@@ -5,6 +5,8 @@ import os
 from datetime import datetime, date
 from sklearn.cluster import DBSCAN
 import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
 
 load_dotenv()
 MAP_KEY = os.getenv("FIRMS_API_KEY")
@@ -52,14 +54,44 @@ class Date():
 
 
         self.df_area_filtered = self.df_area_filtered.groupby('frp_bin', group_keys=False).apply(
-            lambda bin_group: self._sample_south_biased_with_north(bin_group, n_needed=5)
+            lambda bin_group: self._sample_south_biased_with_north(bin_group, n_needed=6)
         )
         self.df_area_filtered = self.df_area_filtered[['latitude', 'longitude', 'acq_date', 'bright_ti4', 'frp']]
 
+    def plot_static_scatter(self):
+        if self.df_area_filtered.empty:
+            print("No data")
+            return
+
+        plt.figure(figsize=(10, 6))
+        
+        scatter = sns.scatterplot(
+            data=self.df_area_filtered,
+            x='longitude',
+            y='latitude',
+            hue='frp',
+            size='frp',
+            sizes=(50, 300),
+            palette='YlOrRd',
+            edgecolor='black'
+        )
+
+        plt.axhline(y=49.0, color='blue', linestyle='--', alpha=0.5, label='Border with the USA(~49°N)')
+        plt.axhline(y=60.0, color='purple', linestyle='--', alpha=0.5, label='Northern border (~60°N)')
+
+        plt.title(f"Distribution of 15 selected fires by {self.fire_date}", fontsize=14)
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True, linestyle=':', alpha=0.6)
+        plt.tight_layout()
+        plt.show()
+
 if __name__ == "__main__":
-    test_date = date(2023, 6, 15)
+    test_date = date(2023, 7, 15)
     date1 = Date(test_date)
     date1.generate_fires()
-    date1.filter_fires(0.00314)
+    date1.filter_fires(0.012)
     print(date1.df_area_filtered)
+    date1.plot_static_scatter()
     
