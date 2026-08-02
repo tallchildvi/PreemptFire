@@ -110,10 +110,11 @@ class Date:
         min_shift_km: float = 30.0, 
         max_shift_km: float = 70.0, 
         safe_radius_km: float = 25.0, 
+        min_neg_dist_km: float = 15.0,  # Minimum distance between negative points
         buffer_days: int = 10,
-        max_attempts: int = 20
+        max_attempts: int = 30
     ) -> pd.DataFrame:
-        """Generate hard negative points (is_fire = 0) verified against window fires."""
+        """Generate hard negative points (is_fire = 0) verified against window fires and existing negatives."""
         if self.df_area_filtered.empty:
             print("No positive fires available to generate negatives.")
             return pd.DataFrame()
@@ -143,31 +144,43 @@ class Date:
                 neg_lat = pos_lat + delta_lat
                 neg_lon = pos_lon + delta_lon
 
-                # Verify no fires occurred within safe_radius_km during buffer_days
-                if df_window_fires.empty:
-                    valid_neg_found = True
-                else:
-                    distances = self._haversine_distance_km(
+                # 1. Check distance to real fires (+/- buffer_days)
+                if not df_window_fires.empty:
+                    fire_distances = self._haversine_distance_km(
                         neg_lat, neg_lon, 
                         df_window_fires['latitude'].values, 
                         df_window_fires['longitude'].values
                     )
-                    
-                    if distances.min() > safe_radius_km:
-                        valid_neg_found = True
+                    if fire_distances.min() <= safe_radius_km:
+                        continue  # Too close to an active or past/future fire
 
-                if valid_neg_found:
-                    negative_points.append({
-                        'latitude': round(neg_lat, 5),
-                        'longitude': round(neg_lon, 5),
-                        'acq_date': self.fire_date,
-                        'bright_ti4': 0.0,
-                        'frp': 0.0,
-                        'is_fire': 0
-                    })
+                # 2. Check distance to previously generated negative points
+                if negative_points:
+                    prev_neg_lats = np.array([p['latitude'] for p in negative_points])
+                    prev_neg_lons = np.array([p['longitude'] for p in negative_points])
+                    neg_distances = self._haversine_distance_km(
+                        neg_lat, neg_lon, 
+                        prev_neg_lats, 
+                        prev_neg_lons
+                    )
+                    if neg_distances.min() <= min_neg_dist_km:
+                        continue  # Too close to another negative point
+
+                # Point passes both spatial checks
+                valid_neg_found = True
+
+            if valid_neg_found:
+                negative_points.append({
+                    'latitude': round(neg_lat, 5),
+                    'longitude': round(neg_lon, 5),
+                    'acq_date': self.fire_date,
+                    'bright_ti4': 0.0,
+                    'frp': 0.0,
+                    'is_fire': 0
+                })
 
         self.df_negatives = pd.DataFrame(negative_points)
-        print(f"Generated {len(self.df_negatives)} negative points.")
+        print(f"Generated {len(self.df_negatives)} sterile and isolated hard negative points.")
         return self.df_negatives
 
     def get_combined_dataset(self) -> pd.DataFrame:
