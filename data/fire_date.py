@@ -179,9 +179,50 @@ class Date:
                     'is_fire': 0
                 })
 
-        self.df_negatives = pd.DataFrame(negative_points)
-        print(f"Generated {len(self.df_negatives)} sterile and isolated hard negative points.")
+        negative_points = pd.DataFrame(negative_points)
+        self.df_negatives = pd.concat([self.df_negatives, negative_points], ignore_index=True)
+        print(f"Generated {len(negative_points)} hard negative points.")
         return self.df_negatives
+
+    def generate_random_negatives(
+        self, 
+        n_points: int = 5, 
+        lat_range=(49.0, 68.0), 
+        lon_range=(-140.0, -55.0),
+        safe_radius_km: float = 25.0,
+        buffer_days: int = 10
+    ) -> pd.DataFrame:
+        """Generate random background negatives across the whole region."""
+        df_window_fires = self._fetch_window_fires(buffer_days=buffer_days)
+        random_negatives = []
+        
+        attempts = 0
+        while len(random_negatives) < n_points and attempts < 100:
+            attempts += 1
+            rand_lat = np.random.uniform(*lat_range)
+            rand_lon = np.random.uniform(*lon_range)
+            
+            if not df_window_fires.empty:
+                distances = self._haversine_distance_km(
+                    rand_lat, rand_lon,
+                    df_window_fires['latitude'].values,
+                    df_window_fires['longitude'].values
+                )
+                if distances.min() <= safe_radius_km:
+                    continue  # Skip if randomly hit a fire area
+                    
+            random_negatives.append({
+                'latitude': round(rand_lat, 5),
+                'longitude': round(rand_lon, 5),
+                'acq_date': self.fire_date,
+                'bright_ti4': 0.0,
+                'frp': 0.0,
+                'is_fire': 0
+            })
+        random_negatives = pd.DataFrame(random_negatives)
+        self.df_negatives = pd.concat([self.df_negatives, random_negatives], ignore_index=True)
+        print(f"Generated {len(random_negatives)} random negative points.")
+        return random_negatives
 
     def get_combined_dataset(self) -> pd.DataFrame:
         """Return combined dataset of positive and negative points."""
