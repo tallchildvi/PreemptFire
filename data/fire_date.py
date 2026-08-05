@@ -142,7 +142,7 @@ class Date:
         self.df_area_filtered = self.df_area_filtered.groupby('frp_bin', group_keys=False).apply(
             lambda bin_group: self._sample_south_biased_with_north(bin_group, n_needed=5)
         )
-        self.df_area_filtered = self.df_area_filtered[['latitude', 'longitude', 'acq_date', 'bright_ti4', 'frp']].copy()
+        self.df_area_filtered = self.df_area_filtered[['latitude', 'longitude', 'acq_date', 'acq_time', 'bright_ti4', 'frp']].copy()
         self.df_area_filtered['is_fire'] = 1
 
     def generate_hard_negatives(
@@ -165,6 +165,7 @@ class Date:
         for _, pos_row in self.df_area_filtered.iterrows():
             pos_lat = pos_row['latitude']
             pos_lon = pos_row['longitude']
+            pos_time = pos_row['acq_time']
             
             valid_neg_found = False
             attempts = 0
@@ -214,6 +215,7 @@ class Date:
                     'latitude': round(neg_lat, 5),
                     'longitude': round(neg_lon, 5),
                     'acq_date': self.fire_date,
+                    'acq_time': pos_time,
                     'bright_ti4': 0.0,
                     'frp': 0.0,
                     'is_fire': 0
@@ -236,6 +238,8 @@ class Date:
         """Generate random background negatives strictly on the target instance landmass."""
         df_window_fires = self._fetch_window_fires(buffer_days=buffer_days)
         random_negatives = []
+
+        default_time = int(self.df_area_filtered['acq_time'].median()) if not self.df_area_filtered.empty else 1900
         
         attempts = 0
         while len(random_negatives) < n_points and attempts < 150:
@@ -273,6 +277,7 @@ class Date:
                 'latitude': round(rand_lat, 5),
                 'longitude': round(rand_lon, 5),
                 'acq_date': self.fire_date,
+                'acq_time': default_time,
                 'bright_ti4': 0.0,
                 'frp': 0.0,
                 'is_fire': 0
