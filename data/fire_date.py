@@ -127,6 +127,10 @@ class Date:
         X = np.radians(self.df_area[['latitude', 'longitude']].values)
         dbscan = DBSCAN(eps=epsilon, metric='haversine')
         self.df_area['claster_id'] = dbscan.fit_predict(X)
+        # Filter raw fires to keep only those strictly within Canadian borders
+        self.df_area = self.df_area[
+            self.df_area.apply(lambda r: self.is_within_country(r['latitude'], r['longitude']), axis=1)
+        ].reset_index(drop=True)
         
         idx = self.df_area.groupby('claster_id')['bright_ti4'].idxmax()
         self.df_area_filtered = self.df_area.loc[idx].copy()
@@ -177,7 +181,11 @@ class Date:
                 neg_lat = pos_lat + delta_lat
                 neg_lon = pos_lon + delta_lon
 
-                # 1. Check distance to active fires
+                # 1. Spatial check: Ensure negative point stays inside the country border
+                if not self.is_within_country(neg_lat, neg_lon):
+                    continue
+
+                # 2. Check distance to active fires
                 if not df_window_fires.empty:
                     fire_distances = self._haversine_distance_km(
                         neg_lat, neg_lon, 
@@ -187,7 +195,7 @@ class Date:
                     if fire_distances.min() <= safe_radius_km:
                         continue
 
-                # 2. Check distance to existing negatives
+                # 3. Check distance to existing negatives
                 all_current_negatives = negative_points.copy()
                 if not self.df_negatives.empty:
                     all_current_negatives.extend(self.df_negatives[['latitude', 'longitude']].to_dict('records'))
@@ -285,31 +293,57 @@ class Date:
         return pd.concat([self.df_area_filtered, self.df_negatives], ignore_index=True)
 
     def plot_static_scatter(self):
-        """Plot positive and negative points on a scatter map."""
+        """Plot positive and negative points on top of the country's landmass map."""
         df_plot = self.get_combined_dataset()
         if df_plot.empty:
             print("No data available to plot.")
             return
 
-        plt.figure(figsize=(10, 6))
-        
+        fig, ax = plt.subplots(figsize=(12, 8))
+
+        # 1. Plot country boundary polygon as background if available
+        if self.geometry is not None:
+            gpd.GeoSeries([self.geometry]).plot(
+                ax=ax, 
+                color='#e2e8f0',       # Light grayish-blue for landmass
+                edgecolor='#64748b',   # Darker gray for borders
+                linewidth=0.8,
+                alpha=0.9
+            )
+
+        # 2. Plot fire and negative points on top
         sns.scatterplot(
             data=df_plot,
             x='longitude',
             y='latitude',
             hue='is_fire',
             style='is_fire',
-            palette={1: 'red', 0: 'green'},
+            palette={1: '#e11d48', 0: '#16a34a'},  # Bright Red for Fire, Green for Negatives
             markers={1: 'X', 0: 'o'},
-            s=100,
-            edgecolor='black'
+            s=120,
+            edgecolor='black',
+            linewidth=0.8,
+            ax=ax,
+            zorder=3
         )
 
-        plt.title(f"Fires (1) vs Negatives (0) for {self.country_code} on {self.fire_date}", fontsize=14)
-        plt.xlabel("Longitude")
-        plt.ylabel("Latitude")
-        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        plt.grid(True, linestyle=':', alpha=0.6)
+        # 3. Add styling and labels
+        plt.title(f"Fires (1) vs Negatives (0) on Map of {self.country_code} ({self.fire_date})", fontsize=14, pad=12)
+        plt.xlabel("Longitude", fontsize=11)
+        plt.ylabel("Latitude", fontsize=11)
+
+        # Custom legend formatting
+        handles, labels = ax.get_legend_handles_labels()
+        ax.legend(
+            handles=handles, 
+            labels=['Hard/Random Negative (0)', 'Active Fire (1)'], 
+            loc='lower left', 
+            frameon=True, 
+            facecolor='white', 
+            framealpha=0.9
+        )
+
+        plt.grid(True, linestyle=':', alpha=0.4)
         plt.tight_layout()
         plt.show()
 
