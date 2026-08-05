@@ -6,24 +6,57 @@ import pandas as pd
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
 from sklearn.cluster import DBSCAN
+import geopandas as gpd
+from shapely.geometry import Point
 import matplotlib.pyplot as plt
 import seaborn as sns
 
 load_dotenv()
 
 class Date:
-    def __init__(self, fire_date: date):
+    def __init__(self, fire_date: date, country_code: str = "CAN"):
         self.fire_date_obj = fire_date
         self.fire_date = fire_date.strftime("%Y-%m-%d")
+        self.country_code = country_code.upper()
+        
         self.df_area = pd.DataFrame()
         self.df_area_filtered = pd.DataFrame()
         self.df_negatives = pd.DataFrame()
+        self.df_window_fires = pd.DataFrame()
+
+        # Instance-bound spatial properties
+        self.geometry = None
+        self.bbox_str = "-180,-90,180,90"
+        self.lat_range = (-90.0, 90.0)
+        self.lon_range = (-180.0, 180.0)
+
+        self._load_country_bounds()
+
+    def _load_country_bounds(self):
+        """Fetch country GeoJSON and calculate bounds bound strictly to this instance."""
+        try:
+            url = f"https://raw.githubusercontent.com/johan/world.geo.json/master/countries/{self.country_code}.geo.json"
+            gdf = gpd.read_file(url)
+            minx, miny, maxx, maxy = gdf.total_bounds
+            
+            self.geometry = gdf.unary_union
+            self.bbox_str = f"{minx:.1f},{miny:.1f},{maxx:.1f},{maxy:.1f}"
+            self.lat_range = (miny, maxy)
+            self.lon_range = (minx, maxx)
+        except Exception as e:
+            print(f"Error loading GeoJSON for '{self.country_code}': {e}")
+
+    def is_within_country(self, lat: float, lon: float) -> bool:
+        """Check if coordinates fall strictly on the instance country landmass."""
+        if self.geometry is None:
+            return True
+        return self.geometry.contains(Point(lon, lat))
 
     def generate_fires(self):
-        """Fetch active fires from NASA FIRMS API for target date T_0."""
+        """Fetch active fires from NASA FIRMS API for target date T_0 and instance bbox."""
         load_dotenv()
         map_key = os.getenv("FIRMS_API_KEY")
-        url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{map_key}/VIIRS_SNPP_SP/-141,41.5,-52.0,83.5/1/{self.fire_date}"
+        url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{map_key}/VIIRS_SNPP_SP/{self.bbox_str}/1/{self.fire_date}"
 
         try:
             self.df_area = pd.read_csv(url)
@@ -31,7 +64,10 @@ class Date:
             print(f"Error querying FIRMS API for {self.fire_date}: {e}")
 
     def _fetch_window_fires(self, buffer_days: int = 10) -> pd.DataFrame:
-        """Fetch all fires within [T_0 - buffer_days, T_0 + buffer_days] in 3-day chunks."""
+        """Fetch and cache all fires within [T_0 - buffer_days, T_0 + buffer_days] for this instance."""
+        if not self.df_window_fires.empty:
+            return self.df_window_fires
+
         load_dotenv()
         map_key = os.getenv("FIRMS_API_KEY")
         
@@ -41,11 +77,10 @@ class Date:
         dfs = []
         curr_date = start_date
         
-        # Fetch in 3-day chunks to stay within FIRMS SP query limits
         while curr_date <= end_date:
             days_to_fetch = min(3, (end_date - curr_date).days + 1)
             date_str = curr_date.strftime('%Y-%m-%d')
-            url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{map_key}/VIIRS_SNPP_SP/-141,41.5,-52.0,83.5/{days_to_fetch}/{date_str}"
+            url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{map_key}/VIIRS_SNPP_SP/{self.bbox_str}/{days_to_fetch}/{date_str}"
             
             try:
                 df_chunk = pd.read_csv(url)
@@ -56,7 +91,8 @@ class Date:
                 
             curr_date += timedelta(days=days_to_fetch)
             
-        return pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        self.df_window_fires = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
+        return self.df_window_fires
 
     @staticmethod
     def _haversine_distance_km(lat1, lon1, lat2_array, lon2_array):
@@ -72,7 +108,7 @@ class Date:
         return 2 * R * np.arcsin(np.sqrt(a))
 
     def _sample_south_biased_with_north(self, bin_df: pd.DataFrame, n_needed: int = 5) -> pd.DataFrame:
-        """Sample points biased towards the south, ensuring at least 1 northernmost point."""
+        """Sample points biased towards lower latitudes, ensuring 1 northernmost point."""
         if len(bin_df) <= n_needed:
             return bin_df
         
@@ -85,7 +121,7 @@ class Date:
     def filter_fires(self, epsilon: float):
         """Cluster fires using DBSCAN and sample stratified points by FRP."""
         if self.df_area.empty:
-            print("No fires available to filter.")
+            print(f"No fires available to filter for {self.country_code}.")
             return
 
         X = np.radians(self.df_area[['latitude', 'longitude']].values)
@@ -110,18 +146,16 @@ class Date:
         min_shift_km: float = 30.0, 
         max_shift_km: float = 70.0, 
         safe_radius_km: float = 25.0, 
-        min_neg_dist_km: float = 15.0,  # Minimum distance between negative points
+        min_neg_dist_km: float = 15.0,
         buffer_days: int = 10,
         max_attempts: int = 30
     ) -> pd.DataFrame:
         """Generate hard negative points (is_fire = 0) verified against window fires and existing negatives."""
         if self.df_area_filtered.empty:
-            print("No positive fires available to generate negatives.")
+            print("No positive fires available to generate hard negatives.")
             return pd.DataFrame()
 
-        print(f"Fetching validation fires for +/-{buffer_days} days around {self.fire_date}...")
         df_window_fires = self._fetch_window_fires(buffer_days=buffer_days)
-
         negative_points = []
 
         for _, pos_row in self.df_area_filtered.iterrows():
@@ -134,7 +168,6 @@ class Date:
             while not valid_neg_found and attempts < max_attempts:
                 attempts += 1
 
-                # Random spatial shift
                 dist_km = np.random.uniform(min_shift_km, max_shift_km)
                 angle_rad = np.random.uniform(0, 2 * np.pi)
 
@@ -144,7 +177,7 @@ class Date:
                 neg_lat = pos_lat + delta_lat
                 neg_lon = pos_lon + delta_lon
 
-                # 1. Check distance to real fires (+/- buffer_days)
+                # 1. Check distance to active fires
                 if not df_window_fires.empty:
                     fire_distances = self._haversine_distance_km(
                         neg_lat, neg_lon, 
@@ -152,21 +185,20 @@ class Date:
                         df_window_fires['longitude'].values
                     )
                     if fire_distances.min() <= safe_radius_km:
-                        continue  # Too close to an active or past/future fire
+                        continue
 
-                # 2. Check distance to previously generated negative points
-                if negative_points:
-                    prev_neg_lats = np.array([p['latitude'] for p in negative_points])
-                    prev_neg_lons = np.array([p['longitude'] for p in negative_points])
-                    neg_distances = self._haversine_distance_km(
-                        neg_lat, neg_lon, 
-                        prev_neg_lats, 
-                        prev_neg_lons
-                    )
+                # 2. Check distance to existing negatives
+                all_current_negatives = negative_points.copy()
+                if not self.df_negatives.empty:
+                    all_current_negatives.extend(self.df_negatives[['latitude', 'longitude']].to_dict('records'))
+
+                if all_current_negatives:
+                    prev_neg_lats = np.array([p['latitude'] for p in all_current_negatives])
+                    prev_neg_lons = np.array([p['longitude'] for p in all_current_negatives])
+                    neg_distances = self._haversine_distance_km(neg_lat, neg_lon, prev_neg_lats, prev_neg_lons)
                     if neg_distances.min() <= min_neg_dist_km:
-                        continue  # Too close to another negative point
+                        continue
 
-                # Point passes both spatial checks
                 valid_neg_found = True
 
             if valid_neg_found:
@@ -179,29 +211,35 @@ class Date:
                     'is_fire': 0
                 })
 
-        negative_points = pd.DataFrame(negative_points)
-        self.df_negatives = pd.concat([self.df_negatives, negative_points], ignore_index=True)
-        print(f"Generated {len(negative_points)} hard negative points.")
+        if negative_points:
+            df_new_neg = pd.DataFrame(negative_points)
+            self.df_negatives = pd.concat([self.df_negatives, df_new_neg], ignore_index=True)
+
+        print(f"Generated {len(negative_points)} hard negative points for {self.country_code}.")
         return self.df_negatives
 
     def generate_random_negatives(
         self, 
         n_points: int = 5, 
-        lat_range=(49.0, 68.0), 
-        lon_range=(-140.0, -55.0),
         safe_radius_km: float = 25.0,
+        min_neg_dist_km: float = 15.0,
         buffer_days: int = 10
     ) -> pd.DataFrame:
-        """Generate random background negatives across the whole region."""
+        """Generate random background negatives strictly on the target instance landmass."""
         df_window_fires = self._fetch_window_fires(buffer_days=buffer_days)
         random_negatives = []
         
         attempts = 0
-        while len(random_negatives) < n_points and attempts < 100:
+        while len(random_negatives) < n_points and attempts < 150:
             attempts += 1
-            rand_lat = np.random.uniform(*lat_range)
-            rand_lon = np.random.uniform(*lon_range)
+            rand_lat = np.random.uniform(*self.lat_range)
+            rand_lon = np.random.uniform(*self.lon_range)
             
+            # 1. Spatial check: Must be on landmass
+            if not self.is_within_country(rand_lat, rand_lon):
+                continue
+
+            # 2. Check distance to active fires
             if not df_window_fires.empty:
                 distances = self._haversine_distance_km(
                     rand_lat, rand_lon,
@@ -209,8 +247,20 @@ class Date:
                     df_window_fires['longitude'].values
                 )
                 if distances.min() <= safe_radius_km:
-                    continue  # Skip if randomly hit a fire area
-                    
+                    continue
+            
+            # 3. Check distance to existing negatives
+            all_current_negatives = random_negatives.copy()
+            if not self.df_negatives.empty:
+                all_current_negatives.extend(self.df_negatives[['latitude', 'longitude']].to_dict('records'))
+
+            if all_current_negatives:
+                prev_lats = np.array([p['latitude'] for p in all_current_negatives])
+                prev_lons = np.array([p['longitude'] for p in all_current_negatives])
+                neg_distances = self._haversine_distance_km(rand_lat, rand_lon, prev_lats, prev_lons)
+                if neg_distances.min() <= min_neg_dist_km:
+                    continue
+
             random_negatives.append({
                 'latitude': round(rand_lat, 5),
                 'longitude': round(rand_lon, 5),
@@ -219,10 +269,13 @@ class Date:
                 'frp': 0.0,
                 'is_fire': 0
             })
-        random_negatives = pd.DataFrame(random_negatives)
-        self.df_negatives = pd.concat([self.df_negatives, random_negatives], ignore_index=True)
-        print(f"Generated {len(random_negatives)} random negative points.")
-        return random_negatives
+
+        if random_negatives:
+            df_new_rand = pd.DataFrame(random_negatives)
+            self.df_negatives = pd.concat([self.df_negatives, df_new_rand], ignore_index=True)
+
+        print(f"Generated {len(random_negatives)} land-verified random negatives for {self.country_code}.")
+        return self.df_negatives
 
     def get_combined_dataset(self) -> pd.DataFrame:
         """Return combined dataset of positive and negative points."""
@@ -252,10 +305,7 @@ class Date:
             edgecolor='black'
         )
 
-        plt.axhline(y=49.0, color='blue', linestyle='--', alpha=0.5, label='USA Border (~49°N)')
-        plt.axhline(y=60.0, color='purple', linestyle='--', alpha=0.5, label='Northern Border (~60°N)')
-
-        plt.title(f"Fire (1) vs Hard Negative (0) Points for {self.fire_date}", fontsize=14)
+        plt.title(f"Fires (1) vs Negatives (0) for {self.country_code} on {self.fire_date}", fontsize=14)
         plt.xlabel("Longitude")
         plt.ylabel("Latitude")
         plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
@@ -266,20 +316,13 @@ class Date:
 
 if __name__ == "__main__":
     test_date = date(2023, 6, 15)
-    date_obj = Date(test_date)
+    date_obj = Date(test_date, country_code="CAN")
     
-    # 1. Fetch fires for target date
     date_obj.generate_fires()
-    
-    # 2. Filter positive points
     date_obj.filter_fires(epsilon=0.012)
-    
-    # 3. Generate negatives validated against +/-10 days window
     date_obj.generate_hard_negatives(buffer_days=10)
+    date_obj.generate_random_negatives(n_points=5, buffer_days=10)
     
-    # 4. Get combined daily dataset
     df_day = date_obj.get_combined_dataset()
     print(df_day[['latitude', 'longitude', 'acq_date', 'frp', 'is_fire']])
-    
-    # 5. Plot distribution
     date_obj.plot_static_scatter()
