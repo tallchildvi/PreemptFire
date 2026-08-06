@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 from datetime import datetime, date, timedelta
 from dotenv import load_dotenv
-from sklearn.cluster import DBSCAN
+from sklearn.cluster import DBSCAN, KMeans
 import geopandas as gpd
 from shapely.geometry import Point
 import matplotlib.pyplot as plt
@@ -107,16 +107,22 @@ class Date:
         a = np.sin(dlat / 2.0)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0)**2
         return 2 * R * np.arcsin(np.sqrt(a))
 
-    def _sample_south_biased_with_north(self, bin_df: pd.DataFrame, n_needed: int = 5) -> pd.DataFrame:
-        """Sample points biased towards lower latitudes, ensuring 1 northernmost point."""
-        if len(bin_df) <= n_needed:
-            return bin_df
-        
-        sorted_df = bin_df.sort_values(by='latitude', ascending=True)
-        n_south = max(1, n_needed - 1)
-        south_points = sorted_df.iloc[:n_south]
-        north_point = sorted_df.iloc[-1:]
-        return pd.concat([south_points, north_point]).drop_duplicates()
+    def _sample_spatially_diverse(self, bin_df: pd.DataFrame, n_needed: int = 5) -> pd.DataFrame:
+            """sample representative points across 2d spatial clusters using kmeans"""
+            if len(bin_df) <= n_needed:
+                return bin_df
+
+            coords = bin_df[['latitude', 'longitude']].values
+            n_clusters = min(n_needed, len(bin_df))
+
+            # group points into k geographical clusters
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            bin_df = bin_df.copy()
+            bin_df['spatial_cluster'] = kmeans.fit_predict(coords)
+
+            # select fire with highest frp from each spatial cluster
+            idx = bin_df.groupby('spatial_cluster')['frp'].idxmax()
+            return bin_df.loc[idx].drop(columns=['spatial_cluster'])
 
     def filter_fires(self, epsilon: float):
         """Cluster fires using DBSCAN and sample stratified points by FRP."""
@@ -140,7 +146,7 @@ class Date:
         )
 
         self.df_area_filtered = self.df_area_filtered.groupby('frp_bin', group_keys=False).apply(
-            lambda bin_group: self._sample_south_biased_with_north(bin_group, n_needed=5)
+            lambda bin_group: self._sample_spatially_diverse(bin_group, n_needed=5)
         )
         self.df_area_filtered = self.df_area_filtered[['latitude', 'longitude', 'acq_date', 'acq_time', 'bright_ti4', 'frp']].copy()
         self.df_area_filtered['is_fire'] = 1
