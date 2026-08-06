@@ -18,8 +18,8 @@ def process_single_date(target_date: date, country_code: str):
         if date_obj.df_area_filtered.empty:
             return None
 
-        date_obj.generate_hard_negatives(buffer_days=10)
-        date_obj.generate_random_negatives(n_points=5, buffer_days=10)
+        date_obj.generate_hard_negatives(buffer_days=15)
+        date_obj.generate_random_negatives(n_points=5, buffer_days=15)
 
         df_day = date_obj.get_combined_dataset()
         if not df_day.empty:
@@ -81,8 +81,8 @@ def generate_master_dataset(
 
 if __name__ == "__main__":
     generate_master_dataset(
-        start_year=2021,
-        end_year=2024,
+        start_year=2020,
+        end_year=2025,
         months=[4, 5, 6, 7, 8, 9, 10, 11],
         days=[1, 15],
         country_code="CAN",

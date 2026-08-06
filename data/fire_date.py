@@ -4,7 +4,7 @@ import requests
 import numpy as np
 import pandas as pd
 from datetime import datetime, date, timedelta
-from dotenv import load_dotenv
+from dotenv import load_dotenv, dotenv_values
 from sklearn.cluster import DBSCAN, KMeans
 import geopandas as gpd
 from shapely.geometry import Point
@@ -31,6 +31,14 @@ class Date:
         self.lon_range = (-180.0, 180.0)
 
         self._load_country_bounds()
+
+    def _change_api_key():
+        config = dotenv_values()
+
+        for env_name, env_value in config.items():
+            if env_name.startswith("FIRMS_API_KEY"):
+                yield env_value
+
 
     def _load_country_bounds(self):
         """Fetch country GeoJSON and calculate bounds bound strictly to this instance."""
@@ -60,8 +68,12 @@ class Date:
 
         try:
             self.df_area = pd.read_csv(url)
-        except Exception as e:
-            print(f"Error querying FIRMS API for {self.fire_date}: {e}")
+        except:
+            map_key = self._change_api_key()
+            try:
+                self.df_area = pd.read_csv(url)
+            except Exception as e:
+                print(f"Error querying FIRMS API for {self.fire_date}: {e}")
 
     def _fetch_window_fires(self, buffer_days: int = 10) -> pd.DataFrame:
         """Fetch and cache all fires within [T_0 - buffer_days, T_0 + buffer_days] for this instance."""
@@ -78,7 +90,7 @@ class Date:
         curr_date = start_date
         
         while curr_date <= end_date:
-            days_to_fetch = min(3, (end_date - curr_date).days + 1)
+            days_to_fetch = min(5, (end_date - curr_date).days + 1)
             date_str = curr_date.strftime('%Y-%m-%d')
             url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{map_key}/VIIRS_SNPP_SP/{self.bbox_str}/{days_to_fetch}/{date_str}"
             
