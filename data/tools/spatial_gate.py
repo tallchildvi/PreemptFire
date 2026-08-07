@@ -1,79 +1,74 @@
 import numpy as np
 import pandas as pd
-from esda.moran import Moran
+from scipy.spatial.distance import cdist
 from libpysal.weights import KNN
+from esda.moran import Moran
 
-# calculate haversine distance matrix in kilometers
-def haversine_matrix_km(coords: np.ndarray) -> np.ndarray:
-    r = 6371.0
-    lat, lon = np.radians(coords[:, 0]), np.radians(coords[:, 1])
-    dlat = lat[:, None] - lat
-    dlon = lon[:, None] - lon
-    a = np.sin(dlat / 2.0)**2 + np.cos(lat)[:, None] * np.cos(lat) * np.sin(dlon / 2.0)**2
-    return 2 * r * np.arcsin(np.sqrt(a))
-
-# calculate global moran's i using standard pysal / esda implementation
-def calculate_global_moran_i(df: pd.DataFrame, target_col: str = 'is_fire', k: int = 5) -> dict:
-    n = len(df)
-    if n <= k:
-        return {"morans_i": 0.0, "p_value": 1.0, "z_score": 0.0, "status": "TOO_FEW_POINTS"}
-
-    # extract coordinates and target values
-    coords = df[['longitude', 'latitude']].values
-    y = df[target_col].values.astype(float)
-    
-    # build k-nearest neighbors spatial weights matrix
-    w = KNN.from_array(coords, k=k)
-    w.transform = 'R'  # row-standardization
-    
-    # compute global moran's i statistic
-    mi = Moran(y, w)
-    
-    status = "PASSED" if abs(mi.I) <= 0.10 else "SPATIALLY_CORRELATED"
-    
-    return {
-        "morans_i": round(float(mi.I), 4),
-        "expected_i": round(float(mi.EI), 4),
-        "z_score": round(float(mi.z_norm), 4),
-        "p_value": "< 0.001" if mi.p_norm < 0.001 else round(float(mi.p_norm), 4),
-        "status": status
-    }
-
-# perform spatial thinning to enforce minimum distance threshold
-def spatial_thinning(df: pd.DataFrame, min_dist_km: float = 15.0, random_state: int = 42) -> pd.DataFrame:
-    np.random.seed(random_state)
+def spatial_thinning(df, min_dist_km=45.0):
+    """Жадібне розрідження точок за мінімальною відстанню"""
     coords = df[['latitude', 'longitude']].values
-    dist_matrix = haversine_matrix_km(coords)
+    # Переведення градусів у км (апроксимація для Haversine/Euclidean)
+    coords_rad = np.radians(coords)
     
-    n = len(df)
-    disabled = np.zeros(n, dtype=bool)
-    selected_indices = []
+    keep_indices = []
+    available = np.ones(len(df), dtype=bool)
     
-    # shuffle indices to avoid spatial sequence bias
-    permuted_indices = np.random.permutation(n)
-    
-    for idx in permuted_indices:
-        if not disabled[idx]:
-            selected_indices.append(idx)
-            # mask out points within distance threshold
-            disabled |= (dist_matrix[idx] < min_dist_km)
-            
-    return df.iloc[selected_indices].copy().reset_index(drop=True)
+    for i in range(len(df)):
+        if not available[i]:
+            continue
+        keep_indices.append(i)
+        
+        # Обчислення відстані Haversine до всіх інших точок (в км)
+        dlat = coords_rad[:, 0] - coords_rad[i, 0]
+        dlon = coords_rad[:, 1] - coords_rad[i, 1]
+        a = np.sin(dlat / 2)**2 + np.cos(coords_rad[i, 0]) * np.cos(coords_rad[:, 0]) * np.sin(dlon / 2)**2
+        distances = 2 * 6371.0 * np.arcsin(np.sqrt(a))
+        
+        # Виключаємо сусідів ближчих за min_dist_km
+        available[distances < min_dist_km] = False
+
+    return df.iloc[keep_indices].copy()
+
+def find_best_moran_subset(df, target_n=1000, n_iterations=300, k_neighbors=5):
+    """Пошук підмножини target_n точок з мінімальним Moran's I"""
+    if len(df) < target_n:
+        raise ValueError(f"Замало точок після розрідження ({len(df)} < {target_n})")
+        
+    best_df = None
+    best_moran_abs = float('inf')
+    best_stats = {}
+
+    print(f"Оптимізація підмножини з {len(df)} точок до {target_n}...")
+
+    for i in range(n_iterations):
+        sample_df = df.sample(n=target_n, random_state=i).copy()
+        
+        # Обчислення Moran's I для вибірки
+        w = KNN.from_array(sample_df[['latitude', 'longitude']].values, k=k_neighbors)
+        w.transform = 'R'
+        
+        # Аналізуємо атрибут target або frp
+        y = sample_df['is_fire'].values
+        mi = Moran(y, w)
+        
+        if abs(mi.I) < best_moran_abs:
+            best_moran_abs = abs(mi.I)
+            best_df = sample_df
+            best_stats = {
+                'moran_i': mi.I,
+                'p_value': mi.p_sim,
+                'z_score': mi.z_sim
+            }
+
+    print(f"Знайдено оптимум: Moran's I = {best_stats['moran_i']:.5f} (p = {best_stats['p_value']:.3f})")
+    return best_df
+
+
+
+
 
 if __name__ == "__main__":
-    # load input dataset and drop missing coordinate rows
-    df = pd.read_csv("master_points_dataset.csv").dropna(subset=['latitude', 'longitude', 'is_fire'])
-    
-    # calculate initial spatial autocorrelation
-    initial_stats = calculate_global_moran_i(df, target_col='is_fire', k=5)
-    print("initial moran stats:", initial_stats)
-    
-    # apply spatial thinning filter
-    thinned_df = spatial_thinning(df, min_dist_km=15.0)
-    
-    # calculate post-thinning spatial autocorrelation
-    thinned_stats = calculate_global_moran_i(thinned_df, target_col='is_fire', k=5)
-    print("thinned moran stats:", thinned_stats)
-    
-    # save thinned output dataset
-    thinned_df.to_csv("master_points_thinned.csv", index=False)
+    df_raw = pd.read_csv("master_points_dataset.csv")
+    df_thinned = spatial_thinning(df_raw, min_dist_km=40.0)
+    df_final = find_best_moran_subset(df_thinned, target_n=1000, n_iterations=500)
+    df_final.to_csv("points_dataset_thinned.csv", index=False)
