@@ -131,12 +131,12 @@ class Date:
         idx = bin_df.groupby('spatial_cluster')['frp'].idxmax()
         return bin_df.loc[idx].drop(columns=['spatial_cluster'])
 
-    def filter_fires(self, epsilon: float = 0.012):
-        """filter fires within country boundaries, cluster with dbscan, and stratify by frp"""
+    def filter_fires(self, epsilon: float = 0.012, lookback_days: int = 15, ignition_radius_km: float = 20.0):
+        """filter fires within country, cluster with dbscan, and retain only fresh ignition points"""
         if self.df_area.empty:
             return
 
-        # 1. Filter points inside country before clustering
+        # 1. Filter points inside country landmass
         self.df_area = self.df_area[
             self.df_area.apply(lambda r: self.is_within_country(r['latitude'], r['longitude']), axis=1)
         ].reset_index(drop=True)
@@ -144,20 +144,43 @@ class Date:
         if self.df_area.empty:
             return
 
-        # 2. DBSCAN clustering
+        # 2. DBSCAN clustering and noise handling
         X = np.radians(self.df_area[['latitude', 'longitude']].values)
         dbscan = DBSCAN(eps=epsilon, metric='haversine')
-        self.df_area['claster_id'] = dbscan.fit_predict(X)
+        self.df_area['cluster_id'] = dbscan.fit_predict(X)
 
-        # Separate noise (-1) to prevent collapsing unclustered fires
-        noise_mask = self.df_area['claster_id'] == -1
+        noise_mask = self.df_area['cluster_id'] == -1
         if noise_mask.any():
-            self.df_area.loc[noise_mask, 'claster_id'] = np.arange(100000, 100000 + noise_mask.sum())
+            self.df_area.loc[noise_mask, 'cluster_id'] = np.arange(100000, 100000 + noise_mask.sum())
 
-        idx = self.df_area.groupby('claster_id')['bright_ti4'].idxmax()
+        idx = self.df_area.groupby('cluster_id')['bright_ti4'].idxmax()
         self.df_area_filtered = self.df_area.loc[idx].copy()
 
-        # 3. FRP stratification
+        # 3. Lookback Filter: Keep only fresh ignition points (no fires in past 15 days)
+        df_window_fires = self._fetch_window_fires(buffer_days=lookback_days)
+        if not df_window_fires.empty:
+            past_fires = df_window_fires[
+                pd.to_datetime(df_window_fires['acq_date']) < pd.to_datetime(self.fire_date)
+            ]
+
+            if not past_fires.empty:
+                fresh_ignition_indices = []
+                for row_idx, pos_row in self.df_area_filtered.iterrows():
+                    distances = self._haversine_distance_km(
+                        pos_row['latitude'], pos_row['longitude'],
+                        past_fires['latitude'].values,
+                        past_fires['longitude'].values
+                    )
+                    # Discard if it was already burning in past 15 days
+                    if distances.min() > ignition_radius_km:
+                        fresh_ignition_indices.append(row_idx)
+
+                self.df_area_filtered = self.df_area_filtered.loc[fresh_ignition_indices].copy()
+
+        if self.df_area_filtered.empty:
+            return
+
+        # 4. FRP stratification and 2D sampling
         self.df_area_filtered['frp_bin'] = pd.qcut(
             self.df_area_filtered['frp'], q=3, labels=['small', 'medium', 'large']
         )
