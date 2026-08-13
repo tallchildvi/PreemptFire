@@ -1,4 +1,4 @@
-import os
+from src.config import BASE_DIR
 import numpy as np
 import pandas as pd
 from datetime import datetime, date, timedelta
@@ -9,7 +9,7 @@ from shapely.geometry import Point
 import matplotlib.pyplot as plt
 import seaborn as sns
 
-load_dotenv()
+load_dotenv(BASE_DIR / ".env")
 
 
 class Date:
@@ -59,7 +59,7 @@ class Date:
 
     def generate_fires(self):
         """fetch active fires from firms api using available keys"""
-        load_dotenv()
+        load_dotenv(BASE_DIR / ".env")
 
         for key in self._get_api_keys():
             url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/VIIRS_SNPP_SP/{self.bbox_str}/1/{self.fire_date}"

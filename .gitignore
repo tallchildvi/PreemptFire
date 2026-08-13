@@ -5,6 +5,8 @@
 *.gpx
 *.kml
 
+data/
+
 ### JupyterNotebooks ###
 # gitignore template for Jupyter Notebooks
 # website: http://jupyter.org/

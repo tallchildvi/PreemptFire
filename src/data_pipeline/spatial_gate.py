@@ -2,6 +2,7 @@ import numpy as np
 import pandas as pd
 from libpysal.weights import KNN
 from esda.moran import Moran
+from src.config import RAW_DATA_DIR, INTERIM_DATA_DIR
 
 
 def spatiotemporal_thinning(
@@ -86,7 +87,9 @@ def find_best_moran_subset(
 
 
 if __name__ == "__main__":
-    df_raw = pd.read_csv("master_points_dataset.csv")
+    input_file = RAW_DATA_DIR / "master_points_dataset.csv"
+    output_file = INTERIM_DATA_DIR / "points_dataset_thinned.csv"
+    df_raw = pd.read_csv(input_file)
     print(f"Initial points count: {len(df_raw)}")
     
     # spatiotemporal thinning (15 km / 15 days)
@@ -95,4 +98,4 @@ if __name__ == "__main__":
     
     # optimize subset to target_n points minimizing moran's i
     df_final = find_best_moran_subset(df_thinned, target_n=1000, n_iterations=500)
-    df_final.to_csv("points_dataset_thinned.csv", index=False)
+    df_final.to_csv(output_file, index=False)

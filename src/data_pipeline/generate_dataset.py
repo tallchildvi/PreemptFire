@@ -1,7 +1,8 @@
 import pandas as pd
 from datetime import date
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from fire_date import Date
+from src.data_pipeline.fire_date import Date
+from src.config import RAW_DATA_DIR
 
 
 def process_single_date(target_date: date, country_code: str):
@@ -46,6 +47,8 @@ def generate_master_dataset(
         for month in months
         for day in days
     ]
+
+    output_filename = RAW_DATA_DIR / output_filename
 
     print(f"starting parallel generation for {country_code} ({len(target_dates)} dates, {max_workers} workers)...")
 
