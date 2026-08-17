@@ -1,6 +1,6 @@
 import numpy as np
 
-class BinaryHeap:
+class PriorityQueue:
     def __init__(self):
         self._heap = []
         self._heapSize = 0
@@ -23,7 +23,7 @@ class BinaryHeap:
     def peek(self):
         return self._heap[0]
 
-    def ExtractMin(self):
+    def extract_min(self):
         if self._heapSize == 0:
             return None
         
@@ -53,4 +53,4 @@ class BinaryHeap:
 
             self._heap[i], self._heap[smallest] = self._heap[smallest], self._heap[i]
             i = smallest
-        return min
+        return min_val
