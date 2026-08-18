@@ -9,7 +9,9 @@ def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, passable_mask: n
         raise ValueError("Shape mismatch: elevation shape must match sources shape.")
 
     rows, cols = elevation.shape
-    optimal_time = np.where(sources == 1, 0.0, np.inf).astype(np.float32)
+
+    valid_sources = (sources == 1) & (passable_mask == 1)
+    optimal_time = np.where(valid_sources, 0.0, np.inf).astype(np.float32)
     queue = PriorityQueue()
 
     for row in range(rows):
