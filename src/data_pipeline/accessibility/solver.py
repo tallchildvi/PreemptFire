@@ -4,7 +4,7 @@ from src.data_pipeline.accessibility.queue import PriorityQueue
 
 
 @njit
-def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, resolution: float):
+def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, passable_mask: np.ndarray, resolution: float):
     if elevation.shape != sources.shape:
         raise ValueError("Shape mismatch: elevation shape must match sources shape.")
 
@@ -22,7 +22,7 @@ def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, resolution: floa
 
         if time > optimal_time[r, c]:
             continue
-
+        
         delta_time, arr_shape, arr_pos = get_time(elevation, r, c, resolution)
         abs_time = delta_time + time
         shape_rows, shape_cols = arr_shape
@@ -33,8 +33,14 @@ def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, resolution: floa
                 if delta_time[row, col] == 0:
                     continue
 
+                if np.isinf(delta_time[row, col]):
+                    continue
+
                 curr_r = r_idx + row
                 curr_c = c_idx + col
+
+                if passable_mask[curr_r, curr_c] == 0:
+                    continue
 
                 if optimal_time[curr_r, curr_c] == 0:
                     continue
@@ -85,4 +91,14 @@ def get_time(elevation: np.ndarray, pixel_row: int, pixel_col: int, resolution: 
 
 @njit
 def toblers_hiking_func(dh, dx):
-    return dx / (6 * np.exp(-3.5 * np.abs(dh / dx + 0.05))) / 1000
+    slope = dh / dx
+
+    if slope > 0.7813 or slope < -0.7002:
+        return np.inf
+
+    speed = 6.0 * np.exp(-3.5 * np.abs(slope + 0.05))
+    if speed <= 0.001:
+        return np.inf
+
+    dist_km = dx / 1000.0
+    return dist_km / speed
