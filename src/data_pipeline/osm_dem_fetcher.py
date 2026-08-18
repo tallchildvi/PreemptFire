@@ -223,16 +223,30 @@ class OsmDemFetcher:
 
         # 2. anthropogenic osm decay layers (5km buffered query -> 10m cropped master grid)
         dist_roads = self.fetch_osm_decay_distance(
-            grid_info, {"highway": ["primary", "secondary", "tertiary", "trunk", "motorway", "residential"]}
+            grid_info, {
+                "highway": [
+                    "motorway", "trunk", "primary", "secondary", "tertiary", 
+                    "unclassified", "residential", "service",
+                    "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link"
+                ]
+            }
         )
         dist_trails = self.fetch_osm_decay_distance(
-            grid_info, {"highway": ["path", "footway", "track"]}
+            grid_info, {
+                "highway": ["path", "footway", "track", "bridleway", "cycleway", "pedestrian"]
+            }
         )
         dist_camps = self.fetch_osm_decay_distance(
-            grid_info, {"tourism": ["camp_site", "picnic_site"]}
+            grid_info, {
+                "tourism": ["camp_site", "picnic_site", "caravan_site", "wilderness_hut", "alpine_hut", "chalet", "viewpoint"],
+                "amenity": ["shelter", "bbq", "firepit"],
+                "leisure": ["firepit", "picnic_table"]
+            }
         )
         dist_power = self.fetch_osm_decay_distance(
-            grid_info, {"power": ["line", "minor_line"]}
+            grid_info, {
+                "power": ["line", "minor_line", "cable", "substation"]
+            }
         )
 
         return {
