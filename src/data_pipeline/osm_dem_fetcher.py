@@ -72,7 +72,7 @@ class SpatialFeatureFetcher:
                 f.close()
 
         min_x, min_y, max_x, max_y = grid_info["utm_bounds"]
-        native_size = int(round(20480.0 / 30.0))  # ~683 px at 30m
+        native_size = int(round(20480.0 / 30.0))  
         native_transform = from_bounds(min_x, min_y, max_x, max_y, native_size, native_size)
 
         dem_30m_utm = np.full((native_size, native_size), np.nan, dtype=np.float32)
@@ -183,7 +183,6 @@ class SpatialFeatureFetcher:
         buf_transform = from_bounds(b_min_x, b_min_y, b_max_x, b_max_y, buf_px_x, buf_px_y)
 
         if gdf_utm is None or gdf_utm.empty:
-            # no infrastructure in wilderness -> return large default distance
             return np.full(grid_info["shape"], 50000.0, dtype=np.float32)
 
         shapes = [(geom, 1) for geom in gdf_utm.geometry if geom is not None and not geom.is_empty]
@@ -211,36 +210,51 @@ class SpatialFeatureFetcher:
         return master_dist
 
 
-    def _compute_accessibility_channel(
+    def _compute_buffered_accessibility(
         self,
-        elevation_10m: np.ndarray,
-        passable_mask: np.ndarray,
-        gdf_utm,
+        dem_buffered: np.ndarray,
+        passable_buffered: np.ndarray,
+        gdf_utm_buffered,
         grid_info: dict,
-        resolution: float = 10.0,
+        buffer_meters: float = 5000.0,
         max_time_cap_hours: float = 12.0
     ) -> np.ndarray:
-        """computes physical walking time (hours) via tobler dijkstra with water barrier constraints"""
-        shape = grid_info["shape"]
-        transform = grid_info["transform"]
 
-        sources = np.zeros(shape, dtype=np.uint8)
-        if gdf_utm is not None and not gdf_utm.empty:
-            shapes = [(geom, 1) for geom in gdf_utm.geometry if geom is not None and not geom.is_empty]
+        buf_shape = dem_buffered.shape
+        min_x, min_y, max_x, max_y = grid_info["utm_bounds"]
+        b_min_x, b_max_x = min_x - buffer_meters, max_x + buffer_meters
+        b_min_y, b_max_y = min_y - buffer_meters, max_y + buffer_meters
+        
+        buf_px_x = int(round((b_max_x - b_min_x) / 10.0))
+        buf_px_y = int(round((b_max_y - b_min_y) / 10.0))
+        buf_transform = from_bounds(b_min_x, b_min_y, b_max_x, b_max_y, buf_px_x, buf_px_y)
+
+        sources_buf = np.zeros(buf_shape, dtype=np.uint8)
+        if gdf_utm_buffered is not None and not gdf_utm_buffered.empty:
+            shapes = [(geom, 1) for geom in gdf_utm_buffered.geometry if geom is not None and not geom.is_empty]
             if shapes:
-                sources = rasterize(shapes, out_shape=shape, transform=transform, fill=0, dtype=np.uint8)
+                sources_buf = rasterize(shapes, out_shape=buf_shape, transform=buf_transform, fill=0, dtype=np.uint8)
 
-        if not np.any((sources == 1) & (passable_mask == 1)):
-            return np.full(shape, max_time_cap_hours, dtype=np.float32)
+        if not np.any((sources_buf == 1) & (passable_buffered == 1)):
+            return np.full(grid_info["shape"], max_time_cap_hours, dtype=np.float32)
 
-        # run dijkstra kernel
-        optimal_time = dijkstra_kernel(elevation_10m, sources, passable_mask, resolution)
+        optimal_time_buf = dijkstra_kernel(
+            dem_buffered, 
+            sources_buf, 
+            passable_buffered, 
+            resolution=10.0
+        )
 
-        # cap inf and unreachable areas at maximum time cost
-        clean_time = np.where(np.isinf(optimal_time), max_time_cap_hours, optimal_time)
-        clean_time = np.clip(clean_time, 0.0, max_time_cap_hours).astype(np.float32)
+   
+        offset_x = int(round(buffer_meters / 10.0)) 
+        offset_y = int(round(buffer_meters / 10.0))  
 
-        return clean_time
+        master_time = optimal_time_buf[
+            offset_y : offset_y + GRID_SIZE_PX,
+            offset_x : offset_x + GRID_SIZE_PX
+        ]
+        clean_time = np.where(np.isinf(master_time), max_time_cap_hours, master_time)
+        return np.clip(clean_time, 0.0, max_time_cap_hours).astype(np.float32)
 
 
     def fetch_all_spatial_features(
