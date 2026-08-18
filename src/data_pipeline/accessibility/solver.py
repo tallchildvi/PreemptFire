@@ -54,7 +54,7 @@ def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, passable_mask: n
 
 
 @njit
-def get_time(elevation: np.ndarray, pixel_row: int, pixel_col: int, resolution: float):
+def get_time(elevation: np.ndarray, passable_mask: np.ndarray, pixel_row: int, pixel_col: int, resolution: float):
     rows, cols = elevation.shape
     central_pixel_elevation = elevation[pixel_row, pixel_col]
 
@@ -79,6 +79,10 @@ def get_time(elevation: np.ndarray, pixel_row: int, pixel_col: int, resolution: 
 
             if r == 0 and c == 0:
                 result[i, j] = 0.0
+                continue
+
+            if passable_mask[pixel_row + r, pixel_col + c] == 0:
+                result[i, j] = np.inf
                 continue
 
             dx = resolution if (r == 0 or c == 0) else resolution * 1.41421356
