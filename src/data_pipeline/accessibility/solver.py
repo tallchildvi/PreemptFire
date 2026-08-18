@@ -17,7 +17,10 @@ def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, resolution: floa
 
     while len(queue) != 0:
         time, pos = queue.extract_min()
-        delta_time, arr_shape, arr_pos = get_time(elevation, pos[0], pos[1])
+
+        if time > optimal_time[pos[0], pos[1]]:
+            continue
+        delta_time, arr_shape, arr_pos = get_time(elevation, pos[0], pos[1], resolution)
         abs_time = delta_time + time
         rows, cols = arr_shape
         r_idx, c_idx = arr_pos
@@ -27,11 +30,11 @@ def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, resolution: floa
             for col in range(cols):
                 if delta_time[row, col] == 0:
                     continue
-                if optimal_time[r_idx + row, c_idx + cols] == 0:
+                if optimal_time[r_idx + row, c_idx + col] == 0:
                     continue
-                if optimal_time[r_idx + row, c_idx + cols] > abs_time[row, col]:
-                    optimal_time[r_idx + row, c_idx + cols] = abs_time[row, col]
-                    node = (optimal_time[r_idx + row, c_idx + cols], (r_idx + row, c_idx + cols))
+                if optimal_time[r_idx + row, c_idx + col] > abs_time[row, col]:
+                    optimal_time[r_idx + row, c_idx + col] = abs_time[row, col]
+                    node = (optimal_time[r_idx + row, c_idx + col], (r_idx + row, c_idx + col))
                     queue.add(node)
 
 
@@ -76,4 +79,4 @@ def get_time(elevation: np.ndarray, pixel_row: int, pixel_col: int, resolution: 
 
 @njit
 def toblers_hiking_func(dh, dx):
-    return dx / 6*np.exp(-3.5*np.abs(dh/dx + 0.05)) / 1000
+    return dx / (6*np.exp(-3.5*np.abs(dh/dx + 0.05))) / 1000
