@@ -1,110 +1,218 @@
+import heapq
 import numpy as np
-from numba import njit
-from src.data_pipeline.accessibility.queue import PriorityQueue
+
+try:
+    from numba import njit, float32, int64, types
+    from numba.experimental import jitclass
+    from numba.typed import List
+    HAS_NUMBA = True
+except ImportError:
+    HAS_NUMBA = False
+
+if HAS_NUMBA:
+    node_type = types.Tuple((float32, int64, int64))
+
+    spec = [
+        ("_heap", types.ListType(node_type)),
+        ("_heapSize", int64),
+    ]
+
+    @jitclass(spec)
+    class PriorityQueue:
+        def __init__(self):
+            self._heap = List.empty_list(node_type)
+            self._heapSize = int64(0)
+
+        def __len__(self):
+            return self._heapSize
+
+        def add(self, node: tuple):
+            self._heap.append(node)
+            self._heapSize += 1
+            i = self._heapSize - 1
+            while i > 0:
+                parent = (i - 1) // 2
+                if self._heap[parent][0] > self._heap[i][0]:
+                    self._heap[parent], self._heap[i] = self._heap[i], self._heap[parent]
+                    i = parent
+                else:
+                    break
+
+        def peek(self):
+            if self._heapSize == 0:
+                return (np.float32(np.inf), int64(-1), int64(-1))
+            return self._heap[0]
+
+        def extract_min(self):
+            if self._heapSize == 0:
+                return (np.float32(np.inf), int64(-1), int64(-1))
+            min_val = self._heap[0]
+            if self._heapSize == 1:
+                self._heap.pop()
+                self._heapSize = 0
+                return min_val
+            self._heap[0] = self._heap.pop()
+            self._heapSize -= 1
+            i = 0
+            while True:
+                left  = 2 * i + 1
+                right = 2 * i + 2
+                if left >= self._heapSize:
+                    break
+                smallest = left
+                if right < self._heapSize and self._heap[right][0] < self._heap[left][0]:
+                    smallest = right
+                if self._heap[i][0] <= self._heap[smallest][0]:
+                    break
+                self._heap[i], self._heap[smallest] = self._heap[smallest], self._heap[i]
+                i = smallest
+            return min_val
 
 
-@njit
-def dijkstra_kernel(elevation: np.ndarray, sources: np.ndarray, passable_mask: np.ndarray, resolution: float):
-    if elevation.shape != sources.shape:
-        raise ValueError("Shape mismatch: elevation shape must match sources shape.")
+if HAS_NUMBA:
+    @njit(fastmath=True)
+    def _dijkstra_numba(
+        elevation: np.ndarray,
+        sources: np.ndarray,
+        passable_mask: np.ndarray,
+        resolution: float,
+    ) -> np.ndarray:
 
-    rows, cols = elevation.shape
+        rows, cols = elevation.shape
 
-    valid_sources = (sources == 1) & (passable_mask == 1)
-    optimal_time = np.where(valid_sources, 0.0, np.inf).astype(np.float32)
-    queue = PriorityQueue()
+        optimal_time = np.full((rows, cols), np.inf, dtype=np.float32)
 
-    for row in range(rows):
-        for col in range(cols):
-            if optimal_time[row, col] == 0:
-                queue.add((np.float32(0.0), np.int64(row), np.int64(col)))
+        queue = PriorityQueue()
 
-    while len(queue) != 0:
-        time, r, c = queue.extract_min()
+        for r in range(rows):
+            for c in range(cols):
+                if sources[r, c] == 1 and passable_mask[r, c] == 1:
+                    optimal_time[r, c] = np.float32(0.0)
+                    queue.add((np.float32(0.0), int64(r), int64(c)))
 
-        if time > optimal_time[r, c]:
-            continue
-        
-        delta_time, arr_shape, arr_pos = get_time(elevation, r, c, resolution)
-        abs_time = delta_time + time
-        shape_rows, shape_cols = arr_shape
-        r_idx, c_idx = arr_pos
+        if len(queue) == 0:
+            return optimal_time
 
-        for row in range(shape_rows):
-            for col in range(shape_cols):
-                if delta_time[row, col] == 0:
-                    continue
+        DR = (-1,  1,  0,  0, -1, -1,  1,  1)
+        DC = ( 0,  0, -1,  1, -1,  1, -1,  1)
+        DF = (1.0, 1.0, 1.0, 1.0,
+              1.41421356, 1.41421356, 1.41421356, 1.41421356)
 
-                if np.isinf(delta_time[row, col]):
-                    continue
+        while len(queue) != 0:
+            curr_time, r, c = queue.extract_min()
 
-                curr_r = r_idx + row
-                curr_c = c_idx + col
-
-                if passable_mask[curr_r, curr_c] == 0:
-                    continue
-
-                if optimal_time[curr_r, curr_c] == 0:
-                    continue
-
-                if optimal_time[curr_r, curr_c] > abs_time[row, col]:
-                    optimal_time[curr_r, curr_c] = abs_time[row, col]
-                    node = (optimal_time[curr_r, curr_c], np.int64(curr_r), np.int64(curr_c))
-                    queue.add(node)
-
-    return optimal_time
-
-
-@njit
-def get_time(elevation: np.ndarray, passable_mask: np.ndarray, pixel_row: int, pixel_col: int, resolution: float):
-    rows, cols = elevation.shape
-    central_pixel_elevation = elevation[pixel_row, pixel_col]
-
-    min_r = -1 if pixel_row > 0 else 0
-    max_r = 1 if pixel_row < rows - 1 else 0
-
-    min_c = -1 if pixel_col > 0 else 0
-    max_c = 1 if pixel_col < cols - 1 else 0
-
-    shape_r = max_r - min_r + 1
-    shape_c = max_c - min_c + 1
-
-    pos_r = pixel_row + min_r
-    pos_col = pixel_col + min_c
-
-    result = np.zeros((shape_r, shape_c), dtype=np.float32)
-
-    for r in range(min_r, max_r + 1):
-        for c in range(min_c, max_c + 1):
-            i = r - min_r
-            j = c - min_c
-
-            if r == 0 and c == 0:
-                result[i, j] = 0.0
+            if curr_time > optimal_time[r, c]:
                 continue
 
-            if passable_mask[pixel_row + r, pixel_col + c] == 0:
-                result[i, j] = np.inf
-                continue
+            z_curr = elevation[r, c]
 
-            dx = resolution if (r == 0 or c == 0) else resolution * 1.41421356
-            dh = elevation[pixel_row + r, pixel_col + c] - central_pixel_elevation
+            for i in range(8):
+                nr = r + DR[i]
+                nc = c + DC[i]
 
-            result[i, j] = toblers_hiking_func(dh, dx)
+                if nr < 0 or nr >= rows or nc < 0 or nc >= cols:
+                    continue
+                if passable_mask[nr, nc] == 0:
+                    continue
 
-    return result, (shape_r, shape_c), (pos_r, pos_col)
+                dx = resolution * DF[i]
+                dh = float(elevation[nr, nc]) - float(z_curr)
+                slope = dh / dx
+
+                if slope > 0.7813 or slope < -0.7002:
+                    continue
+
+                speed_kmh = 6.0 * np.exp(-3.5 * np.abs(slope + 0.05))
+
+                if speed_kmh <= 0.01:
+                    continue
+
+                t_step = np.float32((dx / 1000.0) / speed_kmh)
+                cand_time = curr_time + t_step
+
+                # Relaxation
+                if cand_time < optimal_time[nr, nc]:
+                    optimal_time[nr, nc] = cand_time
+                    queue.add((cand_time, int64(nr), int64(nc)))
+
+        return optimal_time
 
 
-@njit
-def toblers_hiking_func(dh, dx):
+NEIGHBOR_OFFSETS = np.array([
+    [-1,  0, 1.0],
+    [ 1,  0, 1.0],
+    [ 0, -1, 1.0],
+    [ 0,  1, 1.0],
+    [-1, -1, 1.41421356],
+    [-1,  1, 1.41421356],
+    [ 1, -1, 1.41421356],
+    [ 1,  1, 1.41421356],
+], dtype=np.float64)
+
+
+def _tobler_travel_time(dh: float, dx: float) -> float:
     slope = dh / dx
-
     if slope > 0.7813 or slope < -0.7002:
         return np.inf
-
-    speed = 6.0 * np.exp(-3.5 * np.abs(slope + 0.05))
-    if speed <= 0.001:
+    speed_kmh = 6.0 * np.exp(-3.5 * abs(slope + 0.05))
+    if speed_kmh <= 0.01:
         return np.inf
+    return (dx / 1000.0) / speed_kmh
 
-    dist_km = dx / 1000.0
-    return dist_km / speed
+
+def _dijkstra_python(
+    elevation: np.ndarray,
+    sources: np.ndarray,
+    passable_mask: np.ndarray,
+    resolution: float,
+) -> np.ndarray:
+    rows, cols = elevation.shape
+    time_grid = np.full((rows, cols), np.inf, dtype=np.float32)
+    visited   = np.zeros((rows, cols), dtype=bool)
+    pq        = []
+
+    source_r, source_c = np.where((sources == 1) & (passable_mask == 1))
+    for r, c in zip(source_r, source_c):
+        time_grid[r, c] = 0.0
+        heapq.heappush(pq, (0.0, int(r), int(c)))
+
+    while pq:
+        curr_time, r, c = heapq.heappop(pq)
+
+        if visited[r, c]:
+            continue
+        visited[r, c] = True
+
+        z_curr = elevation[r, c]
+
+        for i in range(8):
+            nr = r + int(NEIGHBOR_OFFSETS[i, 0])
+            nc = c + int(NEIGHBOR_OFFSETS[i, 1])
+            step_dist_m = resolution * NEIGHBOR_OFFSETS[i, 2]
+
+            if 0 <= nr < rows and 0 <= nc < cols:
+                if not visited[nr, nc] and passable_mask[nr, nc] == 1:
+                    dh = float(elevation[nr, nc]) - float(z_curr)
+                    t_step    = _tobler_travel_time(dh, step_dist_m)
+                    cand_time = curr_time + t_step
+                    if cand_time < time_grid[nr, nc]:
+                        time_grid[nr, nc] = cand_time
+                        heapq.heappush(pq, (cand_time, nr, nc))
+
+    return time_grid
+
+
+def dijkstra_kernel(
+    elevation: np.ndarray,
+    sources: np.ndarray,
+    passable_mask: np.ndarray,
+    resolution: float,
+) -> np.ndarray:
+    if HAS_NUMBA:
+        return _dijkstra_numba(
+            elevation.astype(np.float32),
+            sources.astype(np.uint8),
+            passable_mask.astype(np.uint8),
+            float(resolution),
+        )
+    return _dijkstra_python(elevation, sources, passable_mask, resolution)
