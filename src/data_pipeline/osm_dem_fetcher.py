@@ -30,6 +30,10 @@ class SpatialFeatureFetcher:
         self.aligner = GridAligner()
 
         # osm tag catalogs
+        self.tags_water = {
+            "natural": ["water", "wetland"],
+            "waterway": ["river", "riverbank", "stream", "canal"]
+        }
         self.tags_roads = {
             "highway": [
                 "motorway", "trunk", "primary", "secondary", "tertiary",
@@ -300,8 +304,8 @@ class SpatialFeatureFetcher:
             passable_mask[bridges_mask == 1] = 1
 
         # Step 4: compute accessibility surfaces (tobler hiking hours)
-        travel_roads = self._compute_accessibility_channel(elevation_10m, passable_mask, gdf_roads, grid_info)
-        travel_trails = self._compute_accessibility_channel(elevation_10m, passable_mask, gdf_trails, grid_info)
+        travel_roads = self._compute_buffered_accessibility(elevation_10m, passable_mask, gdf_roads, grid_info)
+        travel_trails = self._compute_buffered_accessibility(elevation_10m, passable_mask, gdf_trails, grid_info)
 
         # Step 5: compute euclidean distance maps (meters)
         dist_railways = self._compute_buffered_edt(gdf_railways, grid_info)
