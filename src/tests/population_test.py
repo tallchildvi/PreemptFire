@@ -7,6 +7,7 @@ aligner = GridAligner()
 # grid_info = aligner.get_master_grid_info(lat=53.5461, lon=-113.4937)
 grid_info = aligner.get_master_grid_info(lat=59.3862, lon=-108.8931627)
 
+
 fetcher = PopulationFetcher()
 pop_layer = fetcher.fetch_population(grid_info=grid_info)
 
