@@ -70,7 +70,7 @@ if HAS_NUMBA:
 
 
 if HAS_NUMBA:
-    @njit(fastmath=True)
+    @njit(fastmath=True, cache=True)
     def _dijkstra_numba(
         elevation: np.ndarray,
         sources: np.ndarray,
@@ -128,6 +128,13 @@ if HAS_NUMBA:
                     continue
 
                 t_step = np.float32((dx / 1000.0) / speed_kmh)
+
+                if dh > 0.0:
+                    t_step += np.float32(dh / 600.0)
+
+                if sources[nr, nc] == 0:
+                    t_step *= np.float32(2.5)
+
                 cand_time = curr_time + t_step
 
                 # Relaxation

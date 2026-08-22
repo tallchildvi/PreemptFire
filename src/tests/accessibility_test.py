@@ -6,8 +6,10 @@ from src.data_pipeline.osm_dem_fetcher import SpatialFeatureFetcher
 
 SCENES = {
     "ontario_boreal": (52.9607193, -91.3226589),
+    "near_to_ontario_boreal": (52.9679062, -91.4239961),
     "banff_alpine":   (51.1784,    -115.5708),
     "remote_shield":  (59.3862126, -108.8931627),
+    "random_mountain_in_bc": (53.1452644, -119.1260567),
 }
 
 
@@ -104,7 +106,7 @@ def _plot_results(features: dict, lat: float, lon: float, scene_name: str, cap_h
 
     plt.tight_layout()
     plt.show()
-    
+
 def test_real_scene_accessibility(
     scene: str   = "ontario_boreal",
     lat:   float = None,
@@ -159,6 +161,7 @@ def test_real_scene_accessibility(
     return features
 
 if __name__ == "__main__":
+    test_real_scene_accessibility(scene="near_to_ontario_boreal")
     # test_real_scene_accessibility(scene="ontario_boreal")
     # test_real_scene_accessibility(scene="banff_alpine")
-    test_real_scene_accessibility(scene="remote_shield")
+    # test_real_scene_accessibility(scene="random_mountain_in_bc")
