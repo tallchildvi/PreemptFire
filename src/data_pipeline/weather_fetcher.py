@@ -35,7 +35,7 @@ class WeatherFetcher:
 
     def fetch_interval_metrics(self, lat: float, lon: float, start_date: str, end_date: str) -> Dict[str, float]:
         """
-        Computes aggregate metrics for an arbitrary date range (e.g. between satellite passes).
+        Computes aggregate metrics for an arbitrary date range.
         Cumulative variables are normalized by the number of days in the interval.
         """
         variables = ["temperature_2m", "relative_humidity_2m", "precipitation", "wind_speed_10m"]
