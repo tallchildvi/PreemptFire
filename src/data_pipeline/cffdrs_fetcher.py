@@ -1,22 +1,34 @@
-from datetime import datetime, timedelta
-from typing import Any, Dict, List
+from collections import defaultdict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Tuple
 import numpy as np
 import requests
 
 
 class CFFDRSFetcher:
     """
-    Autonomous fetcher and computer for the Canadian Forest Fire Danger Rating System (CFFDRS).
-    Executes a single 90-day historical weather request via Open-Meteo API, extracts strict 
-    12:00 LST (solar noon) records with 24h antecedent rainfall, and computes fuel moisture 
-    codes (FFMC, DMC, DC) and fire behavior indices (ISI, BUI, FWI) at T0.
+    Global autonomous fetcher and computer for the Canadian Forest Fire Danger Rating System (CFFDRS).
+    Implements standard global day-length and evaporative adjustments (Northern, Equatorial, Southern)
+    following Van Wagner (1987).
     """
 
     BASE_URL = "https://archive-api.open-meteo.com/v1/archive"
 
-    # Empirical effective day-length factors by month (Jan -> Dec) for northern latitudes (>= 45°N)
-    DMC_DAY_LENGTH: List[float] = [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.0, 6.0]
-    DC_DAY_LENGTH: List[float] = [-1.6, -1.6, -1.6, 0.9, 3.8, 5.8, 6.4, 5.0, 2.4, 0.4, -1.6, -1.6]
+    # Day-length adjustment factors for DMC (Le) by month (Jan -> Dec)
+    DMC_DAY_LENGTH_NORTH: List[float] = [6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.0, 6.0]
+    DMC_DAY_LENGTH_SOUTH: List[float] = [12.4, 10.9, 9.4, 8.0, 7.0, 6.0, 6.5, 7.5, 9.0, 12.8, 13.9, 13.9]
+
+    # Seasonal evaporative factors for DC (Lf) by month (Jan -> Dec)
+    DC_DAY_LENGTH_NORTH: List[float] = [-1.6, -1.6, -1.6, 0.9, 3.8, 5.8, 6.4, 5.0, 2.4, 0.4, -1.6, -1.6]
+    DC_DAY_LENGTH_SOUTH: List[float] = [6.4, 5.0, 2.4, 0.4, -1.6, -1.6, -1.6, -1.6, -1.6, 0.9, 3.8, 5.8]
+
+    # Equatorial Lf: mean of north + south annual tables (≈ 1.39)
+    _DC_LF_EQUATORIAL: float = float(
+        np.mean(DC_DAY_LENGTH_NORTH) * 0.5 + np.mean(DC_DAY_LENGTH_SOUTH) * 0.5
+    )
+
+    # Open-Meteo archive latency buffer (days)
+    _ARCHIVE_LATENCY_DAYS: int = 5
 
     def __init__(
         self,
@@ -36,11 +48,19 @@ class CFFDRSFetcher:
         """
         Public single-call interface.
         Fetches 90-day history before date_t0, runs the sequential Van Wagner spin-up,
-        and returns all 6 CFFDRS indices calibrated for date_t0.
+        and returns all 6 CFFDRS indices calibrated for date_t0 globally.
         """
         d_end = datetime.strptime(date_t0, "%Y-%m-%d")
+
+        latest_available = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=self._ARCHIVE_LATENCY_DAYS)
+        if d_end > latest_available:
+            raise ValueError(
+                f"date_t0 {date_t0} is within Open-Meteo archive latency window "
+                f"(data available up to {latest_available.strftime('%Y-%m-%d')}). "
+                f"Choose an earlier date."
+            )
+
         d_start = d_end - timedelta(days=self.spinup_days + 2)
-        
         start_str = d_start.strftime("%Y-%m-%d")
         end_str = d_end.strftime("%Y-%m-%d")
 
@@ -67,20 +87,20 @@ class CFFDRSFetcher:
         }
 
         for record in noon_records:
-            state = self._step(state, record)
+            state = self._step(state, record, lat)
 
         return {
-            "ffmc": float(state["FFMC"]),
-            "dmc": float(state["DMC"]),
-            "dc": float(state["DC"]),
-            "isi": float(state["ISI"]),
-            "bui": float(state["BUI"]),
-            "fwi": float(state["FWI"]),
+            "cffdrs_ffmc": float(state["FFMC"]),
+            "cffdrs_dmc": float(state["DMC"]),
+            "cffdrs_dc": float(state["DC"]),
+            "cffdrs_isi": float(state["ISI"]),
+            "cffdrs_bui": float(state["BUI"]),
+            "cffdrs_fwi": float(state["FWI"]),
         }
 
-    
-    # Private Ingestion & Alignment Helpers
-    
+
+    # Private Ingestion & Local Time Alignment
+
 
     def _fetch_hourly_data(self, lat: float, lon: float, start_date: str, end_date: str, variables: list) -> dict:
         params = {
@@ -100,39 +120,88 @@ class CFFDRSFetcher:
 
         return data["hourly"]
 
-    def _extract_noon_records(self, hourly: dict, lon: float) -> List[Dict[str, Any]]:
-        offset_hours = int(round(lon / 15.0))
-        times_utc = [datetime.fromisoformat(t) for t in hourly["time"]]
-        times_lst = [t + timedelta(hours=offset_hours) for t in times_utc]
+    @staticmethod
+    def _solar_noon_utc_hour(date: datetime, lon: float) -> float:
+        """
+        Estimates solar noon in UTC using Spencer's (1971) Equation of Time.
+        Error < 2 minutes — sufficient for selecting the correct hourly slot.
+        """
+        doy = date.timetuple().tm_yday
+        b = 2.0 * np.pi * (doy - 1) / 365.0
 
-        temps = np.array(hourly["temperature_2m"], dtype=np.float32)
-        rhs = np.array(hourly["relative_humidity_2m"], dtype=np.float32)
-        winds = np.array(hourly["wind_speed_10m"], dtype=np.float32)
-        precips = np.array(hourly["precipitation"], dtype=np.float32)
+        eot_minutes = 229.18 * (
+            0.000075
+            + 0.001868 * np.cos(b)
+            - 0.032077 * np.sin(b)
+            - 0.014615 * np.cos(2.0 * b)
+            - 0.04089  * np.sin(2.0 * b)
+        )
+        solar_noon_utc = 12.0 - (eot_minutes / 60.0) - (lon / 15.0)
+        return float(solar_noon_utc % 24.0)
+
+    def _extract_noon_records(self, hourly: dict, lon: float) -> List[Dict[str, Any]]:
+        times_utc = [datetime.fromisoformat(t) for t in hourly["time"]]
+
+        temps   = np.array(hourly["temperature_2m"],       dtype=np.float32)
+        rhs     = np.array(hourly["relative_humidity_2m"], dtype=np.float32)
+        winds   = np.array(hourly["wind_speed_10m"],       dtype=np.float32)
+        precips = np.array(hourly["precipitation"],        dtype=np.float32)
+
+        date_to_indices: Dict[Any, List[Tuple[int, int]]] = defaultdict(list)
+        for i, t in enumerate(times_utc):
+            date_to_indices[t.date()].append((i, t.hour))
 
         noon_records: List[Dict[str, Any]] = []
-        n_hours = len(times_lst)
+        sorted_dates = sorted(date_to_indices.keys())
 
-        for i in range(23, n_hours):
-            cur_time = times_lst[i]
-            if cur_time.hour == 12:
-                # 24h precipitation: sum from 13:00 yesterday to 12:00 today
-                rain_24h = float(np.nansum(precips[i - 23 : i + 1]))
+        for date in sorted_dates:
+            solar_noon_utc = self._solar_noon_utc_hour(
+                datetime(date.year, date.month, date.day), lon
+            )
+            entries = date_to_indices[date]
 
-                noon_records.append({
-                    "date": cur_time.date(),
-                    "month": cur_time.month,
-                    "temp_noon": float(temps[i]),
-                    "rh_noon": float(np.clip(rhs[i], 1.0, 100.0)),
-                    "wind_noon_kmh": max(0.0, float(winds[i])),
-                    "rain_24h_mm": max(0.0, rain_24h),
-                })
+            # Pick the hourly slot closest to true solar noon
+            best_i, _ = min(entries, key=lambda e: abs((e[1] - solar_noon_utc + 12) % 24 - 12))
+
+            # Freeze / snow-cover guard — skip day, hold codes unchanged
+            t_noon = float(temps[best_i])
+            if t_noon < -1.1:
+                continue
+
+            # Need at least 23 prior slots in the UTC array to form a full 24h sum
+            if best_i < 23:
+                continue
+
+            # Strict 24h antecedent rainfall ending at the solar-noon UTC slot.
+            # The UTC array is uniform hourly → [best_i - 23 : best_i + 1] is
+            # always exactly 24 hours regardless of longitude or timezone offset.
+            rain_24h = float(np.nansum(precips[best_i - 23 : best_i + 1]))
+
+            noon_records.append({
+                "date":          date,
+                "month":         date.month,
+                "temp_noon":     t_noon,
+                "rh_noon":       float(np.clip(rhs[best_i], 1.0, 100.0)),
+                "wind_noon_kmh": max(0.0, float(winds[best_i])),
+                "rain_24h_mm":   max(0.0, rain_24h),
+            })
 
         return noon_records
 
-    
+
     # Private Physical Formulations (Van Wagner, 1987)
-    
+
+
+    def _get_day_length_factors(self, lat: float, month: int) -> Tuple[float, float]:
+        """Returns standard global (Le, Lf) daylight factors based on latitude zones."""
+        m_idx = int(np.clip(month, 1, 12)) - 1
+        if lat > 15.0:
+            return self.DMC_DAY_LENGTH_NORTH[m_idx], self.DC_DAY_LENGTH_NORTH[m_idx]
+        elif lat < -15.0:
+            return self.DMC_DAY_LENGTH_SOUTH[m_idx], self.DC_DAY_LENGTH_SOUTH[m_idx]
+        else:
+            # Equatorial / Tropical zone (-15° <= lat <= 15°)
+            return 9.0, self._DC_LF_EQUATORIAL
 
     def _calc_ffmc(self, temp: float, rh: float, wind_kmh: float, rain_24h: float, prev_ffmc: float) -> float:
         m_0 = 147.2 * (101.0 - prev_ffmc) / (59.5 + prev_ffmc)
@@ -176,9 +245,7 @@ class CFFDRSFetcher:
         ffmc = 59.5 * (250.0 - m) / (147.2 + m)
         return float(np.clip(ffmc, 0.0, 101.0))
 
-    def _calc_dmc(self, temp: float, rh: float, rain_24h: float, month: int, prev_dmc: float) -> float:
-        l_e = self.DMC_DAY_LENGTH[int(np.clip(month, 1, 12)) - 1]
-
+    def _calc_dmc(self, temp: float, rh: float, rain_24h: float, l_e: float, prev_dmc: float) -> float:
         if rain_24h > 1.5:
             r_e = 0.92 * rain_24h - 1.27
             m_0 = 20.0 + np.exp(5.6348 - prev_dmc / 43.43)
@@ -196,9 +263,7 @@ class CFFDRSFetcher:
         k = 1.894 * (t_k + 1.1) * (100.0 - rh) * l_e * 1e-4
         return float(max(0.0, prev_dmc + max(0.0, k)))
 
-    def _calc_dc(self, temp: float, rain_24h: float, month: int, prev_dc: float) -> float:
-        l_f = self.DC_DAY_LENGTH[int(np.clip(month, 1, 12)) - 1]
-
+    def _calc_dc(self, temp: float, rain_24h: float, l_f: float, prev_dc: float) -> float:
         if rain_24h > 2.8:
             r_d = 0.83 * rain_24h - 1.27
             q_0 = 800.0 * np.exp(-prev_dc / 400.0)
@@ -241,7 +306,9 @@ class CFFDRSFetcher:
             return float(np.exp(ln_s))
         return float(b)
 
-    def _step(self, state: Dict[str, float], record: Dict[str, Any]) -> Dict[str, float]:
+    def _step(self, state: Dict[str, float], record: Dict[str, Any], lat: float) -> Dict[str, float]:
+        l_e, l_f = self._get_day_length_factors(lat, record["month"])
+
         ffmc = self._calc_ffmc(
             temp=record["temp_noon"],
             rh=record["rh_noon"],
@@ -253,13 +320,13 @@ class CFFDRSFetcher:
             temp=record["temp_noon"],
             rh=record["rh_noon"],
             rain_24h=record["rain_24h_mm"],
-            month=record["month"],
+            l_e=l_e,
             prev_dmc=state["DMC"],
         )
         dc = self._calc_dc(
             temp=record["temp_noon"],
             rain_24h=record["rain_24h_mm"],
-            month=record["month"],
+            l_f=l_f,
             prev_dc=state["DC"],
         )
 
@@ -278,13 +345,19 @@ class CFFDRSFetcher:
 
 
 if __name__ == "__main__":
-    # Test on Fort McMurray during wildfire season
-    lat, lon = 56.7264, -111.3803
-    date_t0 = "2023-07-15"
-
     fetcher = CFFDRSFetcher(spinup_days=90)
-    cffdrs_metrics = fetcher.fetch_cffdrs_metrics(lat, lon, date_t0=date_t0)
 
-    print(f"\n--- CFFDRS Indices at T0 [{lat}, {lon}] ({date_t0}) ---")
-    for k, v in cffdrs_metrics.items():
-        print(f"  {k:<16}: {v:6.2f}")
+    # Test globally diverse wildfire-prone regions
+    GLOBAL_TEST_SITES = {
+        "Canada (Alberta Boreal)": (56.7264, -111.3803, "2023-07-15"),
+        "Australia (NSW Bushfire season)": (-33.8688, 151.2093, "2020-01-05"),
+        "Greece (Mediterranean summer)": (38.0408, 23.8202, "2023-08-22"),
+        "Indonesia (Equatorial peatland)": (-0.7893, 113.9213, "2023-09-15"),
+    }
+
+    for name, (lat, lon, target_date) in GLOBAL_TEST_SITES.items():
+        print(f"\n{'='*60}")
+        print(f"Site: {name} [{lat}, {lon}] at {target_date}")
+        metrics = fetcher.fetch_cffdrs_metrics(lat, lon, date_t0=target_date)
+        for k, v in metrics.items():
+            print(f"  {k:<16}: {v:6.2f}")
