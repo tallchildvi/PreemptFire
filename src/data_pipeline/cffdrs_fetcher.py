@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Tuple
 import numpy as np
 import requests
+from urllib3.util import Retry
+from requests.adapters import HTTPAdapter
 
 
 class CFFDRSFetcher:
@@ -43,6 +45,19 @@ class CFFDRSFetcher:
         self.default_ffmc = default_ffmc
         self.default_dmc = default_dmc
         self.default_dc = default_dc
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": "PreemptFireWildfirePipeline/1.0 (Research Project)"
+        })
+        retries = Retry(
+            total=5,
+            backoff_factor=1.0,  # Паузи: 1с, 2с, 4с, 8с при помилках
+            status_forcelist=[429, 500, 502, 503, 504],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retries, pool_connections=10, pool_maxsize=10)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
     def fetch_cffdrs_metrics(self, lat: float, lon: float, date_t0: str) -> Dict[str, float]:
         """
@@ -111,7 +126,7 @@ class CFFDRSFetcher:
             "hourly": ",".join(variables),
             "timezone": "UTC",
         }
-        resp = requests.get(self.BASE_URL, params=params, timeout=self.timeout)
+        resp = self.session.get(self.BASE_URL, params=params, timeout=self.timeout)
         resp.raise_for_status()
         data = resp.json()
 
@@ -356,7 +371,6 @@ if __name__ == "__main__":
     }
 
     for name, (lat, lon, target_date) in GLOBAL_TEST_SITES.items():
-        print(f"\n{'='*60}")
         print(f"Site: {name} [{lat}, {lon}] at {target_date}")
         metrics = fetcher.fetch_cffdrs_metrics(lat, lon, date_t0=target_date)
         for k, v in metrics.items():
