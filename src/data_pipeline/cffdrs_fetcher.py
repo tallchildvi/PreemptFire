@@ -417,16 +417,22 @@ class CFFDRSFetcher:
                 key=lambda e: abs((e[1] - solar_noon_utc + 12) % 24 - 12),
             )
 
-            t_noon = temps[best_i]
-            if t_noon < -1.1 or best_i < 23:
+            if best_i < 23:
+                continue
+
+            t_noon = float(temps[best_i])
+            rh_noon = float(rhs[best_i])
+            w_noon = float(winds[best_i])
+
+            if not (np.isfinite(t_noon) and np.isfinite(rh_noon) and np.isfinite(w_noon)):
                 continue
 
             rain_24h = float(np.nansum(precips[best_i - 23 : best_i + 1]))
 
             months_list.append(date.month)
             temps_list.append(t_noon)
-            rhs_list.append(float(np.clip(rhs[best_i], 1.0, 100.0)))
-            winds_list.append(max(0.0, winds[best_i]))
+            rhs_list.append(float(np.clip(rh_noon, 1.0, 100.0)))
+            winds_list.append(max(0.0, w_noon))
             rains_list.append(max(0.0, rain_24h))
 
         return (
