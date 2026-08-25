@@ -65,7 +65,7 @@ class SentinelFetcher:
         selected_item = items[0]
         actual_date = selected_item.datetime.strftime("%Y-%m-%d")
 
-        bands_to_fetch = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B11", "B12", "SCL"]
+        bands_to_fetch = ["B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"]
         aligned_bands = {}
 
         for band in bands_to_fetch:
