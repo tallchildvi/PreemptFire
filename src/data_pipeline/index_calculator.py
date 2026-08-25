@@ -61,7 +61,7 @@ class IndexCalculator:
 
         if b08_tprev is not None and b11_tprev is not None:
             results["dNDMI"] = self.calc_delta(results["NDMI_T0"], self.calc_ndmi(b08_tprev, b11_tprev))
-
+ 
         if b08_tprev is not None and b12_tprev is not None:
             results["dNBR"] = self.calc_delta(results["NBR_T0"], self.calc_nbr(b08_tprev, b12_tprev))
 
@@ -92,7 +92,6 @@ class IndexCalculator:
         return self._calc_norm_diff(b08_nir, b04_red)
 
     def calc_ndre(self, b8a_narrow_nir: np.ndarray, b05_rededge: np.ndarray) -> np.ndarray:
-        """Normalized Difference Red Edge Index using Sentinel-2 B8A (~865 nm) and B05 (~705 nm)."""
         return self._calc_norm_diff(b8a_narrow_nir, b05_rededge)
 
     def calc_ndmi(self, b08_nir: np.ndarray, b11_swir1: np.ndarray) -> np.ndarray:
