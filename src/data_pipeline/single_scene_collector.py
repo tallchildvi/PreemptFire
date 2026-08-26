@@ -338,7 +338,7 @@ def visualize_2d_layers_step_by_step(sample: Dict[str, Any], downsample_step: in
 if __name__ == "__main__":
     collector = SingleSceneCollector()
 
-    test_lat, test_lon = 50.1373482, -120.6256778
+    test_lat, test_lon = 56.7264, -111.3803
     test_date = "2025-06-15"
 
     sample = collector.collect_sample(

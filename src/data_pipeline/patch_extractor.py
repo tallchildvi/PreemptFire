@@ -47,7 +47,9 @@ class PatchExtractor:
                 # Filter out patches dominated by clouds, shadows, snow, or NoData
                 invalid_ratio = float((patch_loss_mask > 0.5).mean())
                 if invalid_ratio > self.max_invalid_ratio:
+                    print(f"patch sith row: {r} and column: {c}  is invalid with invalid_ratio of {invalid_ratio}")
                     continue
+
 
                 patch_2d = stacked_2d[:, row_slice, col_slice]
                 patch_target = target[:, row_slice, col_slice]
