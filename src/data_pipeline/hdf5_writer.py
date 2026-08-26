@@ -176,37 +176,84 @@ class HDF5Writer:
         return batch_size
 
 
+def inspect_h5_structure(filepath: str):
+    """prints a detailed structural overview of the generated hdf5 file."""
+    print("\n" + "=" * 75)
+    print(f" HDF5 DATASET STRUCTURE INSPECTION: {filepath}")
+    print(f" File Size: {os.path.getsize(filepath) / (1024 * 1024):.2f} MB")
+    print("=" * 75)
+
+    with h5py.File(filepath, "r") as h5:
+        total_samples = 0
+        for grp_name in ["channels_2d", "target", "context_1d", "metadata"]:
+            if grp_name in h5:
+                grp = h5[grp_name]
+                print(f"\n[Group: /{grp_name}] ({len(grp.keys())} datasets)")
+                print("-" * 75)
+                for key in sorted(grp.keys()):
+                    ds = grp[key]
+                    total_samples = ds.shape[0]
+                    chunks_str = f"chunk={ds.chunks}" if ds.chunks else "contiguous"
+                    comp_str = f"comp={ds.compression}" if ds.compression else "uncompressed"
+                    print(f"  |-- {key:<28} shape: {str(ds.shape):<18} dtype: {str(ds.dtype):<10} ({chunks_str}, {comp_str})")
+
+        print("\n" + "=" * 75)
+        print(f" Total Stored Patches: {total_samples}")
+        print("=" * 75 + "\n")
+
+
 if __name__ == "__main__":
+    import time
     from src.data_pipeline.patch_extractor import PatchExtractor
     from src.data_pipeline.single_scene_collector import SingleSceneCollector
 
     test_h5_path = "data/test_patches_dataset.h5"
 
+    # ensure data directory exists
+    os.makedirs(os.path.dirname(test_h5_path), exist_ok=True)
+
     # remove old test file to start fresh
     if os.path.exists(test_h5_path):
         os.remove(test_h5_path)
 
-    print("[1/3] Collecting full scene...")
+    print("--- [1/3] Collecting full multi-modal master scene ---")
     collector = SingleSceneCollector()
     extractor = PatchExtractor(patch_size=256, stride=256, max_invalid_ratio=0.20)
     writer = HDF5Writer(output_filepath=test_h5_path, patch_size=256, compression="lzf")
 
+    # test coordinates in northern alberta (boreal wildfire region)
     test_lat, test_lon = 56.7264, -111.3803
     test_date = "2023-06-15"
-    sample = collector.collect_sample(lat=test_lat, lon=test_lon, target_date=test_date, is_fire=1)
+
+    start_time = time.perf_counter()
+    sample = collector.collect_sample(
+        lat=test_lat,
+        lon=test_lon,
+        target_date=test_date,
+        is_fire=1,
+    )
 
     if sample:
-        print("[2/3] Extracting and writing patches to HDF5...")
+        elapsed = time.perf_counter() - start_time
+        meta = sample["metadata"]
+        print(f"Master scene fetched in {elapsed:.2f}s | T0: {meta['t0_date']} | Tprev: {meta['tprev_date']}")
+        print(f"Total 2D raster layers: {len(sample['rasters_2d'])} | Total 1D tabular metrics: {len(sample['context_1d'])}")
+
+        print("\n--- [2/3] Extracting patches and streaming to HDF5 ---")
         scene_id = f"SCENE_{test_lat:.2f}_{test_lon:.2f}_{test_date.replace('-', '')}"
 
-        # collect all valid patches from generator
+        # stream and collect valid patches from generator
         patches_batch = list(extractor.extract_patches(sample, scene_id=scene_id))
 
-        # write batch atomically
-        written_count = writer.write_patches_batch(patches_batch)
-        print(f"Successfully saved {written_count} patches into {test_h5_path}")
+        if patches_batch:
+            # write batch atomically to hdf5
+            written_count = writer.write_patches_batch(patches_batch)
+            print(f"Successfully saved {written_count} valid patches into {test_h5_path}")
 
-        # verify and inspect the written file
-        inspect_h5_structure(test_h5_path)
+            # verify and inspect the resulting hdf5 file structure
+            print("\n--- [3/3] Inspecting HDF5 Dataset Schema ---")
+            inspect_h5_structure(test_h5_path)
+        else:
+            print("[Warning] No valid patches passed the cloud/nodata threshold.")
     else:
         print("[Error] Failed to collect master scene sample.")
