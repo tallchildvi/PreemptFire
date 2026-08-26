@@ -56,7 +56,7 @@ class HDF5Writer:
                 compression=self.compression,
             )
 
-            # 2. 1d context features group
+            # 2. 1d context features group (completely dynamic based on provided keys)
             g_1d = h5.create_group("context_1d")
             for feat_name in sample_patch["context_names_1d"]:
                 g_1d.create_dataset(
@@ -113,7 +113,6 @@ class HDF5Writer:
 
         with self._lock:
             with h5py.File(self.output_filepath, "a") as h5:
-                # determine current dataset size from one channel
                 first_ch = patches[0]["channel_names_2d"][0]
                 curr_len = h5["channels_2d"][first_ch].shape[0]
                 new_len = curr_len + batch_size
@@ -175,32 +174,6 @@ class HDF5Writer:
                 meta_ds["target_max_local"][curr_len:new_len] = np.array([float(p["metadata"]["target_max_local"]) for p in patches], dtype=np.float32)
 
         return batch_size
-
-
-def inspect_h5_structure(filepath: str):
-    """prints a detailed structural overview of the generated hdf5 file."""
-    print("\n" + "=" * 75)
-    print(f" HDF5 DATASET STRUCTURE INSPECTION: {filepath}")
-    print(f" File Size: {os.path.getsize(filepath) / (1024 * 1024):.2f} MB")
-    print("=" * 75)
-
-    with h5py.File(filepath, "r") as h5:
-        total_samples = 0
-        for grp_name in ["channels_2d", "target", "context_1d", "metadata"]:
-            if grp_name in h5:
-                grp = h5[grp_name]
-                print(f"\n[Group: /{grp_name}] ({len(grp.keys())} datasets)")
-                print("-" * 75)
-                for key in sorted(grp.keys()):
-                    ds = grp[key]
-                    total_samples = ds.shape[0]
-                    chunks_str = f"chunk={ds.chunks}" if ds.chunks else "contiguous"
-                    comp_str = f"comp={ds.compression}" if ds.compression else "uncompressed"
-                    print(f"  |-- {key:<24} shape: {str(ds.shape):<18} dtype: {str(ds.dtype):<10} ({chunks_str}, {comp_str})")
-
-        print("\n" + "=" * 75)
-        print(f" Total Stored Patches: {total_samples}")
-        print("=" * 75 + "\n")
 
 
 if __name__ == "__main__":
