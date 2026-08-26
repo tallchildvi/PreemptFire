@@ -16,11 +16,11 @@ from src.processing.grid_aligner import GridAligner
 
 class SentinelFetcher:
 
-    SCL_WATER         = [6]
-    SCL_SNOW          = [11]
-    SCL_CLOUDS        = [8, 9, 10]
+    SCL_WATER = [6]
+    SCL_SNOW = [11]
+    SCL_CLOUDS = [8, 9, 10]
     SCL_CLOUD_SHADOWS = [3]
-    SCL_INVALID       = [0, 1, 2, 3, 8, 9, 10, 11]
+    SCL_INVALID = [0, 1, 2, 3, 8, 9, 10, 11]
 
     OPTICAL_BANDS = [
         "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"
@@ -39,8 +39,6 @@ class SentinelFetcher:
         self.retry_backoff       = retry_backoff
         self.aligner             = GridAligner()
 
-        # FIX 1: sign_inplace ensures search results and hrefs are pre-signed,
-        # preventing token expiry issues on slow or large searches.
         self.stac_client = pystac_client.Client.open(
             "https://planetarycomputer.microsoft.com/api/stac/v1",
             modifier=pc.sign_inplace,
@@ -74,7 +72,6 @@ class SentinelFetcher:
         Retries up to max_retries times with exponential backoff on any
         network / rasterio error.
         """
-        # FIX 3: retry loop around the actual HTTP read
         last_exc = None
         for attempt in range(self.max_retries):
             try:
@@ -99,7 +96,6 @@ class SentinelFetcher:
 
     
     # Per-band fetch  (used in ThreadPoolExecutor)
-    
 
     def _fetch_single_band(
         self, band_name: str, item: Any, grid_info: Dict
@@ -132,7 +128,6 @@ class SentinelFetcher:
 
     
     # Sentinel-2 scene selection + parallel band fetch
-    
 
     def fetch_sentinel2_scene(
         self,
@@ -188,7 +183,6 @@ class SentinelFetcher:
             aligned_bands  = {"SCL": scl_check}
             remaining_bands = [b for b in self.OPTICAL_BANDS if b != "SCL"]
 
-            # FIX 4: use as_completed and wrap f.result() to catch thread exceptions
             with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
                 future_map = {
                     executor.submit(self._fetch_single_band, band, candidate_item, grid_info): band
@@ -213,7 +207,6 @@ class SentinelFetcher:
 
     
     # Sentinel-1 SAR fetch
-    
 
     def fetch_sentinel1_sar(
         self, grid_info: Dict, target_date_str: str, window_days: int = 12
@@ -271,7 +264,6 @@ class SentinelFetcher:
 
     
     # Combined entry point
-    
 
     def fetch_all_radar_optical(self, lat: float, lon: float, target_date: str) -> Dict[str, Any]:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
