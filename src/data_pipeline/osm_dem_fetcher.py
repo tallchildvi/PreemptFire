@@ -1,151 +1,100 @@
+from typing import Dict, List, Optional, Tuple
+import geopandas as gpd
 import numpy as np
+import osmnx as ox
 import planetary_computer as pc
 import pystac_client
 import rasterio
+import requests
+from pyproj import Transformer
 from rasterio.enums import Resampling
 from rasterio.features import rasterize
 from rasterio.merge import merge
 from rasterio.transform import from_bounds
 from rasterio.warp import reproject
 from scipy.ndimage import distance_transform_edt
-from pyproj import Transformer
-import osmnx as ox
 
 from src.config import GRID_SIZE_PX
-from src.processing.grid_aligner import GridAligner
 from src.data_pipeline.accessibility.solver import dijkstra_kernel
+from src.processing.grid_aligner import GridAligner
 
 
 class SpatialFeatureFetcher:
-    """fetches terrain, osm infrastructure, accessibility and distance features."""
+    """High-reliability spatial feature fetcher with multi-endpoint Overpass routing."""
 
-    def __init__(self):
+    OVERPASS_SERVERS = [
+        "https://overpass.kumi.systems/api/interpreter",
+        "https://overpass.private.coffee/api/interpreter",
+        "https://overpass-api.de/api/interpreter",
+    ]
+
+    TARGETED_OSM_TAGS = {
+        "highway": [
+            "motorway", "trunk", "primary", "secondary", "tertiary",
+            "unclassified", "residential", "service", "track", "path", "footway"
+        ],
+        "railway": ["rail", "narrow_gauge", "spur"],
+        "power": ["line", "minor_line", "cable", "substation"],
+        "natural": ["water", "wetland"],
+        "waterway": ["river", "stream", "canal"],
+        "tourism": ["camp_site", "picnic_site", "wilderness_hut"],
+        "amenity": ["shelter", "firepit"],
+    }
+
+    ROAD_HIGHWAYS = {
+        "motorway", "trunk", "primary", "secondary", "tertiary",
+        "unclassified", "residential", "service"
+    }
+    TRAIL_HIGHWAYS = {"track", "path", "footway"}
+
+    def __init__(self, timeout_sec: int = 25):
+        self.timeout_sec = timeout_sec
         self.stac_client = pystac_client.Client.open(
             "https://planetarycomputer.microsoft.com/api/stac/v1",
-            modifier=pc.sign_inplace
+            modifier=pc.sign_inplace,
         )
         self.aligner = GridAligner()
 
-        self.tags_water = {
-            "natural": ["water", "wetland"],
-            "waterway": ["river", "riverbank", "stream", "canal"]
-        }
+        # Configure OSMnx resilience settings
+        ox.settings.use_cache = True
+        ox.settings.log_console = False
+        ox.settings.timeout = 10
+    
+        ox.settings.overpass_endpoint = self.OVERPASS_SERVERS[0]
 
-        self.tags_roads = {
-            "highway": [
-                "motorway", "trunk", "primary", "secondary", "tertiary",
-                "unclassified", "residential", "service",
-                "motorway_link", "trunk_link", "primary_link",
-                "secondary_link", "tertiary_link"
-            ]
-        }
-
-        self.tags_trails = {
-            "highway": [
-                "path", "footway", "track",
-                "bridleway", "cycleway", "pedestrian"
-            ]
-        }
-
-        self.tags_railways = {
-            "railway": ["rail", "narrow_gauge", "spur", "yard"]
-        }
-
-        self.tags_camps = {
-            "tourism": [
-                "camp_site", "picnic_site", "caravan_site",
-                "wilderness_hut", "alpine_hut", "chalet", "viewpoint"
-            ],
-            "amenity": ["shelter", "bbq", "firepit"],
-            "leisure": ["firepit", "picnic_table"]
-        }
-
-        self.tags_power = {
-            "power": [
-                "line", "minor_line", "cable",
-                "substation", "transformer"
-            ]
-        }
-
-        self.tags_bridges = {
-            "bridge": ["yes"]
-        }
-
-    def _get_buffered_grid(self, grid_info: dict, buffer_meters: float, resolution: float) -> tuple:
-        """returns buffered utm bounds, shape and transform."""
-
+    def _get_buffered_grid(self, grid_info: dict, buffer_meters: float, resolution: float) -> Tuple:
         min_x, min_y, max_x, max_y = grid_info["utm_bounds"]
-
-        b_min_x = min_x - buffer_meters
-        b_max_x = max_x + buffer_meters
-        b_min_y = min_y - buffer_meters
-        b_max_y = max_y + buffer_meters
+        b_min_x, b_max_x = min_x - buffer_meters, max_x + buffer_meters
+        b_min_y, b_max_y = min_y - buffer_meters, max_y + buffer_meters
 
         width = int(round((b_max_x - b_min_x) / resolution))
         height = int(round((b_max_y - b_min_y) / resolution))
-
         transform = from_bounds(b_min_x, b_min_y, b_max_x, b_max_y, width, height)
 
-        return (
-            (b_min_x, b_min_y, b_max_x, b_max_y),
-            (height, width),
-            transform
-        )
+        return (b_min_x, b_min_y, b_max_x, b_max_y), (height, width), transform
 
-    def _get_buffered_wgs84_bbox(self, grid_info: dict, buffer_meters: float) -> tuple:
-        """returns buffered wgs84 bbox from the utm scene geometry."""
-
+    def _get_buffered_wgs84_bbox(self, grid_info: dict, buffer_meters: float) -> Tuple[float, float, float, float]:
         min_x, min_y, max_x, max_y = grid_info["utm_bounds"]
-
-        b_min_x = min_x - buffer_meters
-        b_max_x = max_x + buffer_meters
-        b_min_y = min_y - buffer_meters
-        b_max_y = max_y + buffer_meters
-
         transformer = Transformer.from_crs(grid_info["crs"], "EPSG:4326", always_xy=True)
-
         corners = [
-            (b_min_x, b_min_y),
-            (b_min_x, b_max_y),
-            (b_max_x, b_min_y),
-            (b_max_x, b_max_y)
+            (min_x - buffer_meters, min_y - buffer_meters),
+            (min_x - buffer_meters, max_y + buffer_meters),
+            (max_x + buffer_meters, min_y - buffer_meters),
+            (max_x + buffer_meters, max_y + buffer_meters),
         ]
+        corners_wgs84 = [transformer.transform(x, y) for x, y in corners]
+        lons = [p[0] for p in corners_wgs84]
+        lats = [p[1] for p in corners_wgs84]
+        return min(lons), min(lats), max(lons), max(lats)
 
-        corners_wgs84 = [
-            transformer.transform(x, y)
-            for x, y in corners
-        ]
-
-        lons = [point[0] for point in corners_wgs84]
-        lats = [point[1] for point in corners_wgs84]
-
-        return (
-            min(lons),
-            min(lats),
-            max(lons),
-            max(lats)
-        )
-
-    def _fetch_dem_raster(self, grid_info: dict, buffer_meters: float, resolution: float) -> tuple[np.ndarray, rasterio.Affine]:
-        """fetches copernicus dem and reprojects it to the target utm grid."""
-
-        if buffer_meters == 0:
-            bbox = grid_info["bbox_wgs84"]
-        else:
-            bbox = self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
-
+    def _fetch_dem_raster(self, grid_info: dict, buffer_meters: float, resolution: float) -> Tuple[np.ndarray, rasterio.Affine]:
+        bbox = grid_info["bbox_wgs84"] if buffer_meters == 0 else self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
         search = self.stac_client.search(collections=["cop-dem-glo-30"], bbox=bbox)
-
         items = list(search.items())
-
         if not items:
-            raise RuntimeError(f"no copernicus dem items found for bbox: {bbox}")
+            raise RuntimeError(f"No Copernicus DEM items found for bbox: {bbox}")
 
-        src_files = [
-            rasterio.open(item.assets["data"].href)
-            for item in items
-        ]
-
+        src_files = [rasterio.open(item.assets["data"].href) for item in items]
         try:
             mosaic_arr, mosaic_transform = merge(src_files)
             src_crs = src_files[0].crs
@@ -155,58 +104,32 @@ class SpatialFeatureFetcher:
                 src.close()
 
         _, target_shape, target_transform = self._get_buffered_grid(grid_info, buffer_meters, resolution)
-
         dem = np.full(target_shape, np.nan, dtype=np.float32)
 
-        reproject_kwargs = {
-            "source": mosaic_arr[0],
-            "destination": dem,
-            "src_transform": mosaic_transform,
-            "src_crs": src_crs,
-            "dst_transform": target_transform,
-            "dst_crs": grid_info["crs"],
-            "resampling": Resampling.bilinear,
-            "dst_nodata": np.nan,
-        }
-
-        if src_nodata is not None:
-            reproject_kwargs["src_nodata"] = src_nodata
-
-        reproject(**reproject_kwargs)
-
+        reproject(
+            source=mosaic_arr[0],
+            destination=dem,
+            src_transform=mosaic_transform,
+            src_crs=src_crs,
+            dst_transform=target_transform,
+            dst_crs=grid_info["crs"],
+            resampling=Resampling.bilinear,
+            src_nodata=src_nodata,
+            dst_nodata=np.nan,
+        )
         return dem, target_transform
 
-    def fetch_dem_features(self, grid_info: dict) -> dict:
-        """computes terrain features on native-scale dem and aligns them."""
-
+    def fetch_dem_features(self, grid_info: dict) -> Dict[str, np.ndarray]:
         dem_30m, native_transform = self._fetch_dem_raster(grid_info, buffer_meters=0.0, resolution=30.0)
 
-        pixel_size_x = abs(native_transform.a)
-        pixel_size_y = abs(native_transform.e)
+        px, py = abs(native_transform.a), abs(native_transform.e)
+        dz_dy, dz_dx = np.gradient(dem_30m, py, px)
+        dz_dnorth = -dz_dy
 
-        dz_d_south, dz_d_east = np.gradient(dem_30m, pixel_size_y, pixel_size_x)
-
-        dz_d_north = -dz_d_south
-
-        slope_rad = np.arctan(
-            np.sqrt(
-                dz_d_east ** 2 +
-                dz_d_north ** 2
-            )
-        )
-
+        slope_rad = np.arctan(np.sqrt(dz_dx**2 + dz_dnorth**2))
         slope_deg = np.degrees(slope_rad).astype(np.float32)
 
-        downslope_east = -dz_d_east
-        downslope_north = -dz_d_north
-
-        aspect_rad = (
-            np.arctan2(
-                downslope_east,
-                downslope_north
-            ) % (2.0 * np.pi)
-        )
-
+        aspect_rad = np.arctan2(-dz_dx, -dz_dnorth) % (2.0 * np.pi)
         northness = np.cos(aspect_rad).astype(np.float32)
         eastness = np.sin(aspect_rad).astype(np.float32)
 
@@ -218,11 +141,10 @@ class SpatialFeatureFetcher:
             "Elevation": dem_30m,
             "Slope": slope_deg,
             "Northness": northness,
-            "Eastness": eastness
+            "Eastness": eastness,
         }
 
         aligned = {}
-
         for name, arr in terrain_layers.items():
             aligned[name] = self.aligner.align_raster_to_master(
                 src_array=arr,
@@ -230,159 +152,148 @@ class SpatialFeatureFetcher:
                 src_transform=native_transform,
                 grid_info=grid_info,
                 resampling_method=Resampling.bilinear,
-                dst_nodata=np.nan
+                dst_nodata=np.nan,
             )
-
         return aligned
 
-    def _query_osm_buffered(self, grid_info: dict, osm_tags: dict, buffer_meters: float = 5000.0):
-        """queries osm within a metric buffer and projects geometries to utm."""
+    def _query_osm_resilient(self, grid_info: dict, buffer_meters: float = 4000.0) -> Optional[gpd.GeoDataFrame]:
+        """Queries Overpass with automatic multi-mirror failover and fast timeout."""
+        west, south, east, north = self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
 
-        bbox = self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
+        for endpoint in self.OVERPASS_SERVERS:
+            ox.settings.overpass_endpoint = endpoint
+            try:
+                if hasattr(ox, "features_from_bbox"):
+                    gdf = ox.features_from_bbox(bbox=(west, south, east, north), tags=self.TARGETED_OSM_TAGS)
+                else:
+                    gdf = ox.geometries_from_bbox(north, south, east, west, tags=self.TARGETED_OSM_TAGS)
 
-        west, south, east, north = bbox
-
-        try:
-            if hasattr(ox, "features_from_bbox"):
-                gdf = ox.features_from_bbox(bbox=(west, south, east, north), tags=osm_tags)
-            else:
-                gdf = ox.geometries_from_bbox(north, south, east, west, tags=osm_tags)
-
-            if gdf is None or gdf.empty:
+                if gdf is not None and not gdf.empty:
+                    return gdf.to_crs(grid_info["crs"])
                 return None
+            except Exception:
+                continue
 
-            return gdf.to_crs(grid_info["crs"])
+        print("  [OSM Warning] All Overpass endpoints timed out. Using default distance matrices.")
+        return None
 
-        except Exception as e:
-            print(f"osm query warning: {e}")
-            return None
-
-    def _rasterize_geometries(self, gdf_utm, shape: tuple, transform, value: int, fill: int = 0) -> np.ndarray:
-        """rasterizes valid geometries into a mask."""
-
+    def _rasterize_geometries(self, gdf_utm, shape: Tuple[int, int], transform, value: int = 1, fill: int = 0) -> np.ndarray:
         if gdf_utm is None or gdf_utm.empty:
             return np.full(shape, fill, dtype=np.uint8)
-
-        shapes = [
-            (geom, value)
-            for geom in gdf_utm.geometry
-            if geom is not None and not geom.is_empty
-        ]
-
+        shapes = [(geom, value) for geom in gdf_utm.geometry if geom is not None and not geom.is_empty]
         if not shapes:
             return np.full(shape, fill, dtype=np.uint8)
-
         return rasterize(shapes, out_shape=shape, transform=transform, fill=fill, dtype=np.uint8)
 
-    def _compute_buffered_edt(self, gdf_utm, grid_info: dict, buffer_meters: float = 5000.0) -> np.ndarray:
-        """computes euclidean distance in meters on a buffered grid."""
-
-        _, buf_shape, buf_transform = self._get_buffered_grid(grid_info, buffer_meters, 10.0)
-
-        if gdf_utm is None or gdf_utm.empty:
-            return np.full(grid_info["shape"], 50000.0, dtype=np.float32)
-
-        mask = self._rasterize_geometries(gdf_utm, buf_shape, buf_transform, value=1, fill=0)
-
-        distance = distance_transform_edt(1 - mask) * 10.0
-
-        offset = int(round(buffer_meters / 10.0))
-
-        result = distance[
-            offset:offset + GRID_SIZE_PX,
-            offset:offset + GRID_SIZE_PX
-        ]
-
-        return result.astype(np.float32)
-
-    def _compute_buffered_accessibility(self, dem_buffered: np.ndarray, passable_buffered: np.ndarray, gdf_utm_buffered, grid_info: dict, buffer_meters: float = 5000.0, max_time_cap_hours: float = 12.0) -> np.ndarray:
-        """computes minimum walking time on a buffered terrain graph."""
-
-        buf_shape = dem_buffered.shape
-
-        _, expected_shape, buf_transform = self._get_buffered_grid(grid_info, buffer_meters, 10.0)
-
-        if buf_shape != expected_shape:
-            raise ValueError(f"buffered DEM shape {buf_shape} does not match expected shape {expected_shape}")
-
-        sources = self._rasterize_geometries(gdf_utm_buffered, buf_shape, buf_transform, value=1, fill=0)
-
-        sources[passable_buffered == 0] = 0
+    def _compute_fast_accessibility_50m(
+        self,
+        dem_50m: np.ndarray,
+        passable_50m: np.ndarray,
+        gdf_subset,
+        grid_info: dict,
+        buf_transform_50m,
+        max_time_cap_hours: float = 12.0,
+    ) -> np.ndarray:
+        shape_50m = dem_50m.shape
+        sources = self._rasterize_geometries(gdf_subset, shape_50m, buf_transform_50m, value=1, fill=0)
+        sources[passable_50m == 0] = 0
 
         if not np.any(sources == 1):
             return np.full(grid_info["shape"], max_time_cap_hours, dtype=np.float32)
 
-        optimal_time = dijkstra_kernel(dem_buffered, sources, passable_buffered, resolution=10.0)
+        time_50m = dijkstra_kernel(dem_50m, sources, passable_50m, resolution=50.0)
+        time_50m = np.where(np.isinf(time_50m), max_time_cap_hours, time_50m)
+        time_50m = np.clip(time_50m, 0.0, max_time_cap_hours).astype(np.float32)
 
-        offset = int(round(buffer_meters / 10.0))
+        master_time_10m = np.full(grid_info["shape"], max_time_cap_hours, dtype=np.float32)
+        reproject(
+            source=time_50m,
+            destination=master_time_10m,
+            src_transform=buf_transform_50m,
+            src_crs=grid_info["crs"],
+            dst_transform=grid_info["transform"],
+            dst_crs=grid_info["crs"],
+            resampling=Resampling.bilinear,
+            dst_nodata=max_time_cap_hours,
+        )
+        return master_time_10m
 
-        master_time = optimal_time[
-            offset:offset + GRID_SIZE_PX,
-            offset:offset + GRID_SIZE_PX
-        ]
+    def _compute_fast_edt_50m(
+        self, gdf_subset, grid_info: dict, buf_shape_50m: tuple, buf_transform_50m, max_dist_m: float = 50000.0
+    ) -> np.ndarray:
+        if gdf_subset is None or gdf_subset.empty:
+            return np.full(grid_info["shape"], max_dist_m, dtype=np.float32)
 
-        clean_time = np.where(np.isinf(master_time), max_time_cap_hours, master_time)
+        mask_50m = self._rasterize_geometries(gdf_subset, buf_shape_50m, buf_transform_50m, value=1, fill=0)
+        dist_50m = (distance_transform_edt(1 - mask_50m) * 50.0).astype(np.float32)
 
-        return np.clip(clean_time, 0.0, max_time_cap_hours).astype(np.float32)
+        dist_10m = np.full(grid_info["shape"], max_dist_m, dtype=np.float32)
+        reproject(
+            source=dist_50m,
+            destination=dist_10m,
+            src_transform=buf_transform_50m,
+            src_crs=grid_info["crs"],
+            dst_transform=grid_info["transform"],
+            dst_crs=grid_info["crs"],
+            resampling=Resampling.bilinear,
+            dst_nodata=max_dist_m,
+        )
+        return dist_10m
 
-    def fetch_all_spatial_features(self, lat: float, lon: float, scl_10m: np.ndarray = None, buffer_meters: float = 5000.0) -> dict:
-        """fetches all static spatial features for one scene."""
-
+    def fetch_all_spatial_features(self, lat: float, lon: float, scl_10m: np.ndarray = None, buffer_meters: float = 4000.0) -> Dict[str, np.ndarray]:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
 
-        shape = grid_info["shape"]
-        transform = grid_info["transform"]
-
+        # 1. 10m Terrain layers
         terrain = self.fetch_dem_features(grid_info)
-        elevation_10m = terrain["Elevation"]
 
-        dem_buffered, _ = self._fetch_dem_raster(grid_info, buffer_meters=buffer_meters, resolution=10.0)
+        # 2. 50m DEM for graph routing
+        dem_50m, buf_transform_50m = self._fetch_dem_raster(grid_info, buffer_meters=buffer_meters, resolution=50.0)
+        _, buf_shape_50m, _ = self._get_buffered_grid(grid_info, buffer_meters, 50.0)
 
-        gdf_roads = self._query_osm_buffered(grid_info, self.tags_roads, buffer_meters)
-        gdf_trails = self._query_osm_buffered(grid_info, self.tags_trails, buffer_meters)
-        gdf_water = self._query_osm_buffered(grid_info, self.tags_water, buffer_meters)
-        gdf_bridges = self._query_osm_buffered(grid_info, self.tags_bridges, buffer_meters)
-        gdf_railways = self._query_osm_buffered(grid_info, self.tags_railways, buffer_meters)
-        gdf_camps = self._query_osm_buffered(grid_info, self.tags_camps, buffer_meters)
-        gdf_power = self._query_osm_buffered(grid_info, self.tags_power, buffer_meters)
+        # 3. Resilient OSM Query with server failover
+        gdf_all = self._query_osm_resilient(grid_info, buffer_meters=buffer_meters)
 
-        _, buf_shape, buf_transform = self._get_buffered_grid(grid_info, buffer_meters, 10.0)
+        gdf_roads, gdf_trails, gdf_water = None, None, None
+        gdf_railways, gdf_camps, gdf_power = None, None, None
 
-        passable_buffered = np.ones(buf_shape, dtype=np.uint8)
+        if gdf_all is not None and not gdf_all.empty:
+            if "highway" in gdf_all.columns:
+                gdf_roads = gdf_all[gdf_all["highway"].isin(self.ROAD_HIGHWAYS)]
+                gdf_trails = gdf_all[gdf_all["highway"].isin(self.TRAIL_HIGHWAYS)]
+            if "natural" in gdf_all.columns or "waterway" in gdf_all.columns:
+                w_cond = False
+                if "natural" in gdf_all.columns:
+                    w_cond = gdf_all["natural"].isin(["water", "wetland"])
+                if "waterway" in gdf_all.columns:
+                    w_cond = w_cond | gdf_all["waterway"].isin(["river", "stream", "canal"])
+                gdf_water = gdf_all[w_cond]
+            if "railway" in gdf_all.columns:
+                gdf_railways = gdf_all[gdf_all["railway"].isin(self.TARGETED_OSM_TAGS["railway"])]
+            if "power" in gdf_all.columns:
+                gdf_power = gdf_all[gdf_all["power"].isin(self.TARGETED_OSM_TAGS["power"])]
+            if "tourism" in gdf_all.columns or "amenity" in gdf_all.columns:
+                c_cond = False
+                if "tourism" in gdf_all.columns:
+                    c_cond = gdf_all["tourism"].isin(self.TARGETED_OSM_TAGS["tourism"])
+                if "amenity" in gdf_all.columns:
+                    c_cond = c_cond | gdf_all["amenity"].isin(self.TARGETED_OSM_TAGS["amenity"])
+                gdf_camps = gdf_all[c_cond]
 
-        water_mask = self._rasterize_geometries(gdf_water, buf_shape, buf_transform, value=1, fill=0)
+        # 4. Passable matrix
+        passable_50m = np.ones(buf_shape_50m, dtype=np.uint8)
+        water_mask_50m = self._rasterize_geometries(gdf_water, buf_shape_50m, buf_transform_50m, value=1, fill=0)
+        passable_50m[water_mask_50m == 1] = 0
+        passable_50m[np.isnan(dem_50m)] = 0
 
-        passable_buffered[water_mask == 1] = 0
-
-        if scl_10m is not None:
-            if scl_10m.shape != shape:
-                raise ValueError("scl_10m must have the same shape as the master grid")
-
-            offset = int(round(buffer_meters / 10.0))
-
-            inner_slice = (
-                slice(offset, offset + GRID_SIZE_PX),
-                slice(offset, offset + GRID_SIZE_PX)
-            )
-
-            passable_inner = passable_buffered[inner_slice]
-            passable_inner[scl_10m == 6] = 0
-            passable_buffered[inner_slice] = passable_inner
-
-        passable_buffered[np.isnan(dem_buffered)] = 0
-
-        bridge_mask = self._rasterize_geometries(gdf_bridges, buf_shape, buf_transform, value=1, fill=0)
-
-        passable_buffered[bridge_mask == 1] = 1
-
-        travel_roads = self._compute_buffered_accessibility(dem_buffered, passable_buffered, gdf_roads, grid_info, buffer_meters)
-        travel_trails = self._compute_buffered_accessibility(dem_buffered, passable_buffered, gdf_trails, grid_info, buffer_meters)
-        dist_railways = self._compute_buffered_edt(gdf_railways, grid_info, buffer_meters)
-        dist_camps = self._compute_buffered_edt(gdf_camps, grid_info, buffer_meters)
-        dist_power = self._compute_buffered_edt(gdf_power, grid_info, buffer_meters)
+        # 5. Fast Distance & Travel Time matrices
+        travel_roads = self._compute_fast_accessibility_50m(dem_50m, passable_50m, gdf_roads, grid_info, buf_transform_50m)
+        travel_trails = self._compute_fast_accessibility_50m(dem_50m, passable_50m, gdf_trails, grid_info, buf_transform_50m)
+        dist_railways = self._compute_fast_edt_50m(gdf_railways, grid_info, buf_shape_50m, buf_transform_50m)
+        dist_camps = self._compute_fast_edt_50m(gdf_camps, grid_info, buf_shape_50m, buf_transform_50m)
+        dist_power = self._compute_fast_edt_50m(gdf_power, grid_info, buf_shape_50m, buf_transform_50m)
 
         return {
-            "Elevation": elevation_10m,
+            "Elevation": terrain["Elevation"],
             "Slope": terrain["Slope"],
             "Northness": terrain["Northness"],
             "Eastness": terrain["Eastness"],
@@ -390,10 +301,10 @@ class SpatialFeatureFetcher:
             "Travel_Time_Trails": travel_trails,
             "Dist_to_Railways": dist_railways,
             "Dist_to_Camps": dist_camps,
-            "Dist_to_Powerlines": dist_power
+            "Dist_to_Powerlines": dist_power,
         }
 
-
+    
 if __name__ == "__main__":
     fetcher = SpatialFeatureFetcher()
 

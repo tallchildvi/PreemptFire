@@ -1,7 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
-import math
 from typing import Any, Dict, List, Optional, Tuple
-import matplotlib.pyplot as plt
 import numpy as np
 import planetary_computer as pc
 import pystac_client
@@ -15,45 +14,42 @@ from src.processing.grid_aligner import GridAligner
 
 
 class SentinelFetcher:
-    """Fetches Sentinel-2 (T0, Tprev) and Sentinel-1 SAR bands from Planetary Computer STAC."""
-
+    
     SCL_WATER = [6]
     SCL_SNOW = [11]
-    SCL_CLOUDS = [8, 9, 10]          # Medium/High probability clouds + Cirrus
-    SCL_CLOUD_SHADOWS = [3]          # Cloud shadows
-    SCL_INVALID = [0, 1, 2, 3, 8, 9, 10, 11]  # NoData, Defects, Shadows, Clouds, Snow
- 
-    def __init__(self):
+    SCL_CLOUDS = [8, 9, 10]
+    SCL_CLOUD_SHADOWS = [3]
+    SCL_INVALID = [0, 1, 2, 3, 8, 9, 10, 11]
+
+    OPTICAL_BANDS = [
+        "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"
+    ]
+
+    def __init__(self, max_nodata_fraction: float = 0.20, max_workers: int = 10):
         self.stac_client = pystac_client.Client.open(
-            "https://planetarycomputer.microsoft.com/api/stac/v1",
-            modifier=pc.sign_inplace,
+            "https://planetarycomputer.microsoft.com/api/stac/v1"
         )
         self.aligner = GridAligner()
+        self.max_nodata_fraction = max_nodata_fraction
+        self.max_workers = max_workers
 
     @staticmethod
     def extract_scl_masks(scl_array: np.ndarray) -> Dict[str, np.ndarray]:
-        """Extracts individual binary float32 masks (0.0 or 1.0) from raw SCL raster."""
         scl_clean = np.nan_to_num(scl_array, nan=0).astype(np.uint8)
-
-        mask_water = np.isin(scl_clean, SentinelFetcher.SCL_WATER).astype(np.float32)
-        mask_snow = np.isin(scl_clean, SentinelFetcher.SCL_SNOW).astype(np.float32)
-        mask_clouds = np.isin(scl_clean, SentinelFetcher.SCL_CLOUDS).astype(np.float32)
-        mask_cloud_shadows = np.isin(scl_clean, SentinelFetcher.SCL_CLOUD_SHADOWS).astype(np.float32)
-        mask_invalid = np.isin(scl_clean, SentinelFetcher.SCL_INVALID).astype(np.float32)
-
         return {
-            "MASK_WATER": mask_water,
-            "MASK_SNOW": mask_snow,
-            "MASK_CLOUDS": mask_clouds,
-            "MASK_CLOUD_SHADOWS": mask_cloud_shadows,
-            "MASK_INVALID": mask_invalid,  # Full mask for Loss calculation
+            "MASK_WATER": np.isin(scl_clean, SentinelFetcher.SCL_WATER).astype(np.float32),
+            "MASK_SNOW": np.isin(scl_clean, SentinelFetcher.SCL_SNOW).astype(np.float32),
+            "MASK_CLOUDS": np.isin(scl_clean, SentinelFetcher.SCL_CLOUDS).astype(np.float32),
+            "MASK_CLOUD_SHADOWS": np.isin(scl_clean, SentinelFetcher.SCL_CLOUD_SHADOWS).astype(np.float32),
+            "MASK_INVALID": np.isin(scl_clean, SentinelFetcher.SCL_INVALID).astype(np.float32),
         }
 
     def _read_band_window(
         self, asset_url: str, bbox_wgs84: List[float]
     ) -> Tuple[np.ndarray, Affine, Any]:
-        """Reads a specific spatial window from a signed cloud COG URL."""
-        with rasterio.open(asset_url) as src:
+        """Signs URL dynamically right before fetching to eliminate SAS token expiration."""
+        signed_url = pc.sign(asset_url)
+        with rasterio.open(signed_url) as src:
             west, south, east, north = bbox_wgs84
             left, bottom, right, top = transform_bounds(
                 "EPSG:4326", src.crs, west, south, east, north
@@ -63,14 +59,42 @@ class SentinelFetcher:
             win_transform = src.window_transform(window)
             return data.astype(np.float32), win_transform, src.crs
 
+    def _fetch_single_band(
+        self, band_name: str, item: Any, grid_info: Dict
+    ) -> Tuple[str, Optional[np.ndarray]]:
+        if band_name not in item.assets:
+            return band_name, None
+
+        try:
+            asset_url = item.assets[band_name].href
+            raw_data, src_transform, src_crs = self._read_band_window(
+                asset_url, grid_info["bbox_wgs84"]
+            )
+
+            resampling = Resampling.nearest if band_name == "SCL" else Resampling.bilinear
+            dst_nodata = 0 if band_name == "SCL" else np.nan
+
+            aligned = self.aligner.align_raster_to_master(
+                src_array=raw_data,
+                src_crs=src_crs,
+                src_transform=src_transform,
+                grid_info=grid_info,
+                resampling_method=resampling,
+                dst_nodata=dst_nodata,
+            )
+            return band_name, aligned
+        except Exception as e:
+            print(f"  [Warning] Failed band {band_name}: {e}")
+            return band_name, None
+
     def fetch_sentinel2_scene(
         self,
         grid_info: Dict,
         target_date_str: str,
         lookback_days: int = 15,
-        max_cloud_cover: float = 20.0,
+        max_cloud_cover: float = 25.0,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], str]:
-        """Fetches optical bands and SCL-derived masks for the clearest scene."""
+        """Searches and selects a valid scene where NoData < 20%, parallel fetching all bands."""
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         start_dt = target_dt - timedelta(days=lookback_days)
 
@@ -88,82 +112,87 @@ class SentinelFetcher:
         if not items:
             return {}, {}, ""
 
-        selected_item = items[0]
-        actual_date = selected_item.datetime.strftime("%Y-%m-%d")
-
-        bands_to_fetch = [
-            "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12", "SCL"
-        ]
-        aligned_bands = {}
-
-        for band in bands_to_fetch:
-            if band not in selected_item.assets:
+        for candidate_item in items:
+            if "SCL" not in candidate_item.assets:
                 continue
-            asset_url = selected_item.assets[band].href
-            raw_data, src_transform, src_crs = self._read_band_window(asset_url, bbox)
 
-            resampling = Resampling.nearest if band == "SCL" else Resampling.bilinear
-            dst_nodata = 0 if band == "SCL" else np.nan
+            _, scl_check = self._fetch_single_band("SCL", candidate_item, grid_info)
+            if scl_check is None:
+                continue
 
-            aligned_bands[band] = self.aligner.align_raster_to_master(
-                src_array=raw_data,
-                src_crs=src_crs,
-                src_transform=src_transform,
-                grid_info=grid_info,
-                resampling_method=resampling,
-                dst_nodata=dst_nodata,
-            )
+            nodata_ratio = float((scl_check == 0).mean())
+            if nodata_ratio > self.max_nodata_fraction:
+                print(f"  [Skip] Scene {candidate_item.id} rejected: NoData is {nodata_ratio * 100:.1f}% (> 20%)")
+                continue
 
-        scl_array = aligned_bands.pop("SCL")
-        masks = self.extract_scl_masks(scl_array)
+            actual_date = candidate_item.datetime.strftime("%Y-%m-%d")
 
-        return aligned_bands, masks, actual_date
+            aligned_bands = {"SCL": scl_check}
+            remaining_bands = [b for b in self.OPTICAL_BANDS if b != "SCL"]
+
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = [
+                    executor.submit(self._fetch_single_band, band, candidate_item, grid_info)
+                    for band in remaining_bands
+                ]
+                for f in futures:
+                    b_name, b_arr = f.result()
+                    if b_arr is not None:
+                        aligned_bands[b_name] = b_arr
+
+            scl_array = aligned_bands.pop("SCL")
+            masks = self.extract_scl_masks(scl_array)
+
+            return aligned_bands, masks, actual_date
+
+        print(f"  [Error] No S2 scene found with < {self.max_nodata_fraction*100:.0f}% NoData.")
+        return {}, {}, ""
 
     def fetch_sentinel1_sar(
-        self,
-        grid_info: Dict,
-        target_date_str: str,
-        window_days: int = 10,
+        self, grid_info: Dict, target_date_str: str, window_days: int = 12
     ) -> Dict[str, np.ndarray]:
-        """Fetches Sentinel-1 RTC SAR (VV, VH polarizations)."""
+        """Fetches S1 RTC SAR with fresh SAS signing."""
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         start_dt = target_dt - timedelta(days=window_days)
         end_dt = target_dt + timedelta(days=window_days)
 
-        bbox = grid_info["bbox_wgs84"]
-        date_range = f"{start_dt.strftime('%Y-%m-%d')}/{end_dt.strftime('%Y-%m-%d')}"
-
         search = self.stac_client.search(
             collections=["sentinel-1-rtc"],
-            bbox=bbox,
-            datetime=date_range,
+            bbox=grid_info["bbox_wgs84"],
+            datetime=f"{start_dt.strftime('%Y-%m-%d')}/{end_dt.strftime('%Y-%m-%d')}",
         )
         items = list(search.items())
         if not items:
             return {}
 
-        selected_item = items[0]
-        sar_bands = {}
+        for item in items:
+            sar_bands = {}
+            for pol in ["vv", "vh"]:
+                if pol not in item.assets:
+                    continue
+                try:
+                    asset_url = item.assets[pol].href
+                    raw_data, src_transform, src_crs = self._read_band_window(
+                        asset_url, grid_info["bbox_wgs84"]
+                    )
+                    sar_bands[f"SAR_{pol.upper()}"] = self.aligner.align_raster_to_master(
+                        src_array=raw_data,
+                        src_crs=src_crs,
+                        src_transform=src_transform,
+                        grid_info=grid_info,
+                        resampling_method=Resampling.bilinear,
+                        dst_nodata=np.nan,
+                    )
+                except Exception as e:
+                    print(f"  [Warning] S1 SAR {pol} fetch failed: {e}")
+                    break
 
-        for pol in ["vv", "vh"]:
-            if pol not in selected_item.assets:
-                continue
-            asset_url = selected_item.assets[pol].href
-            raw_data, src_transform, src_crs = self._read_band_window(asset_url, bbox)
+            if len(sar_bands) == 2:
+                return sar_bands
 
-            sar_bands[f"SAR_{pol.upper()}"] = self.aligner.align_raster_to_master(
-                src_array=raw_data,
-                src_crs=src_crs,
-                src_transform=src_transform,
-                grid_info=grid_info,
-                resampling_method=Resampling.bilinear,
-                dst_nodata=np.nan,
-            )
-
-        return sar_bands
+        return {}
 
     def fetch_all_radar_optical(self, lat: float, lon: float, target_date: str) -> Dict[str, Any]:
-        """Orchestrates fetching T0 optical, T0 masks, Tprev optical, Tprev masks, and SAR."""
         grid_info = self.aligner.get_master_grid_info(lat, lon)
 
         # 1. Fetch T0
@@ -171,17 +200,16 @@ class SentinelFetcher:
             grid_info, target_date, lookback_days=15
         )
         if not bands_t0:
-            print(f"Warning: No clear S2 T0 scene found for ({lat}, {lon}) near {target_date}")
             return {}
 
         # 2. Fetch Tprev
         t0_dt = datetime.strptime(t0_date, "%Y-%m-%d")
         tprev_target = (t0_dt - timedelta(days=10)).strftime("%Y-%m-%d")
         bands_tprev, masks_tprev, tprev_date = self.fetch_sentinel2_scene(
-            grid_info, tprev_target, lookback_days=25
+            grid_info, tprev_target, lookback_days=30
         )
 
-        # 3. Fetch Sentinel-1 SAR
+        # 3. Fetch S1 SAR
         sar_bands = self.fetch_sentinel1_sar(grid_info, t0_date)
 
         return {
