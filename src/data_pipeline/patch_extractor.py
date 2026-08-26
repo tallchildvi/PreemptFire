@@ -31,8 +31,9 @@ class PatchExtractor:
         channel_names: List[str] = sorted(rasters_2d.keys())
         stacked_2d = np.stack([rasters_2d[k] for k in channel_names], axis=0).astype(np.float32)
 
+        # sort 1d keys for deterministic feature vector creation
         sorted_context_keys = sorted(context_1d.keys())
-        context_vec = np.array([context_1d[k] for k in sorted_context_keys], dtype=np.float32)
+        context_vec = np.array([float(context_1d[k]) for k in sorted_context_keys], dtype=np.float32)
 
         _, height, width = stacked_2d.shape
         patch_idx = 0
@@ -52,7 +53,7 @@ class PatchExtractor:
                 patch_2d = stacked_2d[:, row_slice, col_slice]
                 patch_target = target[:, row_slice, col_slice]
 
-                # assemble comprehensive metadata for downstream spatial and temporal splitting
+                # assemble comprehensive metadata
                 patch_meta = {
                     "scene_id": str(scene_id),
                     "patch_idx": int(patch_idx),
