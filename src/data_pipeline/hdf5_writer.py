@@ -1,7 +1,7 @@
+from datetime import datetime
 import os
 import threading
-import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 import h5py
 import numpy as np
 
@@ -24,7 +24,7 @@ class HDF5Writer:
         os.makedirs(os.path.dirname(output_filepath), exist_ok=True)
 
     def _ensure_channel_datasets(self, sample_patch: Dict[str, Any]):
-        """dynamically creates separate datasets for each 2d channel, 1d metric, and target scale."""
+        """dynamically creates separate datasets for each 2d channel, 1d metric, target scale, and metadata."""
         if self._initialized or os.path.exists(self.output_filepath):
             self._initialized = True
             return
@@ -80,11 +80,25 @@ class HDF5Writer:
                     compression=self.compression,
                 )
 
-            # 4. metadata group
+            # 4. comprehensive metadata group
             g_meta = h5.create_group("metadata")
             g_meta.create_dataset("patch_id", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(256,))
             g_meta.create_dataset("scene_id", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(256,))
+            g_meta.create_dataset("target_date", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(256,))
+            g_meta.create_dataset("t0_date", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(256,))
+            g_meta.create_dataset("tprev_date", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(256,))
+            g_meta.create_dataset("crs", shape=(0,), maxshape=(None,), dtype=str_dtype, chunks=(256,))
+
             g_meta.create_dataset("is_fire", shape=(0,), maxshape=(None,), dtype=np.uint8, chunks=(256,))
+            g_meta.create_dataset("month", shape=(0,), maxshape=(None,), dtype=np.uint8, chunks=(256,))
+            g_meta.create_dataset("day_of_year", shape=(0,), maxshape=(None,), dtype=np.uint16, chunks=(256,))
+            g_meta.create_dataset("row_offset", shape=(0,), maxshape=(None,), dtype=np.uint16, chunks=(256,))
+            g_meta.create_dataset("col_offset", shape=(0,), maxshape=(None,), dtype=np.uint16, chunks=(256,))
+
+            g_meta.create_dataset("scene_lat", shape=(0,), maxshape=(None,), dtype=np.float32, chunks=(256,))
+            g_meta.create_dataset("scene_lon", shape=(0,), maxshape=(None,), dtype=np.float32, chunks=(256,))
+            g_meta.create_dataset("invalid_ratio", shape=(0,), maxshape=(None,), dtype=np.float32, chunks=(256,))
+            g_meta.create_dataset("target_max_local", shape=(0,), maxshape=(None,), dtype=np.float32, chunks=(256,))
 
         self._initialized = True
 
@@ -132,18 +146,33 @@ class HDF5Writer:
                     ds.resize((new_len, self.patch_size, self.patch_size))
                     ds[curr_len:new_len] = tgt_stack
 
-                # 4. write metadata
-                ds_patch_id = h5["metadata"]["patch_id"]
-                ds_scene_id = h5["metadata"]["scene_id"]
-                ds_is_fire = h5["metadata"]["is_fire"]
+                # 4. write metadata with explicit string casting
+                meta_ds = h5["metadata"]
+                for k in meta_ds.keys():
+                    meta_ds[k].resize((new_len,))
 
-                ds_patch_id.resize((new_len,))
-                ds_scene_id.resize((new_len,))
-                ds_is_fire.resize((new_len,))
+                meta_ds["patch_id"][curr_len:new_len] = [str(p["patch_id"]) for p in patches]
+                meta_ds["scene_id"][curr_len:new_len] = [str(p["metadata"]["scene_id"]) for p in patches]
+                meta_ds["target_date"][curr_len:new_len] = [str(p["metadata"]["target_date"]) for p in patches]
+                meta_ds["t0_date"][curr_len:new_len] = [str(p["metadata"]["t0_date"]) for p in patches]
+                meta_ds["tprev_date"][curr_len:new_len] = [str(p["metadata"]["tprev_date"]) for p in patches]
+                meta_ds["crs"][curr_len:new_len] = [str(p["metadata"]["crs"]) for p in patches]
 
-                ds_patch_id[curr_len:new_len] = [p["patch_id"] for p in patches]
-                ds_scene_id[curr_len:new_len] = [p["metadata"]["scene_id"] for p in patches]
-                ds_is_fire[curr_len:new_len] = np.array([int(p["metadata"]["is_fire"]) for p in patches], dtype=np.uint8)
+                meta_ds["is_fire"][curr_len:new_len] = np.array([int(p["metadata"]["is_fire"]) for p in patches], dtype=np.uint8)
+                meta_ds["month"][curr_len:new_len] = np.array(
+                    [int(p["metadata"]["target_date"].split("-")[1]) for p in patches], dtype=np.uint8
+                )
+                meta_ds["day_of_year"][curr_len:new_len] = np.array(
+                    [int(datetime.strptime(p["metadata"]["target_date"], "%Y-%m-%d").timetuple().tm_yday) for p in patches],
+                    dtype=np.uint16,
+                )
+                meta_ds["row_offset"][curr_len:new_len] = np.array([int(p["metadata"]["row_offset"]) for p in patches], dtype=np.uint16)
+                meta_ds["col_offset"][curr_len:new_len] = np.array([int(p["metadata"]["col_offset"]) for p in patches], dtype=np.uint16)
+
+                meta_ds["scene_lat"][curr_len:new_len] = np.array([float(p["metadata"]["lat"]) for p in patches], dtype=np.float32)
+                meta_ds["scene_lon"][curr_len:new_len] = np.array([float(p["metadata"]["lon"]) for p in patches], dtype=np.float32)
+                meta_ds["invalid_ratio"][curr_len:new_len] = np.array([float(p["metadata"]["invalid_ratio"]) for p in patches], dtype=np.float32)
+                meta_ds["target_max_local"][curr_len:new_len] = np.array([float(p["metadata"]["target_max_local"]) for p in patches], dtype=np.float32)
 
         return batch_size
 
@@ -199,7 +228,7 @@ if __name__ == "__main__":
 
         # collect all valid patches from generator
         patches_batch = list(extractor.extract_patches(sample, scene_id=scene_id))
-        
+
         # write batch atomically
         written_count = writer.write_patches_batch(patches_batch)
         print(f"Successfully saved {written_count} patches into {test_h5_path}")
