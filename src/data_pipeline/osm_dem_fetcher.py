@@ -1,8 +1,8 @@
+from datetime import date
 import time
 from typing import Dict, List, Optional, Tuple
 import geopandas as gpd
 import numpy as np
-import osmnx as ox
 import planetary_computer as pc
 import pystac_client
 import rasterio
@@ -14,25 +14,19 @@ from rasterio.transform import from_bounds
 from rasterio.warp import reproject
 from scipy.ndimage import distance_transform_edt
 
-from src.config import GRID_SIZE_PX
 from src.data_pipeline.accessibility.solver import dijkstra_kernel
+from src.data_pipeline.osm_temporal_cache import make_temporal_osm_query
 from src.processing.grid_aligner import GridAligner
 
 
 class SpatialFeatureFetcher:
-    """Production-grade DEM and OSM feature extractor with multi-tier fault tolerance and bridge passability."""
-
-    OVERPASS_SERVERS: List[str] = [
-        "https://overpass.kumi.systems/api/interpreter",
-        "https://overpass.private.coffee/api/interpreter",
-        "https://overpass-api.de/api/interpreter",
-    ]
+    """Production-grade DEM and OSM feature extractor with temporal disk caching"""
 
     TARGETED_OSM_TAGS: Dict[str, List[str]] = {
         "highway": [
             "motorway", "trunk", "primary", "secondary", "tertiary",
             "unclassified", "residential", "service", "track", "path", "footway",
-            "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link"
+            "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
         ],
         "railway": ["rail", "narrow_gauge", "spur"],
         "power": ["line", "minor_line", "cable", "substation"],
@@ -46,7 +40,7 @@ class SpatialFeatureFetcher:
     ROAD_HIGHWAYS: set[str] = {
         "motorway", "trunk", "primary", "secondary", "tertiary",
         "unclassified", "residential", "service",
-        "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link"
+        "motorway_link", "trunk_link", "primary_link", "secondary_link", "tertiary_link",
     }
     TRAIL_HIGHWAYS: set[str] = {"track", "path", "footway"}
 
@@ -61,15 +55,7 @@ class SpatialFeatureFetcher:
         self.retry_backoff = retry_backoff
         self.aligner = GridAligner()
         self.stac_client = self._init_stac_client()
-
-        ox.settings.use_cache = True
-        ox.settings.log_console = False
-        ox.settings.timeout = timeout_sec
-        ox.settings.overpass_endpoint = self.OVERPASS_SERVERS[0]
-
-    
-    # STAC Client Management
-    
+        self._query_osm_temporal = make_temporal_osm_query()
 
     def _init_stac_client(self) -> Optional[pystac_client.Client]:
         for attempt in range(self.max_retries):
@@ -90,10 +76,6 @@ class SpatialFeatureFetcher:
         if self.stac_client is None:
             self.stac_client = self._init_stac_client()
         return self.stac_client is not None
-
-    
-    # Grid Geometry Calculations
-    
 
     def _get_buffered_grid(
         self, grid_info: dict, buffer_meters: float, resolution: float
@@ -124,10 +106,6 @@ class SpatialFeatureFetcher:
         lats = [p[1] for p in corners_wgs84]
 
         return min(lons), min(lats), max(lons), max(lats)
-
-    
-    # Copernicus DEM Ingestion
-    
 
     def _fetch_dem_raster(
         self, grid_info: dict, buffer_meters: float, resolution: float
@@ -229,54 +207,13 @@ class SpatialFeatureFetcher:
 
         return aligned
 
-    
-    # Resilient OSM Querying
-    
-
-    def _query_osm_resilient(
-        self, grid_info: dict, buffer_meters: float = 4000.0
-    ) -> Optional[gpd.GeoDataFrame]:
-        west, south, east, north = self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
-
-        for endpoint in self.OVERPASS_SERVERS:
-            ox.settings.overpass_endpoint = endpoint
-
-            for attempt in range(self.max_retries):
-                try:
-                    if hasattr(ox, "features_from_bbox"):
-                        gdf = ox.features_from_bbox(
-                            bbox=(west, south, east, north),
-                            tags=self.TARGETED_OSM_TAGS,
-                        )
-                    else:
-                        gdf = ox.geometries_from_bbox(
-                            north, south, east, west,
-                            tags=self.TARGETED_OSM_TAGS,
-                        )
-
-                    if gdf is not None and not gdf.empty:
-                        return gdf.to_crs(grid_info["crs"])
-                    return None
-
-                except Exception as e:
-                    wait = self.retry_backoff ** attempt
-                    print(
-                        f"  [OSM] {endpoint} attempt {attempt + 1}/{self.max_retries} "
-                        f"failed ({type(e).__name__}), retrying in {wait:.0f}s..."
-                    )
-                    time.sleep(wait)
-
-            print(f"  [OSM] Endpoint {endpoint} exhausted — switching to fallback mirror...")
-
-        print("  [OSM] All Overpass mirrors failed — defaulting distance/accessibility matrices.")
-        return None
-
-    
-    # Rasterization, Graph Routing & EDT
-    
-
     def _rasterize_geometries(
-        self, gdf_utm: Optional[gpd.GeoDataFrame], shape: Tuple[int, int], transform: rasterio.Affine, value: int = 1, fill: int = 0
+        self,
+        gdf_utm: Optional[gpd.GeoDataFrame],
+        shape: Tuple[int, int],
+        transform: rasterio.Affine,
+        value: int = 1,
+        fill: int = 0,
     ) -> np.ndarray:
         if gdf_utm is None or gdf_utm.empty:
             return np.full(shape, fill, dtype=np.uint8)
@@ -366,17 +303,16 @@ class SpatialFeatureFetcher:
             print(f"  [EDT] Distance transform failed ({e}) — using fallback cap.")
             return fallback
 
-    
-    # Public Orchestrator
-    
 
     def fetch_all_spatial_features(
         self,
         lat: float,
         lon: float,
+        target_date: Optional[str] = None,
         scl_10m: Optional[np.ndarray] = None,
         buffer_meters: float = 4000.0,
     ) -> Dict[str, np.ndarray]:
+        date_str = target_date.split(" ")[0] if target_date else date.today().strftime("%Y-%m-%d")
         grid_info = self.aligner.get_master_grid_info(lat, lon)
 
         # 1. High-resolution terrain features
@@ -388,8 +324,8 @@ class SpatialFeatureFetcher:
         )
         _, buf_shape_50m, _ = self._get_buffered_grid(grid_info, buffer_meters, 50.0)
 
-        # 3. Fault-tolerant OSM query & vector filtering
-        gdf_all = self._query_osm_resilient(grid_info, buffer_meters=buffer_meters)
+        # 3. Disk-cached temporal OSM query
+        gdf_all = self._query_osm_temporal(grid_info, target_date=date_str, buffer_meters=buffer_meters)
 
         gdf_roads = gdf_trails = gdf_water = gdf_bridges = None
         gdf_railways = gdf_camps = gdf_power = None
@@ -403,9 +339,9 @@ class SpatialFeatureFetcher:
                 if "natural" in gdf_all.columns or "waterway" in gdf_all.columns:
                     w_cond = False
                     if "natural" in gdf_all.columns:
-                        w_cond = gdf_all["natural"].isin(["water", "wetland"])
+                        w_cond = gdf_all["natural"].isin(self.TARGETED_OSM_TAGS["natural"])
                     if "waterway" in gdf_all.columns:
-                        w_cond = w_cond | gdf_all["waterway"].isin(["river", "stream", "canal", "riverbank"])
+                        w_cond = w_cond | gdf_all["waterway"].isin(self.TARGETED_OSM_TAGS["waterway"])
                     gdf_water = gdf_all[w_cond]
 
                 if "bridge" in gdf_all.columns:
@@ -459,14 +395,22 @@ class SpatialFeatureFetcher:
             "Dist_to_Camps": dist_camps,
             "Dist_to_Powerlines": dist_power,
         }
-    
+
+
 if __name__ == "__main__":
     fetcher = SpatialFeatureFetcher()
 
-    data = fetcher.fetch_all_spatial_features(lat=53.5461, lon=-113.4937)
+    test_lat, test_lon = 53.5461, -113.4937
+    test_date = "2023-06-15"
 
+    print(f"fetching spatial features for [{test_lat}, {test_lon}] on {test_date}...")
+    t_start = time.perf_counter()
+    data = fetcher.fetch_all_spatial_features(lat=test_lat, lon=test_lon, target_date=test_date)
+    elapsed = time.perf_counter() - t_start
+
+    print(f"\ncompleted in {elapsed:.2f}s:")
     for name, arr in data.items():
         print(
-            f"{name:20s} shape: {arr.shape}"
+            f"  {name:20s} shape: {arr.shape} | "
             f"range: [{np.nanmin(arr):8.2f}, {np.nanmax(arr):8.2f}]"
         )
