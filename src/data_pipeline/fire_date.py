@@ -181,13 +181,17 @@ class Date:
             return
 
         # 4. FRP stratification and 2D sampling
-        self.df_area_filtered['frp_bin'] = pd.qcut(
-            self.df_area_filtered['frp'], q=3, labels=['small', 'medium', 'large']
-        )
-
-        self.df_area_filtered = self.df_area_filtered.groupby('frp_bin', group_keys=False).apply(
-            lambda bin_group: self._sample_spatially_diverse(bin_group, n_needed=5)
-        )
+        if len(self.df_area_filtered) > 5 and self.df_area_filtered['frp'].nunique() > 1:
+            self.df_area_filtered['frp_bin'] = pd.qcut(
+                self.df_area_filtered['frp'],
+                q=min(3, self.df_area_filtered['frp'].nunique()),
+                duplicates="drop"
+            )
+            self.df_area_filtered = self.df_area_filtered.groupby(
+                'frp_bin', group_keys=False, observed=False
+            ).apply(lambda bin_group: self._sample_spatially_diverse(bin_group, n_needed=5))
+        elif len(self.df_area_filtered) > 5:
+            self.df_area_filtered = self._sample_spatially_diverse(self.df_area_filtered, n_needed=5)
 
         self.df_area_filtered = self.df_area_filtered[
             ['latitude', 'longitude', 'acq_date', 'acq_time', 'bright_ti4', 'frp']
