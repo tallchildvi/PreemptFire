@@ -141,8 +141,8 @@ class SentinelFetcher:
         self,
         grid_info: Dict,
         target_date_str: str,
-        lookback_days: int = 15,
-        max_cloud_cover: float = 35.0,
+        lookback_days: int = 25,
+        max_cloud_cover: float = 60.0,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], str]:
         """searches and mosaics multi-tile acquisitions grouped by date."""
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
