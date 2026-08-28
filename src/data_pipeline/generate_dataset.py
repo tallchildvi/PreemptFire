@@ -60,15 +60,20 @@ class DatasetGenerator:
             conn.commit()
 
     def sync_from_csv(self, df: pd.DataFrame):
-        """registers new points from csv into tracker."""
+        """registers new points from csv into tracker supporting custom schema mappings."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             now = time.strftime("%Y-%m-%d %H:%M:%S")
 
             for _, row in df.iterrows():
-                lat = float(row["lat"])
-                lon = float(row["lon"])
-                date_str = str(row["target_date"]).split(" ")[0]
+                # support both latitude/longitude and lat/lon schemas
+                lat = float(row.get("latitude", row.get("lat")))
+                lon = float(row.get("longitude", row.get("lon")))
+
+                # support both acq_date and target_date
+                raw_date = row.get("acq_date", row.get("target_date"))
+                date_str = str(raw_date).split(" ")[0].strip()
+
                 is_fire = int(row.get("is_fire", 1))
                 scene_id = f"SCENE_{lat:.4f}_{lon:.4f}_{date_str.replace('-', '')}"
 
@@ -152,3 +157,29 @@ class DatasetGenerator:
                 (status, patches_count, error_msg, now, scene_id),
             )
             conn.commit()
+
+
+if __name__ == "__main__":
+    from src.data_pipeline.hdf5_writer import inspect_h5_structure
+
+    csv_input_path = os.path.join("data", "interim", "points_dataset_thinned.csv")
+    output_h5_path = os.path.join("data", "processed", "wildfire_dataset.h5")
+
+    if not os.path.exists(csv_input_path):
+        raise FileNotFoundError(f"input csv file not found: {csv_input_path}")
+
+    print("--- initializing dataset generator ---")
+    generator = DatasetGenerator(
+        points_csv_path=csv_input_path,
+        output_h5_path=output_h5_path,
+        patch_size=256,
+        stride=256,
+        max_invalid_ratio=0.20,
+    )
+
+    print("--- processing first 5 scenes ---")
+    generator.run(max_scenes=5)
+
+    if os.path.exists(output_h5_path):
+        print("\n--- inspecting hdf5 structure ---")
+        inspect_h5_structure(output_h5_path)
