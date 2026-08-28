@@ -136,11 +136,13 @@ def fetch_overpass_at_date(
     west: float, south: float, east: float, north: float, date_str: str
 ) -> Optional[gpd.GeoDataFrame]:
     """queries overpass with exact historical timestamp and multi-mirror fallback."""
+
     ox.settings.overpass_settings = f'[out:json][timeout:90][date:"{date_str}T00:00:00Z"]'
     ox.settings.use_cache = False
     ox.settings.log_console = False
-    ox.settings.requests_kwargs = {"headers": {"User-Agent": "WildfireResearchPipeline/1.0"}}
-
+    ox.settings.http_user_agent = "WildfireResearchPipeline/1.0 (academic wildfire risk modeling)"
+    ox.settings.requests_kwargs = {}
+        
     for endpoint in OVERPASS_SERVERS:
         ox.settings.overpass_endpoint = endpoint
 
