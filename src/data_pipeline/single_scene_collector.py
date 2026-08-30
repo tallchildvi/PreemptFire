@@ -3,6 +3,8 @@ from datetime import datetime
 import time
 from typing import Any, Dict, Optional
 import numpy as np
+import matplotlib.pyplot as plt
+from typing  import Tuple, List
 
 from src.data_pipeline.cffdrs_fetcher import CFFDRSFetcher
 from src.data_pipeline.era5_fetcher import ERA5Fetcher
@@ -52,7 +54,12 @@ class SingleSceneCollector:
 
         def _fetch_dem_osm():
             t0 = time.perf_counter()
-            res = self.spatial_fetcher.fetch_all_spatial_features(lat, lon, scl_10m=None)
+            res = self.spatial_fetcher.fetch_all_spatial_features(
+                lat=lat,
+                lon=lon,
+                target_date=target_date,
+                scl_10m=None,
+            )
             timings["dem_osm_fetch"] = time.perf_counter() - t0
             return res
 
@@ -190,3 +197,107 @@ class SingleSceneCollector:
             "loss_mask": loss_mask,
             "target": target_tensor,
         }
+def visualize_scene(sample: Dict[str, Any]) -> None:
+    """Prints tabular context features and interactively displays 2D raster channels."""
+    meta = sample["metadata"]
+    rasters = sample["rasters_2d"]
+    context = sample["context_1d"]
+
+    # 1. Metadata and execution timings in terminal
+    elapsed = meta.get("elapsed_seconds", 0.0)
+    print("\n" + "=" * 65)
+    print(f"  SCENE METADATA & TIMINGS (Total: {elapsed:.2f}s)")
+    print("=" * 65)
+    print(f"  CRS: {meta['crs']} | T0: {meta['t0_date']} | Tprev: {meta['tprev_date']}")
+    print("-" * 65)
+    for step, dur in meta.get("timings", {}).items():
+        print(f"  {step:<28}: {dur:.2f}s")
+
+    # 2. Tabular meteorological and context metrics
+    print("\n" + "=" * 65)
+    print("  1D CONTEXT & METEOROLOGICAL METRICS")
+    print("=" * 65)
+    for k, v in sorted(context.items()):
+        val_str = f"{v:.4f}" if isinstance(v, (float, np.floating)) else str(v)
+        print(f"  {k:<35}: {val_str}")
+    print("=" * 65 + "\n")
+
+    # 3. Assembling 2D raster layers (rasters + loss mask + targets)
+    display_layers: List[Tuple[str, np.ndarray]] = list(rasters.items())
+
+    if "loss_mask" in sample and sample["loss_mask"] is not None:
+        display_layers.append(("Loss_Mask_INVALID", sample["loss_mask"]))
+
+    if "target" in sample and sample["target"] is not None:
+        target_scales = ["Target_Scale_250m", "Target_Scale_1000m", "Target_Scale_3000m", "Target_Scale_4000m"]
+        for idx, scale_name in enumerate(target_scales):
+            if idx < len(sample["target"]):
+                display_layers.append((scale_name, sample["target"][idx]))
+
+    print(f"Starting pairwise visualization of {len(display_layers)} raster channels...")
+
+    # 4. Pairwise visualization loop
+    for i in range(0, len(display_layers), 2):
+        pair = display_layers[i : i + 2]
+        fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+        for ax_idx, (name, arr) in enumerate(pair):
+            ax = axes[ax_idx]
+            valid = arr[~np.isnan(arr)]
+            if len(valid) > 0 and valid.max() > valid.min():
+                vmin, vmax = np.percentile(valid, 2), np.percentile(valid, 98)
+            else:
+                vmin, vmax = 0, 1
+
+            if "Target" in name:
+                cmap = "hot"
+            elif "Travel" in name or "Dist" in name:
+                cmap = "plasma"
+            elif "Elevation" in name or "DEM" in name:
+                cmap = "terrain"
+            elif "Slope" in name:
+                cmap = "magma"
+            elif "MASK" in name:
+                cmap = "gray"
+            else:
+                cmap = "viridis"
+
+            im = ax.imshow(arr, cmap=cmap, vmin=vmin, vmax=vmax)
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            min_val = np.nanmin(arr) if len(valid) > 0 else np.nan
+            max_val = np.nanmax(arr) if len(valid) > 0 else np.nan
+            ax.set_title(
+                f"[{i + ax_idx + 1}/{len(display_layers)}] {name}\nRange: [{min_val:.2f}, {max_val:.2f}]",
+                fontsize=10,
+            )
+            ax.axis("off")
+
+        if len(pair) == 1:
+            axes[1].axis("off")
+
+        lat, lon = meta.get("lat"), meta.get("lon")
+        target_date = meta.get("target_date")
+        plt.suptitle(f"Scene: ({lat}, {lon}) | Date: {target_date}", fontsize=12, fontweight="bold")
+        plt.tight_layout()
+        plt.show()
+
+if __name__ == "__main__":
+    collector = SingleSceneCollector()
+
+    # test_lat, test_lon = 50.6745, -120.3273
+    test_lat, test_lon = 58.0313, -104.0258
+    test_date = "2021-08-15"
+
+    print(f"Fetching scene for ({test_lat}, {test_lon}) on {test_date}...")
+    sample = collector.collect_sample(
+        lat=test_lat,
+        lon=test_lon,
+        target_date=test_date,
+        is_fire=1,
+    )
+
+    if sample:
+        visualize_scene(sample)
+    else:
+        print("[Error] Failed to collect sample.")
