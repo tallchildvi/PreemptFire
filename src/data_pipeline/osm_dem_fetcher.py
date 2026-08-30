@@ -2,7 +2,6 @@ import time
 from typing import Dict, List, Optional, Tuple
 import geopandas as gpd
 import numpy as np
-import osmnx as ox
 import planetary_computer as pc
 import pystac_client
 import rasterio
@@ -16,17 +15,12 @@ from scipy.ndimage import distance_transform_edt
 
 from src.config import GRID_SIZE_PX
 from src.data_pipeline.accessibility.solver import dijkstra_kernel
+from src.data_pipeline.osm_extractor import HistoricalOSMExtractor
 from src.processing.grid_aligner import GridAligner
 
 
 class SpatialFeatureFetcher:
-    """Production-grade DEM and OSM feature extractor with multi-tier fault tolerance and bridge passability."""
-
-    OVERPASS_SERVERS: List[str] = [
-        "https://overpass.kumi.systems/api/interpreter",
-        "https://overpass.private.coffee/api/interpreter",
-        "https://overpass-api.de/api/interpreter",
-    ]
+    """Production-grade DEM and Historical OSM feature extractor."""
 
     TARGETED_OSM_TAGS: Dict[str, List[str]] = {
         "highway": [
@@ -61,15 +55,7 @@ class SpatialFeatureFetcher:
         self.retry_backoff = retry_backoff
         self.aligner = GridAligner()
         self.stac_client = self._init_stac_client()
-
-        ox.settings.use_cache = True
-        ox.settings.log_console = False
-        ox.settings.timeout = timeout_sec
-        ox.settings.overpass_endpoint = self.OVERPASS_SERVERS[0]
-
-    
-    # STAC Client Management
-    
+        self.osm_extractor = HistoricalOSMExtractor()
 
     def _init_stac_client(self) -> Optional[pystac_client.Client]:
         for attempt in range(self.max_retries):
@@ -80,20 +66,13 @@ class SpatialFeatureFetcher:
                 )
             except Exception as e:
                 wait = self.retry_backoff ** attempt
-                print(f"  [STAC] Init attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s...")
                 time.sleep(wait)
-
-        print("  [STAC] All client init attempts failed — DEM layers will fallback to NaN.")
         return None
 
     def _ensure_stac_client(self) -> bool:
         if self.stac_client is None:
             self.stac_client = self._init_stac_client()
         return self.stac_client is not None
-
-    
-    # Grid Geometry Calculations
-    
 
     def _get_buffered_grid(
         self, grid_info: dict, buffer_meters: float, resolution: float
@@ -125,10 +104,6 @@ class SpatialFeatureFetcher:
 
         return min(lons), min(lats), max(lons), max(lats)
 
-    
-    # Copernicus DEM Ingestion
-    
-
     def _fetch_dem_raster(
         self, grid_info: dict, buffer_meters: float, resolution: float
     ) -> Tuple[np.ndarray, rasterio.Affine]:
@@ -149,7 +124,6 @@ class SpatialFeatureFetcher:
                 search = self.stac_client.search(collections=["cop-dem-glo-30"], bbox=bbox)
                 items = list(search.items())
                 if not items:
-                    print(f"  [DEM] No items returned for bbox: {bbox}")
                     return fallback
 
                 src_files = [rasterio.open(item.assets["data"].href) for item in items]
@@ -178,13 +152,10 @@ class SpatialFeatureFetcher:
                 )
                 return dem, target_transform
 
-            except Exception as e:
-                wait = self.retry_backoff ** attempt
-                print(f"  [DEM] Attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s...")
-                time.sleep(wait)
+            except Exception:
+                time.sleep(self.retry_backoff ** attempt)
                 self.stac_client = self._init_stac_client()
 
-        print("  [DEM] All retries exhausted — returning NaN array.")
         return fallback
 
     def fetch_dem_features(self, grid_info: dict) -> Dict[str, np.ndarray]:
@@ -223,57 +194,10 @@ class SpatialFeatureFetcher:
                     resampling_method=Resampling.bilinear,
                     dst_nodata=np.nan,
                 )
-            except Exception as e:
-                print(f"  [Terrain] Alignment failed for {name} ({e}) — filling with NaN.")
+            except Exception:
                 aligned[name] = np.full(grid_info["shape"], np.nan, dtype=np.float32)
 
         return aligned
-
-    
-    # Resilient OSM Querying
-    
-
-    def _query_osm_resilient(
-        self, grid_info: dict, buffer_meters: float = 4000.0
-    ) -> Optional[gpd.GeoDataFrame]:
-        west, south, east, north = self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
-
-        for endpoint in self.OVERPASS_SERVERS:
-            ox.settings.overpass_endpoint = endpoint
-
-            for attempt in range(self.max_retries):
-                try:
-                    if hasattr(ox, "features_from_bbox"):
-                        gdf = ox.features_from_bbox(
-                            bbox=(west, south, east, north),
-                            tags=self.TARGETED_OSM_TAGS,
-                        )
-                    else:
-                        gdf = ox.geometries_from_bbox(
-                            north, south, east, west,
-                            tags=self.TARGETED_OSM_TAGS,
-                        )
-
-                    if gdf is not None and not gdf.empty:
-                        return gdf.to_crs(grid_info["crs"])
-                    return None
-
-                except Exception as e:
-                    wait = self.retry_backoff ** attempt
-                    print(
-                        f"  [OSM] {endpoint} attempt {attempt + 1}/{self.max_retries} "
-                        f"failed ({type(e).__name__}), retrying in {wait:.0f}s..."
-                    )
-                    time.sleep(wait)
-
-            print(f"  [OSM] Endpoint {endpoint} exhausted — switching to fallback mirror...")
-
-        print("  [OSM] All Overpass mirrors failed — defaulting distance/accessibility matrices.")
-        return None
-
-    
-    # Rasterization, Graph Routing & EDT
-    
 
     def _rasterize_geometries(
         self, gdf_utm: Optional[gpd.GeoDataFrame], shape: Tuple[int, int], transform: rasterio.Affine, value: int = 1, fill: int = 0
@@ -290,8 +214,7 @@ class SpatialFeatureFetcher:
             if not shapes:
                 return np.full(shape, fill, dtype=np.uint8)
             return rasterize(shapes, out_shape=shape, transform=transform, fill=fill, dtype=np.uint8)
-        except Exception as e:
-            print(f"  [Rasterize] Error rasterizing geometries ({e}) — using fill={fill}.")
+        except Exception:
             return np.full(shape, fill, dtype=np.uint8)
 
     def _compute_fast_accessibility_50m(
@@ -329,8 +252,7 @@ class SpatialFeatureFetcher:
             )
             return master_time_10m
 
-        except Exception as e:
-            print(f"  [Accessibility] Dijkstra kernel failed ({e}) — using fallback cap.")
+        except Exception:
             return fallback
 
     def _compute_fast_edt_50m(
@@ -362,34 +284,38 @@ class SpatialFeatureFetcher:
             )
             return dist_10m
 
-        except Exception as e:
-            print(f"  [EDT] Distance transform failed ({e}) — using fallback cap.")
+        except Exception:
             return fallback
-
-    
-    # Public Orchestrator
-    
 
     def fetch_all_spatial_features(
         self,
         lat: float,
         lon: float,
+        target_date: str,
         scl_10m: Optional[np.ndarray] = None,
         buffer_meters: float = 4000.0,
     ) -> Dict[str, np.ndarray]:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
 
-        # 1. High-resolution terrain features
+        # 1. DEM features
         terrain = self.fetch_dem_features(grid_info)
 
-        # 2. Downscaled 50m buffered DEM for routing
+        # 2. Downscaled 50m DEM for routing
         dem_50m, buf_transform_50m = self._fetch_dem_raster(
             grid_info, buffer_meters=buffer_meters, resolution=50.0
         )
         _, buf_shape_50m, _ = self._get_buffered_grid(grid_info, buffer_meters, 50.0)
 
-        # 3. Fault-tolerant OSM query & vector filtering
-        gdf_all = self._query_osm_resilient(grid_info, buffer_meters=buffer_meters)
+        # 3. Fast Historical OSM Extraction
+        west, south, east, north = self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
+        gdf_all = self.osm_extractor.extract_features_for_date(
+            date=target_date,
+            west=west,
+            south=south,
+            east=east,
+            north=north,
+            target_crs=grid_info["crs"], 
+        )
 
         gdf_roads = gdf_trails = gdf_water = gdf_bridges = None
         gdf_railways = gdf_camps = gdf_power = None
@@ -424,24 +350,19 @@ class SpatialFeatureFetcher:
                     if "amenity" in gdf_all.columns:
                         c_cond = c_cond | gdf_all["amenity"].isin(self.TARGETED_OSM_TAGS["amenity"])
                     gdf_camps = gdf_all[c_cond]
+            except Exception:
+                pass
 
-            except Exception as e:
-                print(f"  [OSM] Feature filtering error ({e}) — assigning null geometries.")
-
-        # 4. Passable terrain grid (water & void DEM cells blocked, bridges unblocked)
+        # 4. Passable terrain grid
         passable_50m = np.ones(buf_shape_50m, dtype=np.uint8)
-        try:
-            water_mask_50m = self._rasterize_geometries(gdf_water, buf_shape_50m, buf_transform_50m)
-            passable_50m[water_mask_50m == 1] = 0
-            passable_50m[np.isnan(dem_50m)] = 0
+        water_mask_50m = self._rasterize_geometries(gdf_water, buf_shape_50m, buf_transform_50m)
+        passable_50m[water_mask_50m == 1] = 0
+        passable_50m[np.isnan(dem_50m)] = 0
 
-            # Unblock bridges over water bodies
-            bridge_mask_50m = self._rasterize_geometries(gdf_bridges, buf_shape_50m, buf_transform_50m)
-            passable_50m[bridge_mask_50m == 1] = 1
-        except Exception as e:
-            print(f"  [Passable] Passability mask building error ({e}) — defaulting to fully passable.")
+        bridge_mask_50m = self._rasterize_geometries(gdf_bridges, buf_shape_50m, buf_transform_50m)
+        passable_50m[bridge_mask_50m == 1] = 1
 
-        # 5. Spatial distance fields & accessibility maps
+        # 5. Accessibility & Distance transforms
         travel_roads = self._compute_fast_accessibility_50m(dem_50m, passable_50m, gdf_roads, grid_info, buf_transform_50m)
         travel_trails = self._compute_fast_accessibility_50m(dem_50m, passable_50m, gdf_trails, grid_info, buf_transform_50m)
         dist_railways = self._compute_fast_edt_50m(gdf_railways, grid_info, buf_shape_50m, buf_transform_50m)
