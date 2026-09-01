@@ -7,7 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 from filelock import FileLock
@@ -33,30 +33,9 @@ OSM_EXTRACTION_FILTER: Dict[str, Any] = {
     "bridge": ["yes"],
 }
 
-# Aggregate/macro regions that must never be downloaded
-EXCLUDED_MACRO_REGIONS = {
-    "us", "us-west", "us-pacific", "us-midwest", "us-south", "us-northeast",
-    "canada", "north-america", "russia", "europe", "central-america", "mexico"
-}
-
-
-def load_geofabrik_index(cache_dir: Path) -> gpd.GeoDataFrame:
-    """Fetches and caches the global Geofabrik spatial index."""
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    index_path = cache_dir / "geofabrik_index.json"
-
-    if not index_path.exists():
-        print("  [OSM] Fetching global Geofabrik spatial index...")
-        response = requests.get(GEOFABRIK_INDEX_URL, timeout=30)
-        response.raise_for_status()
-        index_path.write_text(response.text, encoding="utf-8")
-
-    gdf = gpd.read_file(index_path)
-    return gdf[gdf.geometry.notna()].reset_index(drop=True)
-
 
 def parse_history_url(urls_payload: Any) -> Optional[str]:
-    """Extracts the internal history PBF download link."""
+    """Extracts internal history PBF download link from payload dictionary/string."""
     if isinstance(urls_payload, dict):
         return urls_payload.get("history")
     if isinstance(urls_payload, str):
@@ -68,58 +47,234 @@ def parse_history_url(urls_payload: Any) -> Optional[str]:
     return None
 
 
-def resolve_minimal_covering_regions(
+def load_geofabrik_index(cache_dir: Path) -> gpd.GeoDataFrame:
+    """Fetches, parses and caches global Geofabrik spatial index."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    index_path = cache_dir / "geofabrik_index.json"
+
+    if not index_path.exists():
+        print("  [OSM] Fetching global Geofabrik spatial index...")
+        response = requests.get(GEOFABRIK_INDEX_URL, timeout=30)
+        response.raise_for_status()
+        index_path.write_text(response.text, encoding="utf-8")
+
+    gdf = gpd.read_file(index_path)
+    gdf = gdf[gdf.geometry.notna()].reset_index(drop=True)
+    gdf["history_url"] = gdf["urls"].apply(parse_history_url)
+    return gdf
+
+
+def resolve_finest_covering_regions(
     index_gdf: gpd.GeoDataFrame,
     bbox: Tuple[float, float, float, float],
-    min_overlap_km2: float = 25.0,
 ) -> List[Tuple[str, str]]:
-    """Identifies the minimal set of leaf sub-regions covering a target BBox, strictly ignoring macro-regions."""
+    """
+    Resolves the deepest standard historical regions intersecting the target BBox.
+    Special overlapping extracts are used only when no standard region is available.
+    """
     query_box = box(*bbox)
-    intersecting = index_gdf[index_gdf.intersects(query_box)].copy()
 
-    if intersecting.empty:
-        raise ValueError(f"No Geofabrik region covers bounding box {bbox}")
+    # 1. Build node lookup table for valid geometries
+    node_map: Dict[str, pd.Series] = {}
+    for _, row in index_gdf.iterrows():
+        node_id = row.get("id")
+        geom = row.get("geometry")
+        if pd.notna(node_id) and geom is not None and not geom.is_empty:
+            node_map[str(node_id)] = row
 
-    # 1. Identify all parent regions that contain sub-regions
-    parent_ids = set(index_gdf["parent"].dropna().unique())
+    all_ids = set(node_map.keys())
 
-    intersecting["history_url"] = intersecting["urls"].apply(parse_history_url)
+    # 2. Resolve hierarchical parents with path-based hierarchy support (e.g. us/idaho)
+    logical_parent: Dict[str, Optional[str]] = {}
+    for node_id, row in node_map.items():
+        parent_raw = row.get("parent")
+        parent_id = str(parent_raw) if pd.notna(parent_raw) and str(parent_raw).strip() else None
 
-    # 2. Keep ONLY genuine leaf regions (provinces / individual states)
-    candidates = intersecting[
-        intersecting["history_url"].notna()
-        & ~intersecting["id"].str.endswith("-admreg")
-        & ~intersecting["id"].isin(parent_ids)
-        & ~intersecting["id"].isin(EXCLUDED_MACRO_REGIONS)
-    ].copy()
+        if "/" in node_id:
+            path_parent = node_id.rsplit("/", 1)[0]
+            if path_parent in node_map:
+                logical_parent[node_id] = path_parent
+                continue
 
-    if candidates.empty:
-        raise ValueError(f"No valid historical OSM leaf dumps found for bounding box {bbox}")
+        logical_parent[node_id] = parent_id
 
-    candidates_proj = candidates.to_crs("EPSG:3857")
-    query_box_proj = gpd.GeoSeries([query_box], crs="EPSG:4326").to_crs("EPSG:3857").iloc[0]
+    # 3. Build parent-to-children mapping
+    children_map: Dict[str, List[str]] = {}
+    for node_id, parent_id in logical_parent.items():
+        if parent_id is not None and parent_id in all_ids:
+            children_map.setdefault(parent_id, []).append(node_id)
 
-    overlaps = []
-    for _, row in candidates_proj.iterrows():
-        inter = row.geometry.intersection(query_box_proj)
-        overlaps.append(inter.area / 1e6 if inter is not None else 0.0)
+    # 4. Memoized tree-wide history availability check
+    history_cache: Dict[str, bool] = {}
 
-    candidates["overlap_km2"] = overlaps
-    valid = candidates[candidates["overlap_km2"] >= min_overlap_km2].copy()
+    def has_history(node_id: str, visited: Optional[Set[str]] = None) -> bool:
+        if node_id in history_cache:
+            return history_cache[node_id]
 
-    if valid.empty:
-        valid = candidates.sort_values("overlap_km2", ascending=False).head(1)
+        if visited is None:
+            visited = set()
+        if node_id in visited:
+            return False
+        visited.add(node_id)
 
-    # Return all unique intersecting leaf regions directly
-    selected_regions = [
-        (row["id"], row["history_url"])
-        for _, row in valid.sort_values("overlap_km2", ascending=False).iterrows()
+        row = node_map.get(node_id)
+        if row is None:
+            history_cache[node_id] = False
+            return False
+
+        history_url = row.get("history_url")
+        if pd.notna(history_url) and str(history_url).strip():
+            history_cache[node_id] = True
+            return True
+
+        for child_id in children_map.get(node_id, []):
+            if has_history(child_id, visited.copy()):
+                history_cache[node_id] = True
+                return True
+
+        history_cache[node_id] = False
+        return False
+
+    def intersects_query(node_id: str) -> bool:
+        row = node_map.get(node_id)
+        if row is None:
+            return False
+
+        geom = row.get("geometry")
+        if geom is None or geom.is_empty:
+            return False
+
+        try:
+            return bool(geom.intersects(query_box))
+        except Exception:
+            return False
+
+    continents = {
+        "north-america",
+        "south-america",
+        "europe",
+        "asia",
+        "africa",
+        "oceania",
+        "australia-oceania",
+    }
+
+    def is_special_region(node_id: str) -> bool:
+        if node_id in continents:
+            return False
+
+        row = node_map.get(node_id)
+        if row is None:
+            return False
+
+        parent_id = logical_parent.get(node_id)
+        if parent_id not in continents:
+            return False
+
+        if "/" in node_id:
+            return False
+
+        if pd.notna(row.get("iso3166-1:alpha2")) or pd.notna(row.get("iso3166-2")):
+            return False
+
+        if bool(children_map.get(node_id)):
+            return False
+
+        return True
+
+    # 5. Recursive descent to collect finest valid leaves
+    def collect_deepest(node_id: str, visited: Optional[Set[str]] = None) -> List[str]:
+        if visited is None:
+            visited = set()
+        if node_id in visited:
+            return []
+
+        visited = visited.copy()
+        visited.add(node_id)
+
+        if not intersects_query(node_id):
+            return []
+
+        row = node_map.get(node_id)
+        if row is None:
+            return []
+
+        # Filter valid intersecting non-special children
+        valid_children: List[str] = [
+            child_id
+            for child_id in children_map.get(node_id, [])
+            if child_id != node_id
+            and not is_special_region(child_id)
+            and intersects_query(child_id)
+            and has_history(child_id)
+        ]
+
+        if valid_children:
+            result: List[str] = []
+            for child_id in valid_children:
+                result.extend(collect_deepest(child_id, visited))
+            if result:
+                return result
+
+        history_url = row.get("history_url")
+        if pd.notna(history_url) and str(history_url).strip():
+            return [node_id]
+
+        return []
+
+    # 6. Traverse standard hierarchy from root nodes
+    root_nodes: List[str] = [
+        node_id
+        for node_id, row in node_map.items()
+        if (logical_parent.get(node_id) is None or logical_parent.get(node_id) not in all_ids)
+        and not is_special_region(node_id)
+        and intersects_query(node_id)
+        and has_history(node_id)
     ]
-    return selected_regions
 
+    standard_regions: List[str] = []
+    for root_id in root_nodes:
+        standard_regions.extend(collect_deepest(root_id))
+
+    # Deduplicate standard regions while preserving order
+    unique_standard_ids: List[str] = []
+    seen_standard: Set[str] = set()
+    for reg_id in standard_regions:
+        if reg_id not in seen_standard:
+            seen_standard.add(reg_id)
+            unique_standard_ids.append(reg_id)
+
+    if unique_standard_ids:
+        standard_output: List[Tuple[str, str]] = []
+        for reg_id in unique_standard_ids:
+            row = node_map.get(reg_id)
+            if row is not None:
+                h_url = row.get("history_url")
+                if pd.notna(h_url) and str(h_url).strip():
+                    standard_output.append((reg_id, str(h_url)))
+        if standard_output:
+            return standard_output
+
+    # 7. Fallback: Special overlapping extracts (only if no standard region matched)
+    special_output: List[Tuple[str, str]] = []
+    seen_special: Set[str] = set()
+
+    for node_id, row in node_map.items():
+        if not is_special_region(node_id) or not intersects_query(node_id):
+            continue
+
+        h_url = row.get("history_url")
+        if pd.notna(h_url) and str(h_url).strip() and node_id not in seen_special:
+            seen_special.add(node_id)
+            special_output.append((node_id, str(h_url)))
+
+    if special_output:
+        return special_output
+
+    raise ValueError(f"No historical OSM regions cover bounding box {bbox}")
 
 def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Path:
-    """Downloads authenticated historical .osh.pbf file with strict auth and size validation."""
+    """Downloads authenticated historical .osh.pbf file with binary validation."""
     clean_id = region_id.replace("/", "_")
     target_path = cache_dir / f"{clean_id}-history.osh.pbf"
     lock_path = target_path.with_suffix(".lock")
@@ -129,7 +284,7 @@ def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Pa
 
     cookie = os.getenv("GEOFABRIK_COOKIE")
     if not cookie:
-        raise ValueError("GEOFABRIK_COOKIE is missing in .env file.")
+        raise ValueError("GEOFABRIK_COOKIE environment variable is missing in .env")
 
     cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -172,10 +327,7 @@ def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Pa
 
             if tmp_path.stat().st_size < 10_485_760:
                 tmp_path.unlink(missing_ok=True)
-                raise RuntimeError(
-                    f"Downloaded file {target_path.name} is too small (<10MB). "
-                    "Download failed or cookie expired."
-                )
+                raise RuntimeError(f"Downloaded file {target_path.name} is smaller than 10MB (corrupted).")
 
             tmp_path.rename(target_path)
             print(f"\n  [OSM] Saved to {target_path.name} ({target_path.stat().st_size / (1024 * 1024):.1f} MB)")
@@ -255,8 +407,8 @@ class HistoricalOSMExtractor:
     def resolve_history_files(
         self, west: float, south: float, east: float, north: float
     ) -> List[Dict[str, Any]]:
-        """Resolves covering regions for a BBox and checks local existence."""
-        regions = resolve_minimal_covering_regions(self.index_gdf, (west, south, east, north))
+        """Resolves finest covering regions for a BBox and checks local existence."""
+        regions = resolve_finest_covering_regions(self.index_gdf, (west, south, east, north))
         output = []
 
         for region_id, history_url in regions:
@@ -330,15 +482,16 @@ class HistoricalOSMExtractor:
 
         return combined.to_crs(target_crs) if str(combined.crs) != target_crs else combined
 
+
 if __name__ == "__main__":
     extractor = HistoricalOSMExtractor()
 
     west, south, east, north = -139.3, 48.2, -113.0, 60.2
 
-    print(f"1. Resolving covering historical dumps for BBox: [{west}, {south}, {east}, {north}]")
+    print(f"1. Resolving finest covering historical dumps for BBox: [{west}, {south}, {east}, {north}]")
     files_info = extractor.resolve_history_files(west, south, east, north)
 
-    print(f"\nFound {len(files_info)} regional dump(s):")
+    print(f"\nFound {len(files_info)} finest regional dump(s):")
     for item in files_info:
         status = "CACHED" if item["downloaded"] else "PENDING_DOWNLOAD"
         print(f"  - [{status}] {item['region_id']} -> {item['local_path'].name}")
