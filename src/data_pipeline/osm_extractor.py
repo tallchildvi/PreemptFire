@@ -11,6 +11,7 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from dotenv import load_dotenv
 from filelock import FileLock
+import folium
 import geopandas as gpd
 import pandas as pd
 from pyrosm import OSM
@@ -273,6 +274,102 @@ def resolve_finest_covering_regions(
 
     raise ValueError(f"No historical OSM regions cover bounding box {bbox}")
 
+def plot_bbox_coverage(
+    index_gdf: gpd.GeoDataFrame,
+    bbox: Tuple[float, float, float, float],
+    resolved_regions: List[Tuple[str, str]],
+    output_html: Path | str = "data/osm_raw/coverage_map.html",
+) -> Path:
+    """Generates an interactive HTML map showing the BBox and resolved covering OSM regions."""
+    west, south, east, north = bbox
+    query_box = box(west, south, east, north)
+
+    bbox_gdf = gpd.GeoDataFrame(
+        [{"name": "Target Scene / Macro BBox", "geometry": query_box}],
+        crs="EPSG:4326",
+    )
+
+    resolved_ids = {r[0] for r in resolved_regions}
+    selected_gdf = index_gdf[index_gdf["id"].isin(resolved_ids)].copy()
+
+    center_lat = (south + north) / 2.0
+    center_lon = (west + east) / 2.0
+
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=6,
+        tiles="OpenStreetMap",
+        control_scale=True,
+    )
+
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri World Imagery",
+        name="Satellite (Esri)",
+    ).add_to(m)
+
+    colors = [
+        "#1f77b4",
+        "#ff7f0e",
+        "#2ca02c",
+        "#d62728",
+        "#9467bd",
+        "#8c564b",
+        "#e377c2",
+        "#7f7f7f",
+        "#bcbd22",
+        "#17becf",
+    ]
+
+    for idx, (_, row) in enumerate(selected_gdf.iterrows()):
+        color = colors[idx % len(colors)]
+        reg_id = str(row["id"])
+        h_url = str(row.get("history_url", ""))
+
+        geo_json = folium.GeoJson(
+            row.geometry,
+            name=f"Region: {reg_id}",
+            style_function=lambda x, c=color: {
+                "fillColor": c,
+                "color": c,
+                "weight": 2,
+                "fillOpacity": 0.25,
+            },
+            highlight_function=lambda x: {
+                "weight": 4,
+                "fillOpacity": 0.5,
+            },
+            tooltip=folium.Tooltip(
+                f"<b>ID:</b> {reg_id}<br><b>URL:</b> {h_url}",
+                sticky=True,
+            ),
+        )
+        geo_json.add_to(m)
+
+    folium.GeoJson(
+        bbox_gdf,
+        name="Target Bounding Box",
+        style_function=lambda x: {
+            "fillColor": "red",
+            "color": "red",
+            "weight": 3,
+            "dashArray": "6, 6",
+            "fillOpacity": 0.08,
+        },
+        tooltip=folium.Tooltip(
+            f"<b>Target BBox:</b> [{west:.2f}, {south:.2f}, {east:.2f}, {north:.2f}]",
+            sticky=True,
+        ),
+    ).add_to(m)
+
+    folium.LayerControl(position="topright", collapsed=False).add_to(m)
+
+    out_path = Path(output_html)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    m.save(str(out_path))
+    print(f"  [Map] Interactive coverage map saved to: {out_path.resolve()}")
+    return out_path
+
 def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Path:
     """Downloads authenticated historical .osh.pbf file with binary validation."""
     clean_id = region_id.replace("/", "_")
@@ -486,19 +583,19 @@ class HistoricalOSMExtractor:
 if __name__ == "__main__":
     extractor = HistoricalOSMExtractor()
 
-    west, south, east, north = -139.3, 48.2, -113.0, 60.2
+    west, south, east, north = (-139.3, 48.2, -113.0, 60.2,)
+    test_bbox = (west, south, east, north)
 
-    print(f"1. Resolving finest covering historical dumps for BBox: [{west}, {south}, {east}, {north}]")
-    files_info = extractor.resolve_history_files(west, south, east, north)
+    print(f"Resolving regions for: {test_bbox}")
+    resolved = resolve_finest_covering_regions(extractor.index_gdf, test_bbox)
 
-    print(f"\nFound {len(files_info)} finest regional dump(s):")
-    for item in files_info:
-        status = "CACHED" if item["downloaded"] else "PENDING_DOWNLOAD"
-        print(f"  - [{status}] {item['region_id']} -> {item['local_path'].name}")
+    print(f"\nResolved {len(resolved)} regions:")
+    for reg_id, url in resolved:
+        print(f"  - {reg_id}")
 
-    print("\n2. Downloading missing .osh.pbf dump files...")
-    downloaded = extractor.download_required_dumps(files_info)
-
-    print(f"\nAll regional files are ready in '{DEFAULT_CACHE_DIR}':")
-    for path in downloaded:
-        print(f"  - {path.name} ({path.stat().st_size / (1024 * 1024):.1f} MB)")
+    map_file = plot_bbox_coverage(
+        index_gdf=extractor.index_gdf,
+        bbox=test_bbox,
+        resolved_regions=resolved,
+        output_html="data/osm_raw/coverage_map.html",
+    )
