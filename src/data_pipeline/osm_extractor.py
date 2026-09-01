@@ -33,8 +33,15 @@ OSM_EXTRACTION_FILTER: Dict[str, Any] = {
     "bridge": ["yes"],
 }
 
+# Aggregate/macro regions that must never be downloaded
+EXCLUDED_MACRO_REGIONS = {
+    "us", "us-west", "us-pacific", "us-midwest", "us-south", "us-northeast",
+    "canada", "north-america", "russia", "europe", "central-america", "mexico"
+}
+
 
 def load_geofabrik_index(cache_dir: Path) -> gpd.GeoDataFrame:
+    """Fetches and caches the global Geofabrik spatial index."""
     cache_dir.mkdir(parents=True, exist_ok=True)
     index_path = cache_dir / "geofabrik_index.json"
 
@@ -49,6 +56,7 @@ def load_geofabrik_index(cache_dir: Path) -> gpd.GeoDataFrame:
 
 
 def parse_history_url(urls_payload: Any) -> Optional[str]:
+    """Extracts the internal history PBF download link."""
     if isinstance(urls_payload, dict):
         return urls_payload.get("history")
     if isinstance(urls_payload, str):
@@ -63,21 +71,30 @@ def parse_history_url(urls_payload: Any) -> Optional[str]:
 def resolve_minimal_covering_regions(
     index_gdf: gpd.GeoDataFrame,
     bbox: Tuple[float, float, float, float],
-    min_overlap_km2: float = 1.0,
+    min_overlap_km2: float = 25.0,
 ) -> List[Tuple[str, str]]:
+    """Identifies the minimal set of leaf sub-regions covering a target BBox, strictly ignoring macro-regions."""
     query_box = box(*bbox)
     intersecting = index_gdf[index_gdf.intersects(query_box)].copy()
 
     if intersecting.empty:
         raise ValueError(f"No Geofabrik region covers bounding box {bbox}")
 
+    # 1. Identify all parent regions that contain sub-regions
+    parent_ids = set(index_gdf["parent"].dropna().unique())
+
     intersecting["history_url"] = intersecting["urls"].apply(parse_history_url)
+
+    # 2. Keep ONLY genuine leaf regions (provinces / individual states)
     candidates = intersecting[
-        intersecting["history_url"].notna() & ~intersecting["id"].str.endswith("-admreg")
+        intersecting["history_url"].notna()
+        & ~intersecting["id"].str.endswith("-admreg")
+        & ~intersecting["id"].isin(parent_ids)
+        & ~intersecting["id"].isin(EXCLUDED_MACRO_REGIONS)
     ].copy()
 
     if candidates.empty:
-        raise ValueError(f"No valid historical OSM download links found for bounding box {bbox}")
+        raise ValueError(f"No valid historical OSM leaf dumps found for bounding box {bbox}")
 
     candidates_proj = candidates.to_crs("EPSG:3857")
     query_box_proj = gpd.GeoSeries([query_box], crs="EPSG:4326").to_crs("EPSG:3857").iloc[0]
@@ -88,47 +105,36 @@ def resolve_minimal_covering_regions(
         overlaps.append(inter.area / 1e6 if inter is not None else 0.0)
 
     candidates["overlap_km2"] = overlaps
-    candidates["total_area_km2"] = candidates_proj.geometry.area / 1e6
-
     valid = candidates[candidates["overlap_km2"] >= min_overlap_km2].copy()
+
     if valid.empty:
         valid = candidates.sort_values("overlap_km2", ascending=False).head(1)
 
-    valid = valid.sort_values("total_area_km2", ascending=True)
-
-    selected_regions: List[Tuple[str, str]] = []
-    uncovered_geom = query_box
-
-    for _, row in valid.iterrows():
-        inter = row.geometry.intersection(uncovered_geom)
-        if inter is None or inter.is_empty:
-            continue
-
-        selected_regions.append((row["id"], row["history_url"]))
-        uncovered_geom = uncovered_geom.difference(row.geometry)
-
-        if uncovered_geom.is_empty or (uncovered_geom.area / query_box.area < 0.001):
-            break
-
+    # Return all unique intersecting leaf regions directly
+    selected_regions = [
+        (row["id"], row["history_url"])
+        for _, row in valid.sort_values("overlap_km2", ascending=False).iterrows()
+    ]
     return selected_regions
 
 
 def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Path:
+    """Downloads authenticated historical .osh.pbf file with strict auth and size validation."""
     clean_id = region_id.replace("/", "_")
     target_path = cache_dir / f"{clean_id}-history.osh.pbf"
     lock_path = target_path.with_suffix(".lock")
 
-    if target_path.exists():
+    if target_path.exists() and target_path.stat().st_size > 10_485_760:
         return target_path
 
     cookie = os.getenv("GEOFABRIK_COOKIE")
     if not cookie:
-        raise ValueError("GEOFABRIK_COOKIE не знайдено у .env файлі.")
+        raise ValueError("GEOFABRIK_COOKIE is missing in .env file.")
 
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     with FileLock(str(lock_path), timeout=7200):
-        if target_path.exists():
+        if target_path.exists() and target_path.stat().st_size > 10_485_760:
             return target_path
 
         print(f"\n  [OSM] Downloading historical dump '{region_id}'\n        {history_url}")
@@ -138,7 +144,14 @@ def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Pa
             "Cookie": cookie.strip('"\''),
         }
 
-        with requests.get(history_url, headers=headers, stream=True, timeout=60) as resp:
+        with requests.get(history_url, headers=headers, stream=True, timeout=60, allow_redirects=True) as resp:
+            content_type = resp.headers.get("content-type", "").lower()
+            if "text/html" in content_type:
+                raise PermissionError(
+                    f"Authentication failed for {history_url}. Server returned an HTML login page. "
+                    "Your GEOFABRIK_COOKIE has expired. Please refresh it in your .env file."
+                )
+
             resp.raise_for_status()
             total_size = int(resp.headers.get("content-length", 0))
             downloaded = 0
@@ -157,8 +170,15 @@ def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Pa
                             sys.stdout.write(f"\r  [Download] {mb_d:.1f}/{mb_t:.1f} MB ({pct:.1f}%) | {speed:.2f} MB/s")
                             sys.stdout.flush()
 
+            if tmp_path.stat().st_size < 10_485_760:
+                tmp_path.unlink(missing_ok=True)
+                raise RuntimeError(
+                    f"Downloaded file {target_path.name} is too small (<10MB). "
+                    "Download failed or cookie expired."
+                )
+
             tmp_path.rename(target_path)
-            print(f"\n  [OSM] Saved to {target_path.name}")
+            print(f"\n  [OSM] Saved to {target_path.name} ({target_path.stat().st_size / (1024 * 1024):.1f} MB)")
 
     return target_path
 
@@ -202,7 +222,7 @@ def extract_scene_bbox_pbf(
     bbox: Tuple[float, float, float, float],
     cache_dir: Path,
 ) -> Path:
-    """Cuts exact scene BBox out of provincial PBF using C++ Osmium in ~0.3s."""
+    """Crops exact scene BBox from provincial snapshot using C++ Osmium in ~0.3s."""
     west, south, east, north = bbox
     bbox_tag = f"{west:.2f}_{south:.2f}_{east:.2f}_{north:.2f}".replace("-", "m").replace(".", "p")
     scene_pbf_path = cache_dir / f"scene_{source_pbf.stem}_{bbox_tag}.osm.pbf"
@@ -212,6 +232,7 @@ def extract_scene_bbox_pbf(
 
     cmd = [
         "osmium", "extract",
+        "--strategy", "smart",
         "--bbox", f"{west},{south},{east},{north}",
         str(source_pbf),
         "-o", str(scene_pbf_path),
@@ -234,22 +255,25 @@ class HistoricalOSMExtractor:
     def resolve_history_files(
         self, west: float, south: float, east: float, north: float
     ) -> List[Dict[str, Any]]:
+        """Resolves covering regions for a BBox and checks local existence."""
         regions = resolve_minimal_covering_regions(self.index_gdf, (west, south, east, north))
         output = []
 
         for region_id, history_url in regions:
             clean_id = region_id.replace("/", "_")
             local_path = self.cache_dir / f"{clean_id}-history.osh.pbf"
+            is_valid = local_path.exists() and local_path.stat().st_size > 10_485_760
             output.append({
                 "region_id": region_id,
                 "history_url": history_url,
                 "local_path": local_path,
-                "downloaded": local_path.exists(),
+                "downloaded": is_valid,
             })
 
         return output
 
     def download_required_dumps(self, resolved_files: List[Dict[str, Any]]) -> List[Path]:
+        """Downloads all missing regional .osh.pbf files."""
         return [
             ensure_history_dump(entry["region_id"], entry["history_url"], self.cache_dir)
             for entry in resolved_files
@@ -264,6 +288,7 @@ class HistoricalOSMExtractor:
         north: float,
         target_crs: str = "EPSG:4326",
     ) -> gpd.GeoDataFrame:
+        """Extracts and parses historical features for a given date and BBox."""
         date_str = date.strftime("%Y-%m-%d") if isinstance(date, datetime) else date.split(" ")[0]
         bbox = (west, south, east, north)
         resolved_files = self.resolve_history_files(west, south, east, north)
@@ -271,16 +296,12 @@ class HistoricalOSMExtractor:
 
         for entry in resolved_files:
             osh_path = ensure_history_dump(entry["region_id"], entry["history_url"], self.cache_dir)
-            
-            # 1. Повний зріз провінції на дату (вже згенерований і лежить на SSD)
             snapshot_pbf = get_or_create_snapshot_pbf(osh_path, date_str)
 
-            # 2. C++ миттєво вирізає тільки BBox сцени (~2 MB)
             t_extract = time.perf_counter()
             scene_pbf = extract_scene_bbox_pbf(snapshot_pbf, bbox, self.cache_dir)
-            print(f"  [OSM Spatial Crop] Cropped BBox scene in {time.perf_counter() - t_extract:.2f}s")
+            print(f"  [OSM Spatial Crop] Cropped scene in {time.perf_counter() - t_extract:.2f}s")
 
-            # 3. pyrosm читає легкий 2 MB файл миттєво
             t0 = time.perf_counter()
             osm = OSM(str(scene_pbf))
             gdf_chunk = osm.get_data_by_custom_criteria(
@@ -288,11 +309,11 @@ class HistoricalOSMExtractor:
                 filter_type="keep",
                 keep_nodes=True,
                 keep_ways=True,
-                keep_relations=False,
+                keep_relations=True,
             )
             duration = time.perf_counter() - t0
             count = len(gdf_chunk) if gdf_chunk is not None else 0
-            print(f"  [OSM] Parsed {count:,} features from scene in {duration:.2f}s")
+            print(f"  [OSM] Parsed {count:,} features in {duration:.2f}s")
 
             if gdf_chunk is not None and not gdf_chunk.empty:
                 gathered_gdfs.append(gdf_chunk)
@@ -309,31 +330,22 @@ class HistoricalOSMExtractor:
 
         return combined.to_crs(target_crs) if str(combined.crs) != target_crs else combined
 
-
 if __name__ == "__main__":
     extractor = HistoricalOSMExtractor()
 
-    bc_west, bc_south, bc_east, bc_north = -120.6, 50.4, -119.9, 50.9
-    sample_date = "2021-08-15"
+    west, south, east, north = -139.3, 48.2, -113.0, 60.2
 
-    print(f"\n1. Resolving historical dumps for bbox: [{bc_west}, {bc_south}, {bc_east}, {bc_north}]")
-    files_info = extractor.resolve_history_files(bc_west, bc_south, bc_east, bc_north)
+    print(f"1. Resolving covering historical dumps for BBox: [{west}, {south}, {east}, {north}]")
+    files_info = extractor.resolve_history_files(west, south, east, north)
 
-    print("\n2. Ensuring historical .osh.pbf dump is present...")
-    extractor.download_required_dumps(files_info)
+    print(f"\nFound {len(files_info)} regional dump(s):")
+    for item in files_info:
+        status = "CACHED" if item["downloaded"] else "PENDING_DOWNLOAD"
+        print(f"  - [{status}] {item['region_id']} -> {item['local_path'].name}")
 
-    print(f"\n3. Extracting point-in-time features for {sample_date}...")
-    t0 = time.perf_counter()
-    gdf = extractor.extract_features_for_date(
-        date=sample_date,
-        west=bc_west,
-        south=bc_south,
-        east=bc_east,
-        north=bc_north,
-    )
-    elapsed = time.perf_counter() - t0
+    print("\n2. Downloading missing .osh.pbf dump files...")
+    downloaded = extractor.download_required_dumps(files_info)
 
-    print(f"\nDone: Extracted {len(gdf):,} historical geometries in {elapsed:.2f}s")
-    if not gdf.empty:
-        print("Feature layers detected:", [c for c in gdf.columns if c != "geometry"][:8])
-        print(gdf[["geometry"] + [c for c in ["highway", "waterway", "natural"] if c in gdf.columns]].head(3))
+    print(f"\nAll regional files are ready in '{DEFAULT_CACHE_DIR}':")
+    for path in downloaded:
+        print(f"  - {path.name} ({path.stat().st_size / (1024 * 1024):.1f} MB)")

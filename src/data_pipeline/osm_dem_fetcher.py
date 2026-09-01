@@ -213,7 +213,7 @@ class SpatialFeatureFetcher:
             ]
             if not shapes:
                 return np.full(shape, fill, dtype=np.uint8)
-            return rasterize(shapes, out_shape=shape, transform=transform, fill=fill, dtype=np.uint8)
+            return rasterize(shapes, out_shape=shape, transform=transform, fill=fill, dtype=np.uint8, all_touched=True)
         except Exception:
             return np.full(shape, fill, dtype=np.uint8)
 
