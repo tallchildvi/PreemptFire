@@ -16,6 +16,7 @@ import geopandas as gpd
 import pandas as pd
 from pyrosm import OSM
 import requests
+import tempfile
 from shapely.geometry import box
 
 load_dotenv()
@@ -537,35 +538,56 @@ class HistoricalOSMExtractor:
         north: float,
         target_crs: str = "EPSG:4326",
     ) -> gpd.GeoDataFrame:
-        """Extracts and parses historical features for a given date and BBox."""
-        date_str = date.strftime("%Y-%m-%d") if isinstance(date, datetime) else date.split(" ")[0]
+        date_str = (
+            date.strftime("%Y-%m-%d")
+            if isinstance(date, datetime)
+            else date.split(" ")[0]
+        )
         bbox = (west, south, east, north)
         resolved_files = self.resolve_history_files(west, south, east, north)
         gathered_gdfs: List[gpd.GeoDataFrame] = []
 
         for entry in resolved_files:
-            osh_path = ensure_history_dump(entry["region_id"], entry["history_url"], self.cache_dir)
+            osh_path = ensure_history_dump(
+                entry["region_id"], entry["history_url"], self.cache_dir
+            )
             snapshot_pbf = get_or_create_snapshot_pbf(osh_path, date_str)
 
-            t_extract = time.perf_counter()
-            scene_pbf = extract_scene_bbox_pbf(snapshot_pbf, bbox, self.cache_dir)
-            print(f"  [OSM Spatial Crop] Cropped scene in {time.perf_counter() - t_extract:.2f}s")
+            with tempfile.NamedTemporaryFile(
+                suffix=".osm.pbf", dir=self.cache_dir, delete=False
+            ) as tmp:
+                tmp_scene_path = Path(tmp.name)
 
-            t0 = time.perf_counter()
-            osm = OSM(str(scene_pbf))
-            gdf_chunk = osm.get_data_by_custom_criteria(
-                custom_filter=OSM_EXTRACTION_FILTER,
-                filter_type="keep",
-                keep_nodes=True,
-                keep_ways=True,
-                keep_relations=True,
-            )
-            duration = time.perf_counter() - t0
-            count = len(gdf_chunk) if gdf_chunk is not None else 0
-            print(f"  [OSM] Parsed {count:,} features in {duration:.2f}s")
+            try:
+                cmd = [
+                    "osmium",
+                    "extract",
+                    "--strategy",
+                    "smart",
+                    "--bbox",
+                    f"{west},{south},{east},{north}",
+                    str(snapshot_pbf),
+                    "-o",
+                    str(tmp_scene_path),
+                    "--overwrite",
+                ]
+                res = subprocess.run(cmd, capture_output=True, text=True)
+                if res.returncode != 0:
+                    raise RuntimeError(f"osmium extract failed: {res.stderr}")
 
-            if gdf_chunk is not None and not gdf_chunk.empty:
-                gathered_gdfs.append(gdf_chunk)
+                osm = OSM(str(tmp_scene_path))
+                gdf_chunk = osm.get_data_by_custom_criteria(
+                    custom_filter=OSM_EXTRACTION_FILTER,
+                    filter_type="keep",
+                    keep_nodes=True,
+                    keep_ways=True,
+                    keep_relations=True,
+                )
+                if gdf_chunk is not None and not gdf_chunk.empty:
+                    gathered_gdfs.append(gdf_chunk)
+            finally:
+                if tmp_scene_path.exists():
+                    tmp_scene_path.unlink(missing_ok=True)
 
         if not gathered_gdfs:
             return gpd.GeoDataFrame(geometry=[], crs=target_crs)
@@ -577,7 +599,11 @@ class HistoricalOSMExtractor:
         if combined.crs is None:
             combined = combined.set_crs("EPSG:4326")
 
-        return combined.to_crs(target_crs) if str(combined.crs) != target_crs else combined
+        return (
+            combined.to_crs(target_crs)
+            if str(combined.crs) != target_crs
+            else combined
+        )
 
 
 if __name__ == "__main__":

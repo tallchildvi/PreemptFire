@@ -285,8 +285,9 @@ def visualize_scene(sample: Dict[str, Any]) -> None:
 if __name__ == "__main__":
     collector = SingleSceneCollector()
 
+    test_lat, test_lon = 52.5708739, -117.9518471
     # test_lat, test_lon = 50.6745, -120.3273
-    test_lat, test_lon = 58.0313, -104.0258
+    # test_lat, test_lon = 58.0313, -104.0258
     test_date = "2021-08-15"
 
     print(f"Fetching scene for ({test_lat}, {test_lon}) on {test_date}...")

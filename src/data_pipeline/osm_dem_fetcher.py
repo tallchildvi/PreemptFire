@@ -64,7 +64,7 @@ class SpatialFeatureFetcher:
                     "https://planetarycomputer.microsoft.com/api/stac/v1",
                     modifier=pc.sign_inplace,
                 )
-            except Exception as e:
+            except Exception:
                 wait = self.retry_backoff ** attempt
                 time.sleep(wait)
         return None
@@ -158,6 +158,53 @@ class SpatialFeatureFetcher:
 
         return fallback
 
+    def fetch_road_raster(
+        self,
+        lat: float,
+        lon: float,
+        target_date: str,
+        include_trails: bool = False,
+        grid_shape: Optional[Tuple[int, int]] = None,
+        patch_size_meters: Optional[float] = None,
+        **kwargs,
+    ) -> np.ndarray:
+        grid_info = self.aligner.get_master_grid_info(lat, lon)
+        west, south, east, north = self._get_buffered_wgs84_bbox(
+            grid_info, buffer_meters=0.0
+        )
+
+        gdf_osm = self.osm_extractor.extract_features_for_date(
+            date=target_date,
+            west=west,
+            south=south,
+            east=east,
+            north=north,
+            target_crs=grid_info["crs"],
+        )
+
+        target_shape = grid_shape if grid_shape is not None else grid_info["shape"]
+
+        if gdf_osm.empty or "highway" not in gdf_osm.columns:
+            return np.zeros(target_shape, dtype=np.uint8)
+
+        target_tags = (
+            self.ROAD_HIGHWAYS | self.TRAIL_HIGHWAYS
+            if include_trails
+            else self.ROAD_HIGHWAYS
+        )
+
+        gdf_filtered = gdf_osm[gdf_osm["highway"].isin(target_tags)].copy()
+        if gdf_filtered.empty:
+            return np.zeros(target_shape, dtype=np.uint8)
+
+        return self._rasterize_geometries(
+            gdf_filtered,
+            shape=target_shape,
+            transform=grid_info["transform"],
+            value=1,
+            fill=0,
+        )
+
     def fetch_dem_features(self, grid_info: dict) -> Dict[str, np.ndarray]:
         dem_30m, native_transform = self._fetch_dem_raster(grid_info, buffer_meters=0.0, resolution=30.0)
 
@@ -200,7 +247,12 @@ class SpatialFeatureFetcher:
         return aligned
 
     def _rasterize_geometries(
-        self, gdf_utm: Optional[gpd.GeoDataFrame], shape: Tuple[int, int], transform: rasterio.Affine, value: int = 1, fill: int = 0
+        self,
+        gdf_utm: Optional[gpd.GeoDataFrame],
+        shape: Tuple[int, int],
+        transform: rasterio.Affine,
+        value: int = 1,
+        fill: int = 0,
     ) -> np.ndarray:
         if gdf_utm is None or gdf_utm.empty:
             return np.full(shape, fill, dtype=np.uint8)
@@ -297,16 +349,13 @@ class SpatialFeatureFetcher:
     ) -> Dict[str, np.ndarray]:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
 
-        # 1. DEM features
         terrain = self.fetch_dem_features(grid_info)
 
-        # 2. Downscaled 50m DEM for routing
         dem_50m, buf_transform_50m = self._fetch_dem_raster(
             grid_info, buffer_meters=buffer_meters, resolution=50.0
         )
         _, buf_shape_50m, _ = self._get_buffered_grid(grid_info, buffer_meters, 50.0)
 
-        # 3. Fast Historical OSM Extraction
         west, south, east, north = self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
         gdf_all = self.osm_extractor.extract_features_for_date(
             date=target_date,
@@ -314,7 +363,7 @@ class SpatialFeatureFetcher:
             south=south,
             east=east,
             north=north,
-            target_crs=grid_info["crs"], 
+            target_crs=grid_info["crs"],
         )
 
         gdf_roads = gdf_trails = gdf_water = gdf_bridges = None
@@ -353,7 +402,6 @@ class SpatialFeatureFetcher:
             except Exception:
                 pass
 
-        # 4. Passable terrain grid
         passable_50m = np.ones(buf_shape_50m, dtype=np.uint8)
         water_mask_50m = self._rasterize_geometries(gdf_water, buf_shape_50m, buf_transform_50m)
         passable_50m[water_mask_50m == 1] = 0
@@ -362,7 +410,6 @@ class SpatialFeatureFetcher:
         bridge_mask_50m = self._rasterize_geometries(gdf_bridges, buf_shape_50m, buf_transform_50m)
         passable_50m[bridge_mask_50m == 1] = 1
 
-        # 5. Accessibility & Distance transforms
         travel_roads = self._compute_fast_accessibility_50m(dem_50m, passable_50m, gdf_roads, grid_info, buf_transform_50m)
         travel_trails = self._compute_fast_accessibility_50m(dem_50m, passable_50m, gdf_trails, grid_info, buf_transform_50m)
         dist_railways = self._compute_fast_edt_50m(gdf_railways, grid_info, buf_shape_50m, buf_transform_50m)
@@ -380,14 +427,17 @@ class SpatialFeatureFetcher:
             "Dist_to_Camps": dist_camps,
             "Dist_to_Powerlines": dist_power,
         }
-    
+
+
 if __name__ == "__main__":
     fetcher = SpatialFeatureFetcher()
+    test_lat, test_lon, test_date = 50.6745, -120.3273, "2021-08-15"
 
-    data = fetcher.fetch_all_spatial_features(lat=53.5461, lon=-113.4937)
+    print(f"1. Testing fetch_road_raster for [{test_lat}, {test_lon}]...")
+    road_mask = fetcher.fetch_road_raster(lat=test_lat, lon=test_lon, target_date=test_date)
+    print(f"   Road mask shape: {road_mask.shape} | Road pixels: {int((road_mask == 1).sum())}")
 
+    print(f"\n2. Testing fetch_all_spatial_features...")
+    data = fetcher.fetch_all_spatial_features(lat=test_lat, lon=test_lon, target_date=test_date)
     for name, arr in data.items():
-        print(
-            f"{name:20s} shape: {arr.shape}"
-            f"range: [{np.nanmin(arr):8.2f}, {np.nanmax(arr):8.2f}]"
-        )
+        print(f"   {name:<22} shape: {arr.shape} | range: [{np.nanmin(arr):8.2f}, {np.nanmax(arr):8.2f}]")
