@@ -11,7 +11,7 @@ class PatchExtractor:
         "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12",
         # spectral indices
         "EVI_T0", "MSI_T0", "NBR_T0", "NBR2_T0", "NDMI_T0", "NDRE_T0", "NDVI_T0", "NMDI_T0",
-        "dNBR", "dNDMI", "dNDVI",
+        "dNBR", "dNDMI", "dNDVI", "dNMDI", "dMSI",
         # sentinel-1 sar and polarimetric indices
         "SAR_VV", "SAR_VH", "SAR_RATIO", "SAR_RVI",
         # digital elevation model features

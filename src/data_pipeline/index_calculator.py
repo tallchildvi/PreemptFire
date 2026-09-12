@@ -61,9 +61,13 @@ class IndexCalculator:
 
         if b08_tprev is not None and b11_tprev is not None:
             results["dNDMI"] = self.calc_delta(results["NDMI_T0"], self.calc_ndmi(b08_tprev, b11_tprev))
- 
+            results["dMSI"] = self.calc_delta(results["MSI_T0"], self.calc_msi(b11_tprev, b08_tprev))
+
         if b08_tprev is not None and b12_tprev is not None:
             results["dNBR"] = self.calc_delta(results["NBR_T0"], self.calc_nbr(b08_tprev, b12_tprev))
+
+        if b08_tprev is not None and b11_tprev is not None and b12_tprev is not None:
+            results["dNMDI"] = self.calc_delta(results["NMDI_T0"], self.calc_nmdi(b08_tprev, b11_tprev, b12_tprev))
 
         # 4. Sentinel-1 SAR Polarimetric Features
         if sar_vv is not None and sar_vh is not None:
