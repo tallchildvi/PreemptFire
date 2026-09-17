@@ -46,8 +46,6 @@ class SentinelFetcher:
             modifier=pc.sign_inplace,
         )
 
-    # scl mask extraction
-
     @classmethod
     def extract_scl_masks(cls, scl_array: np.ndarray) -> Dict[str, np.ndarray]:
         scl_clean = np.nan_to_num(scl_array, nan=0).astype(np.uint8)
@@ -59,16 +57,17 @@ class SentinelFetcher:
             "MASK_INVALID": np.isin(scl_clean, cls.SCL_INVALID).astype(np.float32),
         }
 
-    # low-level band read
-
     def _read_band_window(
         self, asset_url: str, bbox_wgs84: List[float]
     ) -> Tuple[np.ndarray, Affine, Any]:
-        """signs url and reads bounding box window with boundless padding."""
+        try:
+            signed_url = pc.sign(asset_url)
+        except Exception:
+            signed_url = asset_url
+
         last_exc = None
         for attempt in range(self.max_retries):
             try:
-                signed_url = pc.sign(asset_url)
                 with rasterio.open(signed_url) as src:
                     west, south, east, north = bbox_wgs84
                     left, bottom, right, top = transform_bounds(
@@ -84,20 +83,20 @@ class SentinelFetcher:
                 wait = self.retry_backoff ** attempt
                 print(f"  [Read] attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s")
                 time.sleep(wait)
+                if attempt > 0:
+                    try:
+                        signed_url = pc.sign(asset_url)
+                    except Exception:
+                        pass
 
         raise RuntimeError(f"_read_band_window failed after {self.max_retries} attempts") from last_exc
-
-    # multi-tile mosaicking per band
 
     def _fetch_mosaicked_band(
         self, band_name: str, items: List[Any], grid_info: Dict
     ) -> Tuple[str, Optional[np.ndarray]]:
-        """reads and seamlessly overlays all tiles captured on the same date onto master canvas."""
         is_scl = (band_name == "SCL")
         resampling = Resampling.nearest if is_scl else Resampling.bilinear
-        dst_nodata = 0.0 if is_scl else np.nan
 
-        # target canvas
         canvas_shape = grid_info["shape"]
         combined_canvas = np.zeros(canvas_shape, dtype=np.uint8) if is_scl else np.full(canvas_shape, np.nan, dtype=np.float32)
 
@@ -117,15 +116,13 @@ class SentinelFetcher:
                     src_transform=src_transform,
                     grid_info=grid_info,
                     resampling_method=resampling,
-                    dst_nodata=dst_nodata,
+                    dst_nodata=0.0 if is_scl else np.nan,
                 )
 
                 if is_scl:
-                    # overlay non-zero classifications
                     valid_mask = (aligned != 0)
                     combined_canvas[valid_mask] = aligned[valid_mask].astype(np.uint8)
                 else:
-                    # overlay non-nan and positive reflectance pixels
                     valid_mask = np.isfinite(aligned) & (aligned > 0.0)
                     combined_canvas[valid_mask] = aligned[valid_mask]
 
@@ -135,8 +132,6 @@ class SentinelFetcher:
 
         return band_name, combined_canvas
 
-    # sentinel-2 scene search with mosaicking
-
     def fetch_sentinel2_scene(
         self,
         grid_info: Dict,
@@ -144,7 +139,6 @@ class SentinelFetcher:
         lookback_days: int = 25,
         max_cloud_cover: float = 60.0,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], str]:
-        """searches and mosaics multi-tile acquisitions grouped by date."""
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         start_dt = target_dt - timedelta(days=lookback_days)
 
@@ -167,19 +161,16 @@ class SentinelFetcher:
         if not items:
             return {}, {}, ""
 
-        # group candidate tiles by acquisition date
         items_by_date: Dict[str, List[Any]] = defaultdict(list)
         for item in items:
             d_str = item.datetime.strftime("%Y-%m-%d")
             items_by_date[d_str].append(item)
 
-        # evaluate candidate dates from newest to oldest
         sorted_dates = sorted(items_by_date.keys(), reverse=True)
 
         for candidate_date in sorted_dates:
             date_items = items_by_date[candidate_date]
 
-            # 1. build mosaicked scl mask to test spatial coverage
             _, mosaicked_scl = self._fetch_mosaicked_band("SCL", date_items, grid_info)
             if mosaicked_scl is None:
                 continue
@@ -194,7 +185,6 @@ class SentinelFetcher:
 
             print(f"  [S2] selected date {candidate_date} mosaicking {len(date_items)} tile(s) (NoData: {nodata_ratio * 100:.1f}%)")
 
-            # 2. fetch and mosaic all remaining bands in parallel
             aligned_bands: Dict[str, np.ndarray] = {}
             remaining_bands = [b for b in self.OPTICAL_BANDS if b != "SCL"]
 
@@ -212,18 +202,16 @@ class SentinelFetcher:
                         band = future_map[future]
                         print(f"  [Warning] thread exception for band {band}: {e}")
 
+            aligned_bands["SCL"] = mosaicked_scl
             masks = self.extract_scl_masks(mosaicked_scl)
             return aligned_bands, masks, candidate_date
 
         print(f"  [Error] no date found with combined NoData < {self.max_nodata_fraction * 100:.0f}%.")
         return {}, {}, ""
 
-    # sentinel-1 sar fetch with multi-slice mosaicking
-
     def fetch_sentinel1_sar(
         self, grid_info: Dict, target_date_str: str, window_days: int = 12
     ) -> Dict[str, np.ndarray]:
-        """fetches and mosaics sentinel-1 rtc sar (vv + vh) slices."""
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         start_dt = target_dt - timedelta(days=window_days)
         end_dt = target_dt + timedelta(days=window_days)
@@ -242,13 +230,11 @@ class SentinelFetcher:
         if not items:
             return {}
 
-        # group slices by date
         items_by_date: Dict[str, List[Any]] = defaultdict(list)
         for item in items:
             d_str = item.datetime.strftime("%Y-%m-%d")
             items_by_date[d_str].append(item)
 
-        # find closest date to target
         sorted_dates = sorted(
             items_by_date.keys(),
             key=lambda d: abs((datetime.strptime(d, "%Y-%m-%d") - target_dt).days),
@@ -256,12 +242,18 @@ class SentinelFetcher:
 
         for d_str in sorted_dates:
             date_items = items_by_date[d_str]
-            sar_bands: Dict[str, np.ndarray] = {}
 
-            for pol in ["vv", "vh"]:
-                _, pol_canvas = self._fetch_mosaicked_band(pol, date_items, grid_info)
-                if pol_canvas is not None and not np.isnan(pol_canvas).all():
-                    sar_bands[f"SAR_{pol.upper()}"] = pol_canvas
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                f_vv = pool.submit(self._fetch_mosaicked_band, "vv", date_items, grid_info)
+                f_vh = pool.submit(self._fetch_mosaicked_band, "vh", date_items, grid_info)
+                _, vv_canvas = f_vv.result()
+                _, vh_canvas = f_vh.result()
+
+            sar_bands: Dict[str, np.ndarray] = {}
+            if vv_canvas is not None and not np.isnan(vv_canvas).all():
+                sar_bands["SAR_VV"] = vv_canvas
+            if vh_canvas is not None and not np.isnan(vh_canvas).all():
+                sar_bands["SAR_VH"] = vh_canvas
 
             if len(sar_bands) == 2:
                 return sar_bands
@@ -269,27 +261,22 @@ class SentinelFetcher:
         print("  [S1] no complete mosaicked VV+VH pair found in search window.")
         return {}
 
-    # combined entry point
-
     def fetch_all_radar_optical(self, lat: float, lon: float, target_date: str) -> Dict[str, Any]:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
 
-        # 1. fetch t0 with mosaicking
-        bands_t0, masks_t0, t0_date = self.fetch_sentinel2_scene(
-            grid_info, target_date, lookback_days=15
-        )
+        tprev_probe = (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=25)).strftime("%Y-%m-%d")
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            f_t0    = pool.submit(self.fetch_sentinel2_scene, grid_info, target_date, 15)
+            f_tprev = pool.submit(self.fetch_sentinel2_scene, grid_info, tprev_probe, 30)
+            f_sar   = pool.submit(self.fetch_sentinel1_sar, grid_info, target_date)
+
+            bands_t0, masks_t0, t0_date          = f_t0.result()
+            bands_tprev, masks_tprev, tprev_date = f_tprev.result()
+            sar_bands                             = f_sar.result()
+
         if not bands_t0:
             return {}
-
-        # 2. fetch tprev with mosaicking
-        t0_dt = datetime.strptime(t0_date, "%Y-%m-%d")
-        tprev_target = (t0_dt - timedelta(days=10)).strftime("%Y-%m-%d")
-        bands_tprev, masks_tprev, tprev_date = self.fetch_sentinel2_scene(
-            grid_info, tprev_target, lookback_days=30
-        )
-
-        # 3. fetch s1 sar
-        sar_bands = self.fetch_sentinel1_sar(grid_info, t0_date)
 
         return {
             "grid_info": grid_info,

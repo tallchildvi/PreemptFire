@@ -157,9 +157,11 @@ def run_pipeline_patch_test(
 
 if __name__ == "__main__":
     run_pipeline_patch_test(
-        lat=56.7264,
-        lon=-111.3803,
-        target_date="2023-06-15",
+        # lat=56.7264,
+        # lon=-111.3803,
+        lat = 52.5708739,
+        lon =  -117.9518471,
+        target_date="2021-08-15",
         is_fire=1,
         patch_size=256,
         stride=256,

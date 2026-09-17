@@ -20,7 +20,7 @@ from src.processing.grid_aligner import GridAligner
 
 
 class SpatialFeatureFetcher:
-    """Production-grade DEM and OSM feature extractor with temporal disk caching"""
+    """Production-grade DEM and OSM feature extractor supporting both local history and live Overpass."""
 
     TARGETED_OSM_TAGS: Dict[str, List[str]] = {
         "highway": [
@@ -46,16 +46,28 @@ class SpatialFeatureFetcher:
 
     def __init__(
         self,
+        osm_mode: str = "local_history",
         timeout_sec: int = 25,
         max_retries: int = 4,
         retry_backoff: float = 2.0,
     ):
+        self.osm_mode = osm_mode
         self.timeout_sec = timeout_sec
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
         self.aligner = GridAligner()
         self.stac_client = self._init_stac_client()
-        self._query_osm_temporal = make_temporal_osm_query()
+
+        if self.osm_mode == "local_history":
+            # lazy import prevents crashes in environments lacking osmium binaries
+            from src.data_pipeline.osm_extractor import HistoricalOSMExtractor
+            self.osm_extractor = HistoricalOSMExtractor()
+            self._query_osm_temporal = None
+        elif self.osm_mode == "overpass":
+            self.osm_extractor = None
+            self._query_osm_temporal = make_temporal_osm_query()
+        else:
+            raise ValueError(f"Unknown osm_mode '{osm_mode}'. Expected 'local_history' or 'overpass'.")
 
     def _init_stac_client(self) -> Optional[pystac_client.Client]:
         for attempt in range(self.max_retries):
@@ -68,7 +80,6 @@ class SpatialFeatureFetcher:
                 wait = self.retry_backoff ** attempt
                 print(f"  [STAC] Init attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s...")
                 time.sleep(wait)
-
         print("  [STAC] All client init attempts failed — DEM layers will fallback to NaN.")
         return None
 
@@ -165,6 +176,64 @@ class SpatialFeatureFetcher:
         print("  [DEM] All retries exhausted — returning NaN array.")
         return fallback
 
+    def _fetch_osm_geometries(
+        self, grid_info: dict, target_date: str, buffer_meters: float = 0.0
+    ) -> Optional[gpd.GeoDataFrame]:
+        """Unified internal router between local history dumps and live Overpass API."""
+        if self.osm_mode == "local_history":
+            west, south, east, north = self._get_buffered_wgs84_bbox(
+                grid_info, buffer_meters=buffer_meters
+            )
+            return self.osm_extractor.extract_features_for_date(
+                date=target_date,
+                west=west,
+                south=south,
+                east=east,
+                north=north,
+                target_crs=grid_info["crs"],
+            )
+        elif self.osm_mode == "overpass":
+            return self._query_osm_temporal(
+                grid_info, target_date=target_date, buffer_meters=buffer_meters
+            )
+        return None
+
+    def fetch_road_raster(
+        self,
+        lat: float,
+        lon: float,
+        target_date: Optional[str] = None,
+        include_trails: bool = False,
+        grid_shape: Optional[Tuple[int, int]] = None,
+        **kwargs,
+    ) -> np.ndarray:
+        date_str = target_date.split(" ")[0] if target_date else date.today().strftime("%Y-%m-%d")
+        grid_info = self.aligner.get_master_grid_info(lat, lon)
+        gdf_osm = self._fetch_osm_geometries(grid_info, target_date=date_str, buffer_meters=0.0)
+
+        target_shape = grid_shape if grid_shape is not None else grid_info["shape"]
+
+        if gdf_osm is None or gdf_osm.empty or "highway" not in gdf_osm.columns:
+            return np.zeros(target_shape, dtype=np.uint8)
+
+        target_tags = (
+            self.ROAD_HIGHWAYS | self.TRAIL_HIGHWAYS
+            if include_trails
+            else self.ROAD_HIGHWAYS
+        )
+
+        gdf_filtered = gdf_osm[gdf_osm["highway"].isin(target_tags)].copy()
+        if gdf_filtered.empty:
+            return np.zeros(target_shape, dtype=np.uint8)
+
+        return self._rasterize_geometries(
+            gdf_filtered,
+            shape=target_shape,
+            transform=grid_info["transform"],
+            value=1,
+            fill=0,
+        )
+
     def fetch_dem_features(self, grid_info: dict) -> Dict[str, np.ndarray]:
         dem_30m, native_transform = self._fetch_dem_raster(grid_info, buffer_meters=0.0, resolution=30.0)
 
@@ -226,7 +295,7 @@ class SpatialFeatureFetcher:
             ]
             if not shapes:
                 return np.full(shape, fill, dtype=np.uint8)
-            return rasterize(shapes, out_shape=shape, transform=transform, fill=fill, dtype=np.uint8)
+            return rasterize(shapes, out_shape=shape, transform=transform, fill=fill, dtype=np.uint8, all_touched=True)
         except Exception as e:
             print(f"  [Rasterize] Error rasterizing geometries ({e}) — using fill={fill}.")
             return np.full(shape, fill, dtype=np.uint8)
@@ -265,7 +334,6 @@ class SpatialFeatureFetcher:
                 dst_nodata=max_time_cap_hours,
             )
             return master_time_10m
-
         except Exception as e:
             print(f"  [Accessibility] Dijkstra kernel failed ({e}) — using fallback cap.")
             return fallback
@@ -298,11 +366,9 @@ class SpatialFeatureFetcher:
                 dst_nodata=max_dist_m,
             )
             return dist_10m
-
         except Exception as e:
             print(f"  [EDT] Distance transform failed ({e}) — using fallback cap.")
             return fallback
-
 
     def fetch_all_spatial_features(
         self,
@@ -324,8 +390,8 @@ class SpatialFeatureFetcher:
         )
         _, buf_shape_50m, _ = self._get_buffered_grid(grid_info, buffer_meters, 50.0)
 
-        # 3. Disk-cached temporal OSM query
-        gdf_all = self._query_osm_temporal(grid_info, target_date=date_str, buffer_meters=buffer_meters)
+        # 3. Unified OSM query router (local history or live overpass)
+        gdf_all = self._fetch_osm_geometries(grid_info, target_date=date_str, buffer_meters=buffer_meters)
 
         gdf_roads = gdf_trails = gdf_water = gdf_bridges = None
         gdf_railways = gdf_camps = gdf_power = None
@@ -360,24 +426,19 @@ class SpatialFeatureFetcher:
                     if "amenity" in gdf_all.columns:
                         c_cond = c_cond | gdf_all["amenity"].isin(self.TARGETED_OSM_TAGS["amenity"])
                     gdf_camps = gdf_all[c_cond]
-
             except Exception as e:
                 print(f"  [OSM] Feature filtering error ({e}) — assigning null geometries.")
 
-        # 4. Passable terrain grid (water & void DEM cells blocked, bridges unblocked)
+        # 4. Passable terrain grid
         passable_50m = np.ones(buf_shape_50m, dtype=np.uint8)
-        try:
-            water_mask_50m = self._rasterize_geometries(gdf_water, buf_shape_50m, buf_transform_50m)
-            passable_50m[water_mask_50m == 1] = 0
-            passable_50m[np.isnan(dem_50m)] = 0
+        water_mask_50m = self._rasterize_geometries(gdf_water, buf_shape_50m, buf_transform_50m)
+        passable_50m[water_mask_50m == 1] = 0
+        passable_50m[np.isnan(dem_50m)] = 0
 
-            # Unblock bridges over water bodies
-            bridge_mask_50m = self._rasterize_geometries(gdf_bridges, buf_shape_50m, buf_transform_50m)
-            passable_50m[bridge_mask_50m == 1] = 1
-        except Exception as e:
-            print(f"  [Passable] Passability mask building error ({e}) — defaulting to fully passable.")
+        bridge_mask_50m = self._rasterize_geometries(gdf_bridges, buf_shape_50m, buf_transform_50m)
+        passable_50m[bridge_mask_50m == 1] = 1
 
-        # 5. Spatial distance fields & accessibility maps
+        # 5. Accessibility and distance fields
         travel_roads = self._compute_fast_accessibility_50m(dem_50m, passable_50m, gdf_roads, grid_info, buf_transform_50m)
         travel_trails = self._compute_fast_accessibility_50m(dem_50m, passable_50m, gdf_trails, grid_info, buf_transform_50m)
         dist_railways = self._compute_fast_edt_50m(gdf_railways, grid_info, buf_shape_50m, buf_transform_50m)
@@ -398,19 +459,18 @@ class SpatialFeatureFetcher:
 
 
 if __name__ == "__main__":
-    fetcher = SpatialFeatureFetcher()
+    fetcher = SpatialFeatureFetcher(osm_mode="local_history")
+    test_lat, test_lon, test_date = 50.6745, -120.3273, "2021-08-15"
 
-    test_lat, test_lon = 53.5461, -113.4937
-    test_date = "2023-06-15"
+    print(f"1. Testing fetch_road_raster for [{test_lat}, {test_lon}]...")
+    road_mask = fetcher.fetch_road_raster(lat=test_lat, lon=test_lon, target_date=test_date)
+    print(f"   Road mask shape: {road_mask.shape} | Road pixels: {int((road_mask == 1).sum())}")
 
-    print(f"fetching spatial features for [{test_lat}, {test_lon}] on {test_date}...")
+    print(f"\n2. Testing fetch_all_spatial_features...")
     t_start = time.perf_counter()
     data = fetcher.fetch_all_spatial_features(lat=test_lat, lon=test_lon, target_date=test_date)
     elapsed = time.perf_counter() - t_start
 
-    print(f"\ncompleted in {elapsed:.2f}s:")
+    print(f"\nCompleted in {elapsed:.2f}s:")
     for name, arr in data.items():
-        print(
-            f"  {name:20s} shape: {arr.shape} | "
-            f"range: [{np.nanmin(arr):8.2f}, {np.nanmax(arr):8.2f}]"
-        )
+        print(f"   {name:<22} shape: {arr.shape} | range: [{np.nanmin(arr):8.2f}, {np.nanmax(arr):8.2f}]")

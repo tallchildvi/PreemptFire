@@ -1,192 +1,154 @@
-from typing import Optional
 import numpy as np
 
 
 class IndexCalculator:
+    """Calculates multi-spectral optical and SAR polarimetric indices."""
 
-    def __init__(
-        self,
-        epsilon: float = 1e-7,
-        reflectance_scale: float = 10000.0,
-        auto_detect_scale: bool = False,
-        sar_ratio_max: float = 10.0,
-    ):
-        self.epsilon = float(epsilon)
-        self.reflectance_scale = float(reflectance_scale)
-        self.auto_detect_scale = bool(auto_detect_scale)
-        self.sar_ratio_max = float(sar_ratio_max)
+    @staticmethod
+    def calc_delta(t0_arr: np.ndarray, tprev_arr: np.ndarray) -> np.ndarray:
+        """Computes temporal difference between t0 and tprev rasters."""
+        return (t0_arr - tprev_arr).astype(np.float32)
 
-    
-    # Main Orchestrator
+    @staticmethod
+    def calc_ndvi(nir: np.ndarray, red: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Normalized Difference Vegetation Index: (B08 - B04) / (B08 + B04)."""
+        return ((nir - red) / (nir + red + eps)).astype(np.float32)
+
+    @staticmethod
+    def calc_ndmi(nir: np.ndarray, swir1: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Normalized Difference Moisture Index: (B08 - B11) / (B08 + B11)."""
+        return ((nir - swir1) / (nir + swir1 + eps)).astype(np.float32)
+
+    @staticmethod
+    def calc_nbr(nir: np.ndarray, swir2: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Normalized Burn Ratio: (B08 - B12) / (B08 + B12)."""
+        return ((nir - swir2) / (nir + swir2 + eps)).astype(np.float32)
+
+    @staticmethod
+    def calc_nbr2(swir1: np.ndarray, swir2: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Normalized Burn Ratio 2: (B11 - B12) / (B11 + B12)."""
+        return ((swir1 - swir2) / (swir1 + swir2 + eps)).astype(np.float32)
+
+    @staticmethod
+    def calc_evi(nir: np.ndarray, red: np.ndarray, blue: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Enhanced Vegetation Index: 2.5 * (B08 - B04) / (B08 + 6*B04 - 7.5*B02 + 1)."""
+        numerator = 2.5 * (nir - red)
+        denominator = nir + 6.0 * red - 7.5 * blue + 1.0 + eps
+        return (numerator / denominator).astype(np.float32)
+
+    @staticmethod
+    def calc_ndre(nir: np.ndarray, red_edge: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Normalized Difference Red Edge Index: (B08 - B05) / (B08 + B05)."""
+        return ((nir - red_edge) / (nir + red_edge + eps)).astype(np.float32)
+
+    @staticmethod
+    def calc_msi(swir1: np.ndarray, nir: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Moisture Stress Index: B11 / B08."""
+        return ((swir1 + eps) / (nir + eps)).astype(np.float32)
+
+    @staticmethod
+    def calc_nmdi(
+        nir: np.ndarray,
+        swir1: np.ndarray,
+        swir2: np.ndarray,
+        eps: float = 1e-6,
+    ) -> np.ndarray:
+        """Normalized Multi-band Drought Index: (B08 - (B11 - B12)) / (B08 + (B11 - B12))."""
+        diff_swir = swir1 - swir2
+        numerator = nir - diff_swir
+        denominator = nir + diff_swir + eps
+        return (numerator / denominator).astype(np.float32)
+
+    @staticmethod
+    def calc_sar_ratio(vh: np.ndarray, vv: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Cross-polarization ratio: VH / VV."""
+        return ((vh + eps) / (vv + eps)).astype(np.float32)
+
+    @staticmethod
+    def calc_sar_rvi(vv: np.ndarray, vh: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+        """Radar Vegetation Index: 4 * VH / (VV + VH)."""
+        return ((4.0 * vh) / (vv + vh + eps)).astype(np.float32)
 
     def compute_all_indices(
         self,
-        b02_t0: np.ndarray,
-        b04_t0: np.ndarray,
-        b08_t0: np.ndarray,
-        b8a_t0: np.ndarray,
-        b11_t0: np.ndarray,
-        b12_t0: np.ndarray,
-        scl_t0: np.ndarray,
-        b05_t0: Optional[np.ndarray] = None,
-        b04_tprev: Optional[np.ndarray] = None,
-        b08_tprev: Optional[np.ndarray] = None,
-        b11_tprev: Optional[np.ndarray] = None,
-        b12_tprev: Optional[np.ndarray] = None,
-        sar_vv: Optional[np.ndarray] = None,
-        sar_vh: Optional[np.ndarray] = None,
+        b02: np.ndarray | None = None,
+        b03: np.ndarray | None = None,
+        b04: np.ndarray | None = None,
+        b05: np.ndarray | None = None,
+        b06: np.ndarray | None = None,
+        b07: np.ndarray | None = None,
+        b08: np.ndarray | None = None,
+        b8a: np.ndarray | None = None,
+        b11: np.ndarray | None = None,
+        b12: np.ndarray | None = None,
+        scl: np.ndarray | None = None,
+        sar_vv: np.ndarray | None = None,
+        sar_vh: np.ndarray | None = None,
+        b04_tprev: np.ndarray | None = None,
+        b08_tprev: np.ndarray | None = None,
+        b11_tprev: np.ndarray | None = None,
+        b12_tprev: np.ndarray | None = None,
+        b02_t0: np.ndarray | None = None,
+        b03_t0: np.ndarray | None = None,
+        b04_t0: np.ndarray | None = None,
+        b05_t0: np.ndarray | None = None,
+        b06_t0: np.ndarray | None = None,
+        b07_t0: np.ndarray | None = None,
+        b08_t0: np.ndarray | None = None,
+        b8a_t0: np.ndarray | None = None,
+        b11_t0: np.ndarray | None = None,
+        b12_t0: np.ndarray | None = None,
+        scl_t0: np.ndarray | None = None,
+        sar_vv_t0: np.ndarray | None = None,
+        sar_vh_t0: np.ndarray | None = None,
+        **kwargs,
     ) -> dict[str, np.ndarray]:
+        """Computes static T0 indices and temporal deltas with support for both band naming styles."""
+        b02 = b02 if b02 is not None else b02_t0
+        b04 = b04 if b04 is not None else b04_t0
+        b05 = b05 if b05 is not None else b05_t0
+        b08 = b08 if b08 is not None else b08_t0
+        b11 = b11 if b11 is not None else b11_t0
+        b12 = b12 if b12 is not None else b12_t0
+        sar_vv = sar_vv if sar_vv is not None else sar_vv_t0
+        sar_vh = sar_vh if sar_vh is not None else sar_vh_t0
+
         results: dict[str, np.ndarray] = {}
 
-        # 1. T0 Optical & Fuel Moisture Indices
-        results["NDVI_T0"] = self.calc_ndvi(b08_t0, b04_t0)
-        results["NDMI_T0"] = self.calc_ndmi(b08_t0, b11_t0)
-        results["MSI_T0"] = self.calc_msi(b11_t0, b08_t0)
-        results["NBR_T0"] = self.calc_nbr(b08_t0, b12_t0)
-        results["NBR2_T0"] = self.calc_nbr2(b11_t0, b12_t0)
-        results["NMDI_T0"] = self.calc_nmdi(b08_t0, b11_t0, b12_t0)
-        results["EVI_T0"] = self.calc_evi(b08_t0, b04_t0, b02_t0)
+        # 1. Optical Indices (T0)
+        if b08 is not None and b04 is not None:
+            results["NDVI_T0"] = self.calc_ndvi(b08, b04)
+        if b08 is not None and b11 is not None:
+            results["NDMI_T0"] = self.calc_ndmi(b08, b11)
+            results["MSI_T0"] = self.calc_msi(b11, b08)
+        if b08 is not None and b12 is not None:
+            results["NBR_T0"] = self.calc_nbr(b08, b12)
+        if b11 is not None and b12 is not None:
+            results["NBR2_T0"] = self.calc_nbr2(b11, b12)
+        if b08 is not None and b04 is not None and b02 is not None:
+            results["EVI_T0"] = self.calc_evi(b08, b04, b02)
+        if b08 is not None and b05 is not None:
+            results["NDRE_T0"] = self.calc_ndre(b08, b05)
+        if b08 is not None and b11 is not None and b12 is not None:
+            results["NMDI_T0"] = self.calc_nmdi(b08, b11, b12)
 
-        if b05_t0 is not None:
-            results["NDRE_T0"] = self.calc_ndre(b8a_t0, b05_t0)
-
-        # 2. Quality & Physical State Masks
-        results["MASK_SNOW"] = self.calc_snow_mask(scl_t0)
-        results["MASK_OPTICAL_INVALID"] = self.calc_optical_invalid_mask(scl_t0)
-        results["MASK_WATER"] = self.calc_water_mask(scl_t0)
-
-        # 3. Temporal Spectral Changes (T0 - Tprev)
-        if b08_tprev is not None and b04_tprev is not None:
-            results["dNDVI"] = self.calc_delta(results["NDVI_T0"], self.calc_ndvi(b08_tprev, b04_tprev))
-
-        if b08_tprev is not None and b11_tprev is not None:
-            results["dNDMI"] = self.calc_delta(results["NDMI_T0"], self.calc_ndmi(b08_tprev, b11_tprev))
- 
-        if b08_tprev is not None and b12_tprev is not None:
-            results["dNBR"] = self.calc_delta(results["NBR_T0"], self.calc_nbr(b08_tprev, b12_tprev))
-
-        # 4. Sentinel-1 SAR Polarimetric Features
+        # 2. SAR Polarimetric Indices
         if sar_vv is not None and sar_vh is not None:
             results["SAR_RATIO"] = self.calc_sar_ratio(sar_vh, sar_vv)
-            results["SAR_RVI"] = self.calc_sar_rvi(sar_vh, sar_vv)
+            results["SAR_RVI"] = self.calc_sar_rvi(sar_vv, sar_vh)
+
+        # 3. Temporal Spectral Changes (T0 - Tprev)
+        if b08_tprev is not None and b04_tprev is not None and "NDVI_T0" in results:
+            results["dNDVI"] = self.calc_delta(results["NDVI_T0"], self.calc_ndvi(b08_tprev, b04_tprev))
+
+        if b08_tprev is not None and b11_tprev is not None and "NDMI_T0" in results:
+            results["dNDMI"] = self.calc_delta(results["NDMI_T0"], self.calc_ndmi(b08_tprev, b11_tprev))
+            results["dMSI"] = self.calc_delta(results["MSI_T0"], self.calc_msi(b11_tprev, b08_tprev))
+
+        if b08_tprev is not None and b12_tprev is not None and "NBR_T0" in results:
+            results["dNBR"] = self.calc_delta(results["NBR_T0"], self.calc_nbr(b08_tprev, b12_tprev))
+
+        if b08_tprev is not None and b11_tprev is not None and b12_tprev is not None and "NMDI_T0" in results:
+            results["dNMDI"] = self.calc_delta(results["NMDI_T0"], self.calc_nmdi(b08_tprev, b11_tprev, b12_tprev))
 
         return results
-
-    
-    # Common Utilities
-    
-
-    def _calc_norm_diff(self, band_a: np.ndarray, band_b: np.ndarray) -> np.ndarray:
-        denom = band_a + band_b
-        valid = np.isfinite(band_a) & np.isfinite(band_b) & (np.abs(denom) > self.epsilon)
-
-        out = np.zeros_like(band_a, dtype=np.float32)
-        np.divide(band_a - band_b, denom, out=out, where=valid)
-        return np.clip(out, -1.0, 1.0).astype(np.float32)
-
-    
-    # Vegetation & Moisture Indices
-    
-
-    def calc_ndvi(self, b08_nir: np.ndarray, b04_red: np.ndarray) -> np.ndarray:
-        return self._calc_norm_diff(b08_nir, b04_red)
-
-    def calc_ndre(self, b8a_narrow_nir: np.ndarray, b05_rededge: np.ndarray) -> np.ndarray:
-        return self._calc_norm_diff(b8a_narrow_nir, b05_rededge)
-
-    def calc_ndmi(self, b08_nir: np.ndarray, b11_swir1: np.ndarray) -> np.ndarray:
-        return self._calc_norm_diff(b08_nir, b11_swir1)
-
-    def calc_nbr(self, b08_nir: np.ndarray, b12_swir2: np.ndarray) -> np.ndarray:
-        return self._calc_norm_diff(b08_nir, b12_swir2)
-
-    def calc_nbr2(self, b11_swir1: np.ndarray, b12_swir2: np.ndarray) -> np.ndarray:
-        return self._calc_norm_diff(b11_swir1, b12_swir2)
-
-    def calc_msi(self, b11_swir1: np.ndarray, b08_nir: np.ndarray) -> np.ndarray:
-        valid = np.isfinite(b11_swir1) & np.isfinite(b08_nir) & (b08_nir > self.epsilon)
-        out = np.zeros_like(b11_swir1, dtype=np.float32)
-        np.divide(b11_swir1, b08_nir, out=out, where=valid)
-        return np.clip(np.nan_to_num(out, nan=0.0, posinf=5.0, neginf=0.0), 0.0, 5.0).astype(np.float32)
-
-    def calc_nmdi(self, b08_nir: np.ndarray, b11_swir1: np.ndarray, b12_swir2: np.ndarray) -> np.ndarray:
-        swir_diff = b11_swir1 - b12_swir2
-        numerator = b08_nir - swir_diff
-        denominator = b08_nir + swir_diff
-
-        valid = np.isfinite(numerator) & np.isfinite(denominator) & (np.abs(denominator) > self.epsilon)
-        out = np.zeros_like(b08_nir, dtype=np.float32)
-        np.divide(numerator, denominator, out=out, where=valid)
-        return np.clip(out, -1.0, 1.0).astype(np.float32)
-
-    
-    # EVI
-    
-
-    def _get_reflectance_scale(self, reference_band: np.ndarray) -> float:
-        if not self.auto_detect_scale:
-            return self.reflectance_scale
-
-        finite = reference_band[np.isfinite(reference_band)]
-        if finite.size == 0:
-            return 1.0
-
-        p95 = np.percentile(finite, 95)
-        return self.reflectance_scale if p95 > 2.0 else 1.0
-
-    def calc_evi(self, b08_nir: np.ndarray, b04_red: np.ndarray, b02_blue: np.ndarray) -> np.ndarray:
-        scale = self._get_reflectance_scale(b08_nir)
-        nir = b08_nir / scale
-        red = b04_red / scale
-        blue = b02_blue / scale
-
-        denominator = nir + 6.0 * red - 7.5 * blue + 1.0
-        valid = np.isfinite(nir) & np.isfinite(red) & np.isfinite(blue) & (denominator > self.epsilon)
-
-        out = np.zeros_like(nir, dtype=np.float32)
-        np.divide(2.5 * (nir - red), denominator, out=out, where=valid)
-        return np.clip(np.nan_to_num(out, nan=0.0, posinf=1.0, neginf=-1.0), -1.0, 1.0).astype(np.float32)
-
-    
-    # Sentinel-2 Quality Masks (Boolean Arrays)
-    
-
-    def calc_snow_mask(self, scl: np.ndarray) -> np.ndarray:
-        """True where Sentinel-2 SCL identifies Snow/Ice (SCL = 11)."""
-        return scl == 11
-
-    def calc_optical_invalid_mask(self, scl: np.ndarray) -> np.ndarray:
-        """True where optical observations are unreliable (SCL: 2, 3, 8, 9, 10)."""
-        return (scl == 2) | (scl == 3) | (scl == 8) | (scl == 9) | (scl == 10)
-
-    def calc_water_mask(self, scl: np.ndarray) -> np.ndarray:
-        """True where Sentinel-2 SCL identifies water (SCL = 6)."""
-        return scl == 6
-
-    
-    # Temporal Changes
-    
-
-    def calc_delta(self, index_t0: np.ndarray, index_tprev: np.ndarray) -> np.ndarray:
-        """Temporal difference: index(T0) - index(Tprev), bounded to [-2, 2]."""
-        delta = index_t0.astype(np.float32) - index_tprev.astype(np.float32)
-        return np.clip(np.nan_to_num(delta, nan=0.0, posinf=2.0, neginf=-2.0), -2.0, 2.0).astype(np.float32)
-
-    
-    # Sentinel-1 SAR Features
-    
-
-    def calc_sar_ratio(self, vh: np.ndarray, vv: np.ndarray) -> np.ndarray:
-        """VH/VV cross-polarization ratio in linear power scale."""
-        valid = np.isfinite(vh) & np.isfinite(vv) & (vv > self.epsilon)
-        out = np.zeros_like(vh, dtype=np.float32)
-        np.divide(vh, vv, out=out, where=valid)
-        return np.clip(np.nan_to_num(out, nan=0.0, posinf=self.sar_ratio_max, neginf=0.0), 0.0, self.sar_ratio_max).astype(np.float32)
-
-    def calc_sar_rvi(self, vh: np.ndarray, vv: np.ndarray) -> np.ndarray:
-        """Dual-polarization Radar Vegetation Index: 4*VH / (VV + VH) in linear power scale."""
-        denominator = vv + vh
-        valid = np.isfinite(vh) & np.isfinite(vv) & (denominator > self.epsilon)
-        out = np.zeros_like(vh, dtype=np.float32)
-        np.divide(4.0 * vh, denominator, out=out, where=valid)
-        return np.clip(np.nan_to_num(out, nan=0.0, posinf=4.0, neginf=0.0), 0.0, 4.0).astype(np.float32)
