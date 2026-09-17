@@ -1,16 +1,17 @@
 import os
+from pathlib import Path
 import sqlite3
 import time
 from typing import Dict, List, Optional
 import pandas as pd
 
-from src.data_pipeline.hdf5_writer import HDF5Writer
+from src.data_pipeline.hdf5_writer import HDF5Writer, inspect_h5_structure
 from src.data_pipeline.patch_extractor import PatchExtractor
 from src.data_pipeline.single_scene_collector import SingleSceneCollector
 
 
 class DatasetGenerator:
-    """batch processor creating a unified hdf5 dataset with sqlite-based state recovery."""
+    """Batch processor creating a unified HDF5 dataset with SQLite-based state recovery."""
 
     def __init__(
         self,
@@ -19,6 +20,7 @@ class DatasetGenerator:
         patch_size: int = 256,
         stride: int = 256,
         max_invalid_ratio: float = 0.20,
+        osm_mode: str = "local_history",
     ):
         self.points_csv_path = points_csv_path
         self.output_h5_path = output_h5_path
@@ -27,7 +29,7 @@ class DatasetGenerator:
         self.db_path = os.path.join(os.path.dirname(output_h5_path), "dataset_checkpoint.db")
         self._init_db()
 
-        self.collector = SingleSceneCollector()
+        self.collector = SingleSceneCollector(osm_mode=osm_mode)
         self.extractor = PatchExtractor(
             patch_size=patch_size,
             stride=stride,
@@ -39,7 +41,7 @@ class DatasetGenerator:
         return sqlite3.connect(self.db_path, timeout=30.0)
 
     def _init_db(self):
-        """creates checkpoint table if not exists."""
+        """Creates checkpoint table if not exists."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -60,17 +62,14 @@ class DatasetGenerator:
             conn.commit()
 
     def sync_from_csv(self, df: pd.DataFrame):
-        """registers new points from csv into tracker supporting custom schema mappings."""
+        """Registers new points from CSV into tracker supporting custom schema mappings."""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             now = time.strftime("%Y-%m-%d %H:%M:%S")
 
             for _, row in df.iterrows():
-                # support both latitude/longitude and lat/lon schemas
                 lat = float(row.get("latitude", row.get("lat")))
                 lon = float(row.get("longitude", row.get("lon")))
-
-                # support both acq_date and target_date
                 raw_date = row.get("acq_date", row.get("target_date"))
                 date_str = str(raw_date).split(" ")[0].strip()
 
@@ -88,7 +87,7 @@ class DatasetGenerator:
             conn.commit()
 
     def run(self, max_scenes: Optional[int] = None):
-        """executes batch collection and atomic streaming into a single hdf5 file."""
+        """Executes batch collection and atomic streaming into a single HDF5 file."""
         df_points = pd.read_csv(self.points_csv_path)
         self.sync_from_csv(df_points)
 
@@ -124,14 +123,17 @@ class DatasetGenerator:
                     lat=lat, lon=lon, target_date=target_date, is_fire=is_fire
                 )
 
+                # Якщо супутник або інші дані не знайдено — пропускаємо сцену і не пишемо в H5
                 if sample is None:
-                    self._update_status(scene_id, status="FAILED", error_msg="collector returned none")
+                    print(f"  [SKIP] Skipping {scene_id}: Missing Sentinel-2 optical pair.")
+                    self._update_status(scene_id, status="SKIPPED_NO_DATA", error_msg="missing S2 optical pair")
                     continue
 
                 patches = list(self.extractor.extract_patches(sample, scene_id=scene_id))
 
                 if not patches:
-                    self._update_status(scene_id, status="COMPLETED", patches_count=0, error_msg="0 valid patches")
+                    print(f"  [SKIP] Skipping {scene_id}: 0 valid patches.")
+                    self._update_status(scene_id, status="SKIPPED_EMPTY_PATCHES", patches_count=0, error_msg="0 valid patches")
                     continue
 
                 written_count = self.writer.write_patches_batch(patches)
@@ -160,8 +162,6 @@ class DatasetGenerator:
 
 
 if __name__ == "__main__":
-    from src.data_pipeline.hdf5_writer import inspect_h5_structure
-
     csv_input_path = os.path.join("data", "interim", "points_dataset_thinned.csv")
     output_h5_path = os.path.join("data", "processed", "wildfire_dataset.h5")
 
@@ -175,6 +175,7 @@ if __name__ == "__main__":
         patch_size=256,
         stride=256,
         max_invalid_ratio=0.20,
+        osm_mode="local_history",
     )
 
     print("--- processing first 5 scenes ---")

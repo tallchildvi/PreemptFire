@@ -57,16 +57,22 @@ class PatchExtractor:
 
         # assemble 2d channels according to canonical schema with zero-imputation
         canonical_rasters = []
+        validity_flags = []
+
         for ch in self.CANONICAL_2D_CHANNELS:
             if ch == "MASK_SAR_VALID":
                 canonical_rasters.append(sar_valid_mask)
+                validity_flags.append(1.0 if has_sar else 0.0)
             elif ch in rasters_2d and rasters_2d[ch] is not None:
                 canonical_rasters.append(np.nan_to_num(rasters_2d[ch], nan=0.0).astype(np.float32))
+                validity_flags.append(1.0)
             else:
                 # impute missing modality with zero baseline to maintain fixed tensor dimensions
                 canonical_rasters.append(np.zeros((h_full, w_full), dtype=np.float32))
+                validity_flags.append(0.0)
 
         stacked_2d = np.stack(canonical_rasters, axis=0).astype(np.float32)
+        channel_validity_vec = np.array(validity_flags, dtype=np.float32)
 
         # sort 1d keys for deterministic feature vector creation
         sorted_context_keys = sorted(context_1d.keys())
@@ -111,6 +117,7 @@ class PatchExtractor:
                     "patch_id": f"{scene_id}_p{patch_idx:03d}",
                     "X_2d": patch_2d,
                     "X_1d": context_vec,
+                    "channel_validity": channel_validity_vec,
                     "loss_mask": patch_loss_mask,
                     "Y": patch_target,
                     "metadata": patch_meta,
