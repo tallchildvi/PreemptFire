@@ -113,7 +113,7 @@ if __name__ == "__main__":
 
     generate_master_dataset(
         start_year=2020,
-        end_year=2024,
+        end_year=2025,
         months=[4, 5, 6, 7, 8, 9, 10, 11], 
         days=[1, 15],
         country_code="CAN",
