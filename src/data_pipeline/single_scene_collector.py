@@ -45,12 +45,10 @@ class SingleSceneCollector:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
         target_year = datetime.strptime(target_date, "%Y-%m-%d").year
 
-        # 1. Завантаження Sentinel-2 виконується ПЕРШИМ
         t_s2 = time.perf_counter()
         sentinel_data = self.sentinel_fetcher.fetch_all_radar_optical(lat, lon, target_date)
         timings["sentinel_fetch"] = time.perf_counter() - t_s2
 
-        # Жорсткий дроп сцени, якщо оптична пара T0 або Tprev відсутня
         if not sentinel_data:
             return None
 
@@ -62,11 +60,9 @@ class SingleSceneCollector:
         if not bands_t0 or not bands_tprev or not t0_date or not tprev_date:
             return None
 
-        # Безпечне отримання масок та радарних каналів (Sentinel-1 може бути None)
         masks_t0 = sentinel_data.get("masks_t0") or {}
         sar_bands = sentinel_data.get("sar_bands") or {}
 
-        # 2. Паралельний збір решти модальностей лише якщо оптика валідна
         def _fetch_dem_osm():
             t0 = time.perf_counter()
             res = self.spatial_fetcher.fetch_all_spatial_features(
@@ -133,14 +129,12 @@ class SingleSceneCollector:
             cffdrs_metrics = f_cffdrs.result()
             weather_t0 = f_weather.result()
 
-        # 3. Метеорологічні показники за три інтервали
         t_tri = time.perf_counter()
         tri_intervals = self.weather_fetcher.fetch_tri_interval_metrics(
             lat=lat, lon=lon, target_date=target_date, t0_date=t0_date, tprev_date=tprev_date
         )
         timings["weather_tri_intervals"] = time.perf_counter() - t_tri
 
-        # 4. Обчислення спектральних індексів і дельт
         t_ind = time.perf_counter()
         indices = self.index_calc.compute_all_indices(
             b02_t0=bands_t0.get("B02"),
@@ -166,14 +160,16 @@ class SingleSceneCollector:
         }
         timings["indices_calc"] = time.perf_counter() - t_ind
 
-        # 5. Побудова цільового тензора
         t_tgt = time.perf_counter()
         target_tensor = self.target_builder.build_target(
             grid_info=grid_info, lat=lat, lon=lon, is_fire=is_fire
         )
-        loss_mask = masks_t0.get(
+        raw_invalid = masks_t0.get(
             "MASK_INVALID", np.zeros(grid_info["shape"], dtype=np.float32)
         )
+        snow_mask = masks_t0.get("MASK_SNOW", np.zeros(grid_info["shape"], dtype=np.float32))
+        loss_mask = np.where(snow_mask > 0.5, 0.0, raw_invalid).astype(np.float32)
+        
         timings["target_builder"] = time.perf_counter() - t_tgt
 
         total_elapsed = time.perf_counter() - total_start
@@ -220,3 +216,114 @@ class SingleSceneCollector:
             "loss_mask": loss_mask,
             "target": target_tensor,
         }
+    
+if __name__ == "__main__":
+    from src.data_pipeline.patch_extractor import PatchExtractor
+
+    # initialize collector and patch extractor
+    collector = SingleSceneCollector()
+    extractor = PatchExtractor(patch_size=256, stride=256, max_invalid_ratio=0.20)
+
+    # test wildfire scene with both optical and sar coverage (jasper, alberta)
+    test_lat = 52.5708739
+    test_lon = -117.9518471
+    test_date = "2021-08-15"
+
+    print(f"=== fetching scene [{test_lat}, {test_lon}] on {test_date} ===")
+    sample = collector.collect_sample(
+        lat=test_lat, lon=test_lon, target_date=test_date, is_fire=1
+    )
+
+    if not sample:
+        print("[error] failed to collect scene or missing sentinel-2 optical pair.")
+        exit(1)
+
+    # print 1d context feature vector to console
+    context_1d = sample["context_1d"]
+    print("\n" + "=" * 65)
+    print(f" 1D CONTEXT VECTOR (total features: {len(context_1d)})")
+    print("=" * 65)
+    for key in sorted(context_1d.keys()):
+        val = context_1d[key]
+        if isinstance(val, (int, float, np.floating)):
+            print(f"  {key:<32}: {val:>12.4f}")
+        else:
+            print(f"  {key:<32}: {str(val):>12}")
+    print("=" * 65 + "\n")
+
+    # extract patches using patchextractor
+    scene_id = f"SCENE_{test_lat:.4f}_{test_lon:.4f}_{test_date.replace('-', '')}"
+    patches = list(extractor.extract_patches(sample, scene_id=scene_id))
+    print(f"extracted {len(patches)} valid patches out of 64 possible (max invalid ratio <= 20%).")
+
+    if not patches:
+        print("[warning] zero patches passed quality threshold.")
+        exit(0)
+
+    # sequential visualization of 2d channels on reconstructed master grid
+    channel_names = patches[0]["channel_names_2d"]
+    num_channels = len(channel_names)
+    full_h, full_w = sample["loss_mask"].shape
+
+    print(f"\nstarting visualization for {num_channels} channels.")
+    print("close current window to display next channel...\n")
+
+    for ch_idx, ch_name in enumerate(channel_names):
+        # empty canvas initialized with nan so rejected patches stay transparent/blank
+        canvas = np.full((full_h, full_w), np.nan, dtype=np.float32)
+
+        # place each valid 256x256 patch into its original grid position
+        for p in patches:
+            r = p["metadata"]["row_offset"]
+            c = p["metadata"]["col_offset"]
+            canvas[r : r + 256, c : c + 256] = p["X_2d"][ch_idx]
+
+        fig, ax = plt.subplots(figsize=(9, 9))
+
+        # select colormap based on sensor and feature type
+        if "MASK" in ch_name or "SCL" in ch_name:
+            cmap = "gray"
+        elif "SAR" in ch_name:
+            cmap = "plasma"
+        elif any(idx in ch_name for idx in ["NDVI", "EVI", "NDRE"]):
+            cmap = "YlGn"
+        elif any(idx in ch_name for idx in ["NDMI", "MSI", "NMDI", "NBR"]):
+            cmap = "coolwarm"
+        elif ch_name in ["Elevation", "Slope"]:
+            cmap = "terrain"
+        else:
+            cmap = "viridis"
+
+        # compute robust display percentiles excluding nan values
+        valid_pixels = canvas[np.isfinite(canvas)]
+        if len(valid_pixels) > 0 and "MASK" not in ch_name:
+            vmin, vmax = np.percentile(valid_pixels, [2, 98])
+        else:
+            vmin = np.nanmin(canvas) if len(valid_pixels) > 0 else 0.0
+            vmax = np.nanmax(canvas) if len(valid_pixels) > 0 else 1.0
+
+        im = ax.imshow(canvas, cmap=cmap, origin="upper", vmin=vmin, vmax=vmax)
+
+        # draw 8x8 patch grid lines (every 256 pixels)
+        for offset in range(0, full_h + 1, 256):
+            ax.axhline(offset - 0.5, color="red", linestyle="--", linewidth=0.7, alpha=0.7)
+            ax.axvline(offset - 0.5, color="red", linestyle="--", linewidth=0.7, alpha=0.7)
+
+        ax.set_title(
+            f"[{ch_idx + 1}/{num_channels}] channel: {ch_name}\n"
+            f"valid patches: {len(patches)}/64 | canvas shape: {full_h}x{full_w}",
+            fontsize=12,
+            fontweight="bold",
+            pad=12,
+        )
+        ax.set_xlabel("x pixel (10m)")
+        ax.set_ylabel("y pixel (10m)")
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("value")
+
+        plt.tight_layout()
+        plt.show()  # blocks execution until window is closed
+        plt.close(fig)
+
+    print("visualization completed.")

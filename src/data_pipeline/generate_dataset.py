@@ -109,6 +109,8 @@ class DatasetGenerator:
 
         print(f"found {len(pending_scenes)} scenes pending processing.")
 
+        max_retries = 1
+
         for idx, scene in enumerate(pending_scenes, 1):
             scene_id = scene["scene_id"]
             lat, lon = scene["lat"], scene["lon"]
@@ -118,33 +120,40 @@ class DatasetGenerator:
             print(f"\n[{idx}/{len(pending_scenes)}] processing {scene_id} | fire={is_fire}")
             t_start = time.perf_counter()
 
-            try:
-                sample = self.collector.collect_sample(
-                    lat=lat, lon=lon, target_date=target_date, is_fire=is_fire
-                )
+            for attempt in range(max_retries + 1):
+                try:
+                    sample = self.collector.collect_sample(
+                        lat=lat, lon=lon, target_date=target_date, is_fire=is_fire
+                    )
 
-                # Якщо супутник або інші дані не знайдено — пропускаємо сцену і не пишемо в H5
-                if sample is None:
-                    print(f"  [SKIP] Skipping {scene_id}: Missing Sentinel-2 optical pair.")
-                    self._update_status(scene_id, status="SKIPPED_NO_DATA", error_msg="missing S2 optical pair")
-                    continue
+                    # Якщо знімки хмарні або відсутні фізично в STAC — це не мережевий збій, дропаємо без retry
+                    if sample is None:
+                        print(f"  [SKIP] Skipping {scene_id}: Missing Sentinel-2 optical pair.")
+                        self._update_status(scene_id, status="SKIPPED_NO_DATA", error_msg="missing S2 optical pair")
+                        break
 
-                patches = list(self.extractor.extract_patches(sample, scene_id=scene_id))
+                    patches = list(self.extractor.extract_patches(sample, scene_id=scene_id))
 
-                if not patches:
-                    print(f"  [SKIP] Skipping {scene_id}: 0 valid patches.")
-                    self._update_status(scene_id, status="SKIPPED_EMPTY_PATCHES", patches_count=0, error_msg="0 valid patches")
-                    continue
+                    if not patches:
+                        print(f"  [SKIP] Skipping {scene_id}: 0 valid patches.")
+                        self._update_status(scene_id, status="SKIPPED_EMPTY_PATCHES", patches_count=0, error_msg="0 valid patches")
+                        break
 
-                written_count = self.writer.write_patches_batch(patches)
-                elapsed = time.perf_counter() - t_start
-                print(f"saved {written_count} patches in {elapsed:.2f}s")
+                    written_count = self.writer.write_patches_batch(patches)
+                    elapsed = time.perf_counter() - t_start
+                    print(f"saved {written_count} patches in {elapsed:.2f}s")
 
-                self._update_status(scene_id, status="COMPLETED", patches_count=written_count)
+                    self._update_status(scene_id, status="COMPLETED", patches_count=written_count)
+                    break  # Успішно завершено, виходимо з retry-циклу
 
-            except Exception as e:
-                print(f"error on {scene_id}: {str(e)}")
-                self._update_status(scene_id, status="FAILED", error_msg=str(e))
+                except Exception as e:
+                    if attempt < max_retries:
+                        print(f"  [RETRY] Connection error on {scene_id}: {e}. Retrying in 5s (attempt {attempt + 1}/{max_retries})...")
+                        time.sleep(5.0)
+                        continue
+                    else:
+                        print(f"error on {scene_id}: {str(e)}")
+                        self._update_status(scene_id, status="FAILED", error_msg=str(e))
 
     def _update_status(self, scene_id: str, status: str, patches_count: int = 0, error_msg: Optional[str] = None):
         with self._get_connection() as conn:
