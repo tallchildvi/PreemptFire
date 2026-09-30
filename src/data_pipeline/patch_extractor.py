@@ -38,91 +38,101 @@ class PatchExtractor:
         self.max_invalid_ratio = max_invalid_ratio
 
     def extract_patches(
-        self,
-        sample: Dict[str, Any],
-        scene_id: str,
-    ) -> Generator[Dict[str, Any], None, None]:
-        """yields valid individual patch dictionaries one by one without full-grid memory duplication."""
-        rasters_2d = sample["rasters_2d"]
-        loss_mask = sample["loss_mask"]
-        target = sample["target"]
-        context_1d = sample["context_1d"]
-        metadata = sample["metadata"]
+            self,
+            sample: Dict[str, Any],
+            scene_id: str,
+        ) -> Generator[Dict[str, Any], None, None]:
+            rasters_2d = sample["rasters_2d"]
+            loss_mask = sample["loss_mask"]
+            target = sample["target"]
+            context_1d = sample["context_1d"]
+            metadata = sample["metadata"]
 
-        h_full, w_full = loss_mask.shape
+            h_full, w_full = loss_mask.shape
 
-        # determine sar availability and build validity channel
-        has_sar = ("SAR_VV" in rasters_2d and "SAR_VH" in rasters_2d)
-        sar_valid_mask = np.full((h_full, w_full), 1.0 if has_sar else 0.0, dtype=np.float32)
-
-        # assemble 2d channels according to canonical schema with zero-imputation
-        canonical_rasters = []
-        validity_flags = []
-
-        for ch in self.CANONICAL_2D_CHANNELS:
-            if ch == "MASK_SAR_VALID":
-                canonical_rasters.append(sar_valid_mask)
-                validity_flags.append(1.0 if has_sar else 0.0)
-            elif ch in rasters_2d and rasters_2d[ch] is not None:
-                canonical_rasters.append(np.nan_to_num(rasters_2d[ch], nan=0.0).astype(np.float32))
-                validity_flags.append(1.0)
+            # 1. Чесна попіксельна маска валідності Sentinel-1
+            sar_vv = rasters_2d.get("SAR_VV")
+            if sar_vv is not None and isinstance(sar_vv, np.ndarray):
+                # Валідними є лише скінченні пікселі з реальним фізичним сигналом > 0
+                sar_valid_mask = (np.isfinite(sar_vv) & (sar_vv > 0.0)).astype(np.float32)
+                has_sar_scene = bool(sar_valid_mask.max() > 0.0)
             else:
-                # impute missing modality with zero baseline to maintain fixed tensor dimensions
-                canonical_rasters.append(np.zeros((h_full, w_full), dtype=np.float32))
-                validity_flags.append(0.0)
+                sar_valid_mask = np.zeros((h_full, w_full), dtype=np.float32)
+                has_sar_scene = False
 
-        stacked_2d = np.stack(canonical_rasters, axis=0).astype(np.float32)
-        channel_validity_vec = np.array(validity_flags, dtype=np.float32)
+            # 2. Збірка 2D-тензора за канонічною схемою
+            canonical_rasters = []
+            for ch in self.CANONICAL_2D_CHANNELS:
+                if ch == "MASK_SAR_VALID":
+                    canonical_rasters.append(sar_valid_mask)
+                elif ch in rasters_2d and rasters_2d[ch] is not None:
+                    canonical_rasters.append(np.nan_to_num(rasters_2d[ch], nan=0.0).astype(np.float32))
+                else:
+                    canonical_rasters.append(np.zeros((h_full, w_full), dtype=np.float32))
 
-        # sort 1d keys for deterministic feature vector creation
-        sorted_context_keys = sorted(context_1d.keys())
-        context_vec = np.array([float(context_1d[k]) for k in sorted_context_keys], dtype=np.float32)
+            stacked_2d = np.stack(canonical_rasters, axis=0).astype(np.float32)
 
-        patch_idx = 0
+            sorted_context_keys = sorted(context_1d.keys())
+            context_vec = np.array([float(context_1d[k]) for k in sorted_context_keys], dtype=np.float32)
 
-        for r in range(0, h_full - self.patch_size + 1, self.stride):
-            for c in range(0, w_full - self.patch_size + 1, self.stride):
-                row_slice = slice(r, r + self.patch_size)
-                col_slice = slice(c, c + self.patch_size)
+            patch_idx = 0
 
-                patch_loss_mask = loss_mask[row_slice, col_slice]
+            for r in range(0, h_full - self.patch_size + 1, self.stride):
+                for c in range(0, w_full - self.patch_size + 1, self.stride):
+                    row_slice = slice(r, r + self.patch_size)
+                    col_slice = slice(c, c + self.patch_size)
 
-                # filter out patches dominated by clouds, shadows, snow, or nodata
-                invalid_ratio = float((patch_loss_mask > 0.5).mean())
-                if invalid_ratio > self.max_invalid_ratio:
-                    continue
+                    patch_loss_mask = loss_mask[row_slice, col_slice]
 
-                patch_2d = stacked_2d[:, row_slice, col_slice]
-                patch_target = target[:, row_slice, col_slice]
+                    # Фільтр дефектів оптики (хмари, тіні, порожні краї)
+                    invalid_ratio = float((patch_loss_mask > 0.5).mean())
+                    if invalid_ratio > self.max_invalid_ratio:
+                        continue
 
-                # assemble comprehensive metadata
-                patch_meta = {
-                    "scene_id": str(scene_id),
-                    "patch_idx": int(patch_idx),
-                    "row_offset": int(r),
-                    "col_offset": int(c),
-                    "invalid_ratio": float(invalid_ratio),
-                    "has_sar": int(has_sar),
-                    "target_max_local": float(patch_target.max()),
-                    "lat": float(metadata["lat"]),
-                    "lon": float(metadata["lon"]),
-                    "target_date": str(metadata["target_date"]),
-                    "t0_date": str(metadata["t0_date"]),
-                    "tprev_date": str(metadata["tprev_date"]),
-                    "crs": str(metadata["crs"]),
-                    "is_fire": int(metadata["is_fire"]),
-                }
+                    patch_2d = stacked_2d[:, row_slice, col_slice]
+                    patch_target = target[:, row_slice, col_slice]
+                    patch_sar_mask = sar_valid_mask[row_slice, col_slice]
 
-                yield {
-                    "patch_id": f"{scene_id}_p{patch_idx:03d}",
-                    "X_2d": patch_2d,
-                    "X_1d": context_vec,
-                    "channel_validity": channel_validity_vec,
-                    "loss_mask": patch_loss_mask,
-                    "Y": patch_target,
-                    "metadata": patch_meta,
-                    "channel_names_2d": self.CANONICAL_2D_CHANNELS,
-                    "context_names_1d": sorted_context_keys,
-                }
+                    # 3. Чесний локальний вектор присутності для конкретного патча
+                    # Якщо хоча б 50% площі патча покрито радаром - вважаємо модальність доступною
+                    patch_has_sar = float(patch_sar_mask.mean() >= 0.50)
 
-                patch_idx += 1
+                    validity_flags = []
+                    for ch in self.CANONICAL_2D_CHANNELS:
+                        if ch in ("SAR_VV", "SAR_VH", "SAR_RATIO", "SAR_RVI", "MASK_SAR_VALID"):
+                            validity_flags.append(patch_has_sar)
+                        else:
+                            validity_flags.append(1.0)
+                    patch_channel_validity = np.array(validity_flags, dtype=np.float32)
+
+                    patch_meta = {
+                        "scene_id": str(scene_id),
+                        "patch_idx": int(patch_idx),
+                        "row_offset": int(r),
+                        "col_offset": int(c),
+                        "invalid_ratio": float(invalid_ratio),
+                        "sar_coverage_ratio": float(patch_sar_mask.mean()),
+                        "has_sar": int(patch_has_sar > 0.5),
+                        "target_max_local": float(patch_target.max()),
+                        "lat": float(metadata["lat"]),
+                        "lon": float(metadata["lon"]),
+                        "target_date": str(metadata["target_date"]),
+                        "t0_date": str(metadata["t0_date"]),
+                        "tprev_date": str(metadata["tprev_date"]),
+                        "crs": str(metadata["crs"]),
+                        "is_fire": int(metadata["is_fire"]),
+                    }
+
+                    yield {
+                        "patch_id": f"{scene_id}_p{patch_idx:03d}",
+                        "X_2d": patch_2d,
+                        "X_1d": context_vec,
+                        "channel_validity": patch_channel_validity,
+                        "loss_mask": patch_loss_mask,
+                        "Y": patch_target,
+                        "metadata": patch_meta,
+                        "channel_names_2d": self.CANONICAL_2D_CHANNELS,
+                        "context_names_1d": sorted_context_keys,
+                    }
+
+                    patch_idx += 1

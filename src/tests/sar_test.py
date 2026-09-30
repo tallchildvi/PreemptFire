@@ -2,7 +2,9 @@ from src.data_pipeline.sentinel_fetcher import SentinelFetcher
 
 fetcher = SentinelFetcher()
 res = fetcher.fetch_all_radar_optical(
-    lat=52.5708739, lon=-117.9518471, target_date="2021-08-15"
+    # lat=52.5708739, lon=-117.9518471, target_date="2021-08-15"
+    lat = 51.14272, lon = -119.42858, target_date="2025-05-01"
+
 )
 
 print("Optical bands:", list(res.get("bands_t0", {}).keys()))

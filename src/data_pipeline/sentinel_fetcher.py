@@ -210,7 +210,7 @@ class SentinelFetcher:
         return {}, {}, ""
 
     def fetch_sentinel1_sar(
-        self, grid_info: Dict, target_date_str: str, window_days: int = 12
+        self, grid_info: Dict, target_date_str: str, window_days: int = 20
     ) -> Dict[str, np.ndarray]:
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         start_dt = target_dt - timedelta(days=window_days)
