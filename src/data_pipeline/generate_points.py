@@ -1,7 +1,7 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date
 import os
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 import pandas as pd
 
 from src.config import RAW_DATA_DIR
@@ -10,8 +10,11 @@ from src.data_pipeline.fire_date import Date
 
 def process_single_date(
     target_date: date,
-    country_code: Optional[str] = "CAN",
+    country_code: str,
     bounds: Optional[Tuple[float, float, float, float]] = None,
+    direction_north: float = 0.0,
+    direction_east: float = 0.0,
+    intensity: float = 0.0,
 ) -> Optional[pd.DataFrame]:
     """process single date and return combined daily dataframe with optional bounds filter."""
     date_str = target_date.strftime("%Y-%m-%d")
@@ -43,14 +46,21 @@ def process_single_date(
             return None
 
         date_obj.generate_hard_negatives(buffer_days=15)
-        date_obj.generate_random_negatives(n_points=5, buffer_days=15)
+
+        date_obj.generate_random_negatives(
+            n_points=5, 
+            buffer_days=15,
+            direction_north=direction_north,
+            direction_east=direction_east,
+            intensity=intensity
+        )
 
         df_day = date_obj.get_combined_dataset()
         if not df_day.empty:
-            print(f"processed {date_str}: {len(df_day)} points")
+            print(f"processed {date_str} ({country_code}): {len(df_day)} points")
             return df_day
     except Exception as e:
-        print(f"error processing date {date_str}: {e}")
+        print(f"error processing date {date_str} ({country_code}): {e}")
     return None
 
 
@@ -59,29 +69,41 @@ def generate_master_dataset(
     end_year: int = 2024,
     months: list = [6, 7, 8, 9],
     days: list = [1, 15],
-    country_code: Optional[str] = "CAN",
+    country_codes: List[str] = ["CAN"],
     bounds: Optional[Tuple[float, float, float, float]] = None,
+    direction_north: float = 0.0,
+    direction_east: float = 0.0,
+    intensity: float = 0.0,
     output_filename: str = "master_points_dataset.csv",
     max_workers: int = 4,
 ) -> pd.DataFrame:
-    """batch dataset generator using parallel threads with country and bounding box support."""
-    target_dates = [
-        date(year, month, day)
+    """batch dataset generator using parallel threads with multi-country and bounding box support."""
+    target_tasks = [
+        (date(year, month, day), code)
         for year in range(start_year, end_year + 1)
         for month in months
         for day in days
+        for code in country_codes
     ]
 
     output_filepath = RAW_DATA_DIR / output_filename
 
-    target_desc = f"bounds {bounds}" if bounds else f"country {country_code}"
-    print(f"starting parallel generation for {target_desc} ({len(target_dates)} dates, {max_workers} workers)...")
+    target_desc = f"bounds {bounds}" if bounds else f"countries {country_codes}"
+    print(f"starting parallel generation for {target_desc} ({len(target_tasks)} tasks, {max_workers} workers)...")
 
     all_daily_datasets = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = [
-            executor.submit(process_single_date, d, country_code, bounds)
-            for d in target_dates
+            executor.submit(
+                process_single_date, 
+                d, 
+                code, 
+                bounds, 
+                direction_north, 
+                direction_east, 
+                intensity
+            )
+            for d, code in target_tasks
         ]
 
         for future in as_completed(futures):
@@ -96,7 +118,7 @@ def generate_master_dataset(
 
         print("-" * 40)
         print("dataset generation complete")
-        print(f"processed dates with data: {len(all_daily_datasets)}")
+        print(f"processed tasks with data: {len(all_daily_datasets)}")
         print(f"total rows: {len(master_df)}")
         print(f"saved to: {output_filepath}")
         print("-" * 40)
@@ -108,16 +130,19 @@ def generate_master_dataset(
 
 
 if __name__ == "__main__":
-    # British Columbia bounding box
-    bc_bounds = (49.0, -139.0, 60.0, -114.0)
+    # min_lat, min_lon, max_lat, max_lon
+    iberia_bounds = (35.9, -9.5, 43.9, 3.4)
 
     generate_master_dataset(
         start_year=2020,
         end_year=2025,
-        months=[4, 5, 6, 7, 8, 9, 10, 11], 
+        months=[2, 3, 4, 5, 6, 7, 8, 9, 10], 
         days=[1, 15],
-        country_code="CAN",
-        bounds=bc_bounds,
-        output_filename="master_points_dataset.csv",
-        max_workers=4,
+        country_codes=["ESP", "PRT"],        
+        bounds=iberia_bounds,
+        direction_north=1.0,                 
+        direction_east=0.3,                 
+        intensity=0.1,                       
+        output_filename="master_points_iberia.csv",
+        max_workers=6,                   
     )

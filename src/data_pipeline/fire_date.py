@@ -281,19 +281,38 @@ class Date:
         n_points: int = 5,
         safe_radius_km: float = 25.0,
         min_neg_dist_km: float = 15.0,
-        buffer_days: int = 15
+        buffer_days: int = 15,
+        direction_north: float = 0.0,
+        direction_east: float = 0.0,
+        intensity: float = 0.0
     ) -> pd.DataFrame:
-        """generate random background negatives across country landmass"""
+        """generate random background negatives across country landmass with adaptive directional bias"""
         df_window_fires = self._fetch_window_fires(buffer_days=buffer_days)
         random_negatives = []
 
         default_time = int(self.df_area_filtered['acq_time'].median()) if not self.df_area_filtered.empty else 1900
+        def biased_sample(min_val: float, max_val: float, weight: float, intens: float) -> float:
+            if intens <= 0.0 or weight == 0.0:
+                return np.random.uniform(min_val, max_val)
+            
+            u = np.random.uniform(0, 1)
+            power = 1.0 + (intens * abs(weight) * 49.0)
+            
+            if weight > 0:
+                u_biased = u ** (1.0 / power)
+            else:
+                u_biased = u ** power
+                
+            return min_val + u_biased * (max_val - min_val)
 
         attempts = 0
-        while len(random_negatives) < n_points and attempts < 150:
+        max_allowed_attempts = max(500, n_points * 100) # Збільшений ліміт для жорстких векторів
+
+        while len(random_negatives) < n_points and attempts < max_allowed_attempts:
             attempts += 1
-            rand_lat = np.random.uniform(*self.lat_range)
-            rand_lon = np.random.uniform(*self.lon_range)
+            
+            rand_lat = biased_sample(self.lat_range[0], self.lat_range[1], direction_north, intensity)
+            rand_lon = biased_sample(self.lon_range[0], self.lon_range[1], direction_east, intensity)
 
             if not self.is_within_country(rand_lat, rand_lon):
                 continue
@@ -399,7 +418,15 @@ if __name__ == "__main__":
     date_obj.generate_fires()
     date_obj.filter_fires(epsilon=0.012)
     date_obj.generate_hard_negatives(buffer_days=15)
-    date_obj.generate_random_negatives(n_points=5, buffer_days=15)
+    
+    # Тестуємо з адаптивним вектором: зміщуємо точки на Північ (1.0) та трохи на Схід (0.3)
+    date_obj.generate_random_negatives(
+        n_points=5, 
+        buffer_days=15, 
+        direction_north=1.0, 
+        direction_east=0.3, 
+        intensity=0.2
+    )
 
     df_day = date_obj.get_combined_dataset()
     print(df_day[['latitude', 'longitude', 'acq_date', 'acq_time', 'frp', 'is_fire']])
