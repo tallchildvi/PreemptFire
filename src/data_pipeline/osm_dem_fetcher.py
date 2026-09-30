@@ -50,6 +50,8 @@ class SpatialFeatureFetcher:
         timeout_sec: int = 25,
         max_retries: int = 4,
         retry_backoff: float = 2.0,
+        allowed_countries: Optional[List[str]] = None,
+        allowed_regions: Optional[List[str]] = None,
     ):
         self.osm_mode = osm_mode
         self.timeout_sec = timeout_sec
@@ -59,15 +61,13 @@ class SpatialFeatureFetcher:
         self.stac_client = self._init_stac_client()
 
         if self.osm_mode == "local_history":
-            # lazy import prevents crashes in environments lacking osmium binaries
             from src.data_pipeline.osm_extractor import HistoricalOSMExtractor
-            self.osm_extractor = HistoricalOSMExtractor()
+            # pass boundary constraints to the local extractor
+            self.osm_extractor = HistoricalOSMExtractor(
+                allowed_countries=allowed_countries,
+                allowed_regions=allowed_regions,
+            )
             self._query_osm_temporal = None
-        elif self.osm_mode == "overpass":
-            self.osm_extractor = None
-            self._query_osm_temporal = make_temporal_osm_query()
-        else:
-            raise ValueError(f"Unknown osm_mode '{osm_mode}'. Expected 'local_history' or 'overpass'.")
 
     def _init_stac_client(self) -> Optional[pystac_client.Client]:
         for attempt in range(self.max_retries):

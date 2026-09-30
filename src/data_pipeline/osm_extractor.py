@@ -8,12 +8,14 @@ import subprocess
 import sys
 import time
 from typing import Any, Dict, List, Optional, Set, Tuple
-
+from shapely.geometry import box, MultiPolygon, Polygon
+from shapely.ops import unary_union
 from dotenv import load_dotenv
 from filelock import FileLock
 import folium
 import geopandas as gpd
 import pandas as pd
+import numpy as np
 from pyrosm import OSM
 import requests
 import tempfile
@@ -68,15 +70,24 @@ def load_geofabrik_index(cache_dir: Path) -> gpd.GeoDataFrame:
 
 def resolve_finest_covering_regions(
     index_gdf: gpd.GeoDataFrame,
-    bbox: Tuple[float, float, float, float],
+    bbox: Optional[Tuple[float, float, float, float]] = None,
+    polygon_mask: Optional[Polygon | MultiPolygon] = None,
+    allowed_countries: Optional[List[str]] = None,
+    allowed_regions: Optional[List[str]] = None,
+    exclude_regions: Optional[List[str]] = None,
+    clip_to_allowed_countries: bool = False,
 ) -> List[Tuple[str, str]]:
-    """
-    Resolves the deepest standard historical regions intersecting the target BBox.
-    Special overlapping extracts are used only when no standard region is available.
-    """
-    query_box = box(*bbox)
+    """resolves covering regions using adaptive polygons, boundary whitelists and blacklists."""
+    
+    # 1. build query spatial geometry (adaptive polygon or fallback to rectangular box)
+    if polygon_mask is not None:
+        query_geometry = polygon_mask
+    elif bbox is not None:
+        query_geometry = box(*bbox)
+    else:
+        raise ValueError("either bbox or polygon_mask must be provided.")
 
-    # 1. Build node lookup table for valid geometries
+    # 2. build lookup table
     node_map: Dict[str, pd.Series] = {}
     for _, row in index_gdf.iterrows():
         node_id = row.get("id")
@@ -86,33 +97,112 @@ def resolve_finest_covering_regions(
 
     all_ids = set(node_map.keys())
 
-    # 2. Resolve hierarchical parents with path-based hierarchy support (e.g. us/idaho)
+    # 3. resolve hierarchical parents
     logical_parent: Dict[str, Optional[str]] = {}
     for node_id, row in node_map.items():
         parent_raw = row.get("parent")
         parent_id = str(parent_raw) if pd.notna(parent_raw) and str(parent_raw).strip() else None
-
         if "/" in node_id:
             path_parent = node_id.rsplit("/", 1)[0]
             if path_parent in node_map:
                 logical_parent[node_id] = path_parent
                 continue
-
         logical_parent[node_id] = parent_id
 
-    # 3. Build parent-to-children mapping
     children_map: Dict[str, List[str]] = {}
     for node_id, parent_id in logical_parent.items():
         if parent_id is not None and parent_id in all_ids:
             children_map.setdefault(parent_id, []).append(node_id)
 
-    # 4. Memoized tree-wide history availability check
+    # 4. optional boundary clipping: intersect query geometry with real shapes of allowed countries
+    if clip_to_allowed_countries and allowed_countries:
+        c_upper = {c.upper().strip() for c in allowed_countries}
+        c_clean = {c.lower().strip() for c in allowed_countries}
+        matching_geoms = []
+        for n_id, row in node_map.items():
+            iso_raw = row.get("iso3166-1:alpha2")
+            iso_list = [str(x).upper() for x in (iso_raw if isinstance(iso_raw, (list, tuple, np.ndarray, set)) else [iso_raw])] if iso_raw is not None else []
+            if any(c in iso_list for c in c_upper) or n_id.lower() in c_clean:
+                matching_geoms.append(row.geometry)
+        if matching_geoms:
+            target_country_union = unary_union(matching_geoms)
+            query_geometry = query_geometry.intersection(target_country_union)
+
+    # prepare blacklist lookup
+    exclude_clean = {e.lower().strip() for e in (exclude_regions or [])}
+
+    def has_valid_tag(val: Any) -> bool:
+        if val is None:
+            return False
+        if isinstance(val, (list, tuple, np.ndarray, set)):
+            return len(val) > 0
+        try:
+            return bool(pd.notna(val) and str(val).strip())
+        except (ValueError, TypeError):
+            return False
+
+    def is_jurisdiction_allowed(node_id: str) -> bool:
+        # check blacklist first
+        node_slug = node_id.lower().split("/")[-1]
+        if node_id.lower() in exclude_clean or node_slug in exclude_clean:
+            return False
+
+        if not allowed_countries and not allowed_regions:
+            return True
+
+        row = node_map.get(node_id)
+        if row is None:
+            return False
+
+        if allowed_regions:
+            allowed_reg_clean = {r.lower().strip() for r in allowed_regions}
+            if node_id.lower() in allowed_reg_clean or node_slug in allowed_reg_clean:
+                return True
+
+        if allowed_countries:
+            allowed_c_upper = {c.upper().strip() for c in allowed_countries}
+            allowed_c_clean = {c.lower().strip() for c in allowed_countries}
+
+            curr: Optional[str] = node_id
+            while curr is not None:
+                curr_row = node_map.get(curr)
+                if curr_row is not None:
+                    iso_raw = curr_row.get("iso3166-1:alpha2")
+                    if isinstance(iso_raw, (list, tuple, np.ndarray, set)):
+                        if any(str(x).upper() in allowed_c_upper for x in iso_raw):
+                            return True
+                    elif has_valid_tag(iso_raw) and str(iso_raw).upper() in allowed_c_upper:
+                        return True
+
+                    iso2_raw = curr_row.get("iso3166-2")
+                    if isinstance(iso2_raw, (list, tuple, np.ndarray, set)):
+                        if any(str(x).split("-")[0].upper() in allowed_c_upper for x in iso2_raw if "-" in str(x)):
+                            return True
+                    elif has_valid_tag(iso2_raw) and "-" in str(iso2_raw):
+                        if str(iso2_raw).split("-")[0].upper() in allowed_c_upper:
+                            return True
+
+                    if any(part in allowed_c_clean for part in curr.lower().split("/")):
+                        return True
+                curr = logical_parent.get(curr)
+
+        return False
+
+    def intersects_query(node_id: str) -> bool:
+        row = node_map.get(node_id)
+        if row is None or row.geometry is None or row.geometry.is_empty:
+            return False
+        try:
+            # check intersection with meaningful spatial overlap
+            return bool(row.geometry.intersects(query_geometry))
+        except Exception:
+            return False
+
     history_cache: Dict[str, bool] = {}
 
     def has_history(node_id: str, visited: Optional[Set[str]] = None) -> bool:
         if node_id in history_cache:
             return history_cache[node_id]
-
         if visited is None:
             visited = set()
         if node_id in visited:
@@ -124,8 +214,8 @@ def resolve_finest_covering_regions(
             history_cache[node_id] = False
             return False
 
-        history_url = row.get("history_url")
-        if pd.notna(history_url) and str(history_url).strip():
+        h_url = row.get("history_url")
+        if pd.notna(h_url) and str(h_url).strip():
             history_cache[node_id] = True
             return True
 
@@ -137,143 +227,84 @@ def resolve_finest_covering_regions(
         history_cache[node_id] = False
         return False
 
-    def intersects_query(node_id: str) -> bool:
-        row = node_map.get(node_id)
-        if row is None:
-            return False
-
-        geom = row.get("geometry")
-        if geom is None or geom.is_empty:
-            return False
-
-        try:
-            return bool(geom.intersects(query_box))
-        except Exception:
-            return False
-
     continents = {
-        "north-america",
-        "south-america",
-        "europe",
-        "asia",
-        "africa",
-        "oceania",
-        "australia-oceania",
+        "north-america", "south-america", "europe", "asia", "africa", "oceania", "australia-oceania",
     }
 
     def is_special_region(node_id: str) -> bool:
         if node_id in continents:
             return False
-
         row = node_map.get(node_id)
         if row is None:
             return False
-
         parent_id = logical_parent.get(node_id)
-        if parent_id not in continents:
+        if parent_id not in continents or "/" in node_id:
             return False
-
-        if "/" in node_id:
+        if has_valid_tag(row.get("iso3166-1:alpha2")) or has_valid_tag(row.get("iso3166-2")):
             return False
+        return not bool(children_map.get(node_id))
 
-        if pd.notna(row.get("iso3166-1:alpha2")) or pd.notna(row.get("iso3166-2")):
-            return False
-
-        if bool(children_map.get(node_id)):
-            return False
-
-        return True
-
-    # 5. Recursive descent to collect finest valid leaves
     def collect_deepest(node_id: str, visited: Optional[Set[str]] = None) -> List[str]:
         if visited is None:
             visited = set()
         if node_id in visited:
             return []
-
         visited = visited.copy()
         visited.add(node_id)
 
-        if not intersects_query(node_id):
+        if not intersects_query(node_id) or not is_jurisdiction_allowed(node_id):
             return []
 
         row = node_map.get(node_id)
         if row is None:
             return []
 
-        # Filter valid intersecting non-special children
-        valid_children: List[str] = [
-            child_id
-            for child_id in children_map.get(node_id, [])
-            if child_id != node_id
-            and not is_special_region(child_id)
-            and intersects_query(child_id)
-            and has_history(child_id)
+        valid_children = [
+            cid for cid in children_map.get(node_id, [])
+            if cid != node_id
+            and not is_special_region(cid)
+            and intersects_query(cid)
+            and is_jurisdiction_allowed(cid)
+            and has_history(cid)
         ]
 
         if valid_children:
-            result: List[str] = []
-            for child_id in valid_children:
-                result.extend(collect_deepest(child_id, visited))
-            if result:
-                return result
-
-        history_url = row.get("history_url")
-        if pd.notna(history_url) and str(history_url).strip():
-            return [node_id]
-
-        return []
-
-    # 6. Traverse standard hierarchy from root nodes
-    root_nodes: List[str] = [
-        node_id
-        for node_id, row in node_map.items()
-        if (logical_parent.get(node_id) is None or logical_parent.get(node_id) not in all_ids)
-        and not is_special_region(node_id)
-        and intersects_query(node_id)
-        and has_history(node_id)
-    ]
-
-    standard_regions: List[str] = []
-    for root_id in root_nodes:
-        standard_regions.extend(collect_deepest(root_id))
-
-    # Deduplicate standard regions while preserving order
-    unique_standard_ids: List[str] = []
-    seen_standard: Set[str] = set()
-    for reg_id in standard_regions:
-        if reg_id not in seen_standard:
-            seen_standard.add(reg_id)
-            unique_standard_ids.append(reg_id)
-
-    if unique_standard_ids:
-        standard_output: List[Tuple[str, str]] = []
-        for reg_id in unique_standard_ids:
-            row = node_map.get(reg_id)
-            if row is not None:
-                h_url = row.get("history_url")
-                if pd.notna(h_url) and str(h_url).strip():
-                    standard_output.append((reg_id, str(h_url)))
-        if standard_output:
-            return standard_output
-
-    # 7. Fallback: Special overlapping extracts (only if no standard region matched)
-    special_output: List[Tuple[str, str]] = []
-    seen_special: Set[str] = set()
-
-    for node_id, row in node_map.items():
-        if not is_special_region(node_id) or not intersects_query(node_id):
-            continue
+            res = []
+            for cid in valid_children:
+                res.extend(collect_deepest(cid, visited))
+            if res:
+                return res
 
         h_url = row.get("history_url")
-        if pd.notna(h_url) and str(h_url).strip() and node_id not in seen_special:
-            seen_special.add(node_id)
-            special_output.append((node_id, str(h_url)))
+        if pd.notna(h_url) and str(h_url).strip():
+            return [node_id]
+        return []
 
-    if special_output:
-        return special_output
+    # root traversal
+    root_nodes = [
+        nid for nid, row in node_map.items()
+        if (logical_parent.get(nid) is None or logical_parent.get(nid) not in all_ids)
+        and not is_special_region(nid)
+        and intersects_query(nid)
+        and is_jurisdiction_allowed(nid)
+        and has_history(nid)
+    ]
 
-    raise ValueError(f"No historical OSM regions cover bounding box {bbox}")
+    resolved_ids: List[str] = []
+    seen: Set[str] = set()
+    for root_id in root_nodes:
+        for reg_id in collect_deepest(root_id):
+            if reg_id not in seen:
+                seen.add(reg_id)
+                resolved_ids.append(reg_id)
+
+    output: List[Tuple[str, str]] = []
+    for reg_id in resolved_ids:
+        row = node_map.get(reg_id)
+        if row is not None and pd.notna(row.get("history_url")):
+            output.append((reg_id, str(row["history_url"])))
+
+    return output
 
 def plot_bbox_coverage(
     index_gdf: gpd.GeoDataFrame,
@@ -497,16 +528,31 @@ def extract_scene_bbox_pbf(
 
 
 class HistoricalOSMExtractor:
-    def __init__(self, cache_dir: Optional[Path] = None):
+    def __init__(
+        self,
+        cache_dir: Optional[Path] = None,
+        allowed_countries: Optional[List[str]] = None,
+        allowed_regions: Optional[List[str]] = None,
+        exclude_regions: Optional[List[str]] = None,
+    ):
         self.cache_dir = cache_dir or DEFAULT_CACHE_DIR
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.index_gdf = load_geofabrik_index(self.cache_dir)
+        self.allowed_countries = allowed_countries
+        self.allowed_regions = allowed_regions
+        self.exclude_regions = exclude_regions
 
     def resolve_history_files(
         self, west: float, south: float, east: float, north: float
     ) -> List[Dict[str, Any]]:
-        """Resolves finest covering regions for a BBox and checks local existence."""
-        regions = resolve_finest_covering_regions(self.index_gdf, (west, south, east, north))
+        """Resolves finest covering regions for a BBox taking filters into account."""
+        regions = resolve_finest_covering_regions(
+            self.index_gdf,
+            bbox=(west, south, east, north),
+            allowed_countries=self.allowed_countries,
+            allowed_regions=self.allowed_regions,
+            exclude_regions=self.exclude_regions,
+        )
         output = []
 
         for region_id, history_url in regions:
@@ -521,9 +567,8 @@ class HistoricalOSMExtractor:
             })
 
         return output
-
     def download_required_dumps(self, resolved_files: List[Dict[str, Any]]) -> List[Path]:
-        """Downloads all missing regional .osh.pbf files."""
+        """downloads all missing regional .osh.pbf files."""
         return [
             ensure_history_dump(entry["region_id"], entry["history_url"], self.cache_dir)
             for entry in resolved_files
@@ -543,7 +588,6 @@ class HistoricalOSMExtractor:
             if isinstance(date, datetime)
             else date.split(" ")[0]
         )
-        bbox = (west, south, east, north)
         resolved_files = self.resolve_history_files(west, south, east, north)
         gathered_gdfs: List[gpd.GeoDataFrame] = []
 
@@ -605,23 +649,106 @@ class HistoricalOSMExtractor:
             else combined
         )
 
-
 if __name__ == "__main__":
-    extractor = HistoricalOSMExtractor()
+    import argparse
 
-    west, south, east, north = (-139.3, 48.2, -113.0, 60.2,)
-    test_bbox = (west, south, east, north)
+    parser = argparse.ArgumentParser(
+        description="resolve historical osm regions and visualize coverage for a target bbox"
+    )
+    # spatial bounding box parameters
+    parser.add_argument("--west", type=float, default=-139.3, help="western longitude boundary")
+    parser.add_argument("--south", type=float, default=48.2, help="southern latitude boundary")
+    parser.add_argument("--east", type=float, default=-113.0, help="eastern longitude boundary")
+    parser.add_argument("--north", type=float, default=60.2, help="northern latitude boundary")
 
-    print(f"Resolving regions for: {test_bbox}")
-    resolved = resolve_finest_covering_regions(extractor.index_gdf, test_bbox)
+    # optional jurisdiction whitelist filters
+    parser.add_argument(
+        "--countries",
+        nargs="+",
+        default=None,
+        help="list of allowed country names or iso codes (e.g. --countries canada us or --countries CA US)",
+    )
+    parser.add_argument(
+        "--regions",
+        nargs="+",
+        default=None,
+        help="list of specific allowed regional ids (e.g. --regions british-columbia alberta)",
+    )
+    parser.add_argument(
+        "--output-map",
+        type=str,
+        default="data/osm_raw/coverage_map.html",
+        help="file path for interactive folium html map output",
+    )
+    parser.add_argument(
+        "--exclude",
+        nargs="+",
+        default=None,
+        help="list of region ids or slugs to exclude (e.g. --exclude islas-baleares ceuta andorra)",
+    )
+    parser.add_argument(
+        "--clip-to-countries",
+        action="store_true",
+        help="clip bounding box to exact country boundary geometries from index",
+    )
+    parser.add_argument(
+        "--polygon-file",
+        type=str,
+        default=None,
+        help="optional geojson/gpkg vector file representing exact adaptive boundaries",
+    )
+    parser.add_argument(
+        "--download",
+        action="store_true",
+        help="automatically download all resolved .osh.pbf files into cache_dir",
+    )
 
-    print(f"\nResolved {len(resolved)} regions:")
+    args = parser.parse_args()
+
+    args = parser.parse_args()
+
+    # initialize extractor with requested jurisdiction constraints
+    extractor = HistoricalOSMExtractor(
+        allowed_countries=args.countries,
+        allowed_regions=args.regions,
+        exclude_regions=args.exclude,
+    )
+
+    test_bbox = (args.west, args.south, args.east, args.north)
+
+    print(
+        f"resolving regions for bbox: {test_bbox} | "
+        f"countries: {args.countries} | "
+        f"regions: {args.regions} | "
+        f"exclude: {args.exclude}"
+    )
+
+    resolved = resolve_finest_covering_regions(
+        extractor.index_gdf,
+        bbox=test_bbox,
+        allowed_countries=args.countries,
+        allowed_regions=args.regions,
+        exclude_regions=args.exclude,
+        clip_to_allowed_countries=args.clip_to_countries,
+    )
+
+    print(f"\nresolved {len(resolved)} covering regions:")
     for reg_id, url in resolved:
         print(f"  - {reg_id}")
 
+    # generate interactive visual verification map
     map_file = plot_bbox_coverage(
         index_gdf=extractor.index_gdf,
         bbox=test_bbox,
         resolved_regions=resolved,
-        output_html="data/osm_raw/coverage_map.html",
+        output_html=args.output_map,
     )
+    # automatically download missing historical dumps if requested
+    if args.download:
+        payload = [
+            {"region_id": r_id, "history_url": r_url}
+            for r_id, r_url in resolved
+        ]
+        print(f"\nstarting download of {len(payload)} historical dumps into '{extractor.cache_dir}'...")
+        downloaded = extractor.download_required_dumps(payload)
+        print(f"\nall {len(downloaded)} files are ready for extraction.")

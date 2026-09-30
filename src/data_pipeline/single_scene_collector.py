@@ -225,9 +225,12 @@ if __name__ == "__main__":
     extractor = PatchExtractor(patch_size=256, stride=256, max_invalid_ratio=0.20)
 
     # test wildfire scene with both optical and sar coverage (jasper, alberta)
-    test_lat = 52.5708739
-    test_lon = -117.9518471
-    test_date = "2021-08-15"
+    # test_lat = 52.5708739
+    # test_lon = -117.9518471
+    # test_date = "2021-08-15"
+    test_lat = 51.14272
+    test_lon = -119.42858
+    test_date = "2025-05-01"
 
     print(f"=== fetching scene [{test_lat}, {test_lon}] on {test_date} ===")
     sample = collector.collect_sample(
