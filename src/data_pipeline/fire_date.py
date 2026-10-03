@@ -1,22 +1,51 @@
-from src.config import BASE_DIR
+from datetime import date, datetime, timedelta
+import os
+from pathlib import Path
+from typing import Optional
+import warnings
+import requests
+
+from dotenv import dotenv_values, load_dotenv
+import geopandas as gpd
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from datetime import datetime, date, timedelta
-from dotenv import load_dotenv, dotenv_values
-from sklearn.cluster import DBSCAN, KMeans
-import geopandas as gpd
-from shapely.geometry import Point
-import matplotlib.pyplot as plt
+from scipy.spatial import cKDTree
 import seaborn as sns
+from shapely.geometry import Point
+from sklearn.cluster import DBSCAN, KMeans
+
+from src.config import BASE_DIR
 
 load_dotenv(BASE_DIR / ".env")
 
+DEFAULT_INDUSTRIAL_HOTSPOTS_PATH = BASE_DIR / "data" / "raw" / "industrial_hotspots.csv"
+DEFAULT_GLOBFIRE_PATH = BASE_DIR / "data" / "raw" / "globfire"
+BOUNDARIES_CACHE_DIR = BASE_DIR / "data" / "raw" / "boundaries"
+
 
 class Date:
-    def __init__(self, fire_date: date, country_code: str = "CAN"):
+    def __init__(
+        self,
+        fire_date: date,
+        country_code: str = "CAN",
+        industrial_blacklist_path: Optional[Path | str] = None,
+        globfire_path: Optional[Path | str] = None,
+    ):
         self.fire_date_obj = fire_date
         self.fire_date = fire_date.strftime("%Y-%m-%d")
         self.country_code = country_code.upper()
+
+        self.industrial_blacklist_path = (
+            Path(industrial_blacklist_path)
+            if industrial_blacklist_path is not None
+            else DEFAULT_INDUSTRIAL_HOTSPOTS_PATH
+        )
+        self.globfire_path = (
+            Path(globfire_path)
+            if globfire_path is not None
+            else DEFAULT_GLOBFIRE_PATH
+        )
 
         self.df_area = pd.DataFrame()
         self.df_area_filtered = pd.DataFrame()
@@ -31,17 +60,26 @@ class Date:
         self._load_country_bounds()
 
     def _get_api_keys(self):
-        """yield available firms api keys from env"""
-        config = dotenv_values()
+        """yield available firms api keys from env safely"""
+        config = dotenv_values(BASE_DIR / ".env")
         for env_name, env_value in config.items():
             if env_name.startswith("FIRMS_API_KEY") and env_value:
                 yield env_value
 
     def _load_country_bounds(self):
-        """load country geometry and calculate bounding box"""
+        """load country geometry, cache locally to avoid rate limits, and calculate bounding box"""
+        BOUNDARIES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        local_path = BOUNDARIES_CACHE_DIR / f"{self.country_code}.geo.json"
+
         try:
-            url = f"https://raw.githubusercontent.com/johan/world.geo.json/master/countries/{self.country_code}.geo.json"
-            gdf = gpd.read_file(url)
+            if not local_path.exists():
+                url = f"https://raw.githubusercontent.com/johan/world.geo.json/master/countries/{self.country_code}.geo.json"
+                response = requests.get(url, timeout=15)
+                response.raise_for_status()
+                with open(local_path, "w", encoding="utf-8") as f:
+                    f.write(response.text)
+
+            gdf = gpd.read_file(local_path)
             minx, miny, maxx, maxy = gdf.total_bounds
 
             self.geometry = gdf.unary_union
@@ -49,18 +87,18 @@ class Date:
             self.lat_range = (miny, maxy)
             self.lon_range = (minx, maxx)
         except Exception as e:
-            print(f"error loading geojson for {self.country_code}: {e}")
+            warnings.warn(f"Error loading geojson for {self.country_code}: {e}. Falling back to global bbox.")
 
-    def is_within_country(self, lat: float, lon: float) -> bool:
-        """check if coordinates fall inside country boundary"""
-        if self.geometry is None:
-            return True
-        return self.geometry.contains(Point(lon, lat))
+    def _get_xyz(self, lat_series, lon_series) -> np.ndarray:
+        """convert lat/lon to 3d spherical coordinates for exact cKDTree distance"""
+        lat_rad, lon_rad = np.radians(lat_series), np.radians(lon_series)
+        return np.column_stack([
+            np.cos(lat_rad) * np.cos(lon_rad),
+            np.cos(lat_rad) * np.sin(lon_rad),
+            np.sin(lat_rad),
+        ])
 
     def generate_fires(self):
-        """fetch active fires from firms api using available keys"""
-        load_dotenv(BASE_DIR / ".env")
-
         for key in self._get_api_keys():
             url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/VIIRS_SNPP_SP/{self.bbox_str}/1/{self.fire_date}"
             try:
@@ -70,11 +108,9 @@ class Date:
                     return
             except Exception:
                 continue
-
         print(f"failed to query firms api for {self.fire_date}")
 
     def _fetch_window_fires(self, buffer_days: int = 15) -> pd.DataFrame:
-        """fetch and cache validation window fires in 5-day chunks"""
         if not self.df_window_fires.empty:
             return self.df_window_fires
 
@@ -103,18 +139,121 @@ class Date:
         self.df_window_fires = pd.concat(dfs, ignore_index=True) if dfs else pd.DataFrame()
         return self.df_window_fires
 
-    @staticmethod
-    def _haversine_distance_km(lat1, lon1, lat2_array, lon2_array):
-        """calculate geodetic distance in kilometers"""
-        R = 6371.0
-        lat1_rad, lon1_rad = np.radians(lat1), np.radians(lon1)
-        lat2_rad, lon2_rad = np.radians(lat2_array), np.radians(lon2_array)
+    def _filter_industrial_hotspots(self, industrial_radius_km: float = 2.0) -> None:
+        if self.df_area.empty:
+            return
 
-        dlat = lat2_rad - lat1_rad
-        dlon = lon2_rad - lon1_rad
+        path = self.industrial_blacklist_path
+        if path is None or not Path(path).exists():
+            warnings.warn(f"Industrial blacklist not found at {path}. Skipping filtering.")
+            return
 
-        a = np.sin(dlat / 2.0)**2 + np.cos(lat1_rad) * np.cos(lat2_rad) * np.sin(dlon / 2.0)**2
-        return 2 * R * np.arcsin(np.sqrt(a))
+        try:
+            path = Path(path)
+            if path.suffix.lower() == ".csv":
+                ind_df = pd.read_csv(path)
+            elif path.suffix.lower() in [".gpkg", ".shp", ".geojson"]:
+                ind_gdf = gpd.read_file(path)
+                ind_df = pd.DataFrame({"latitude": ind_gdf.geometry.y, "longitude": ind_gdf.geometry.x})
+            else:
+                return
+
+            lat_col = "latitude" if "latitude" in ind_df.columns else "lat"
+            lon_col = "longitude" if "longitude" in ind_df.columns else "lon"
+            ind_df = ind_df.dropna(subset=[lat_col, lon_col])
+            
+            if ind_df.empty: return
+
+            ind_xyz = self._get_xyz(ind_df[lat_col].values, ind_df[lon_col].values)
+            tree = cKDTree(ind_xyz)
+            pts_xyz = self._get_xyz(self.df_area['latitude'].values, self.df_area['longitude'].values)
+
+            chord_dist = 2.0 * np.sin(industrial_radius_km / (2.0 * 6371.0))
+            matches = tree.query_ball_point(pts_xyz, r=chord_dist)
+            clean_mask = [len(m) == 0 for m in matches]
+
+            dropped_count = len(self.df_area) - sum(clean_mask)
+            if dropped_count > 0:
+                print(f"  [Verification] Dropped {dropped_count} points near industrial heat sources (< {industrial_radius_km} km)")
+
+            self.df_area = self.df_area[clean_mask].reset_index(drop=True)
+        except Exception as e:
+            warnings.warn(f"Error filtering industrial hotspots: {e}")
+
+    def _verify_globfire_burned_areas(self, buffer_meters: float = 500.0, tolerance_days: int = 3) -> None:
+        if self.df_area.empty:
+            return
+
+        path = self.globfire_path
+        if path is None or not Path(path).exists():
+            warnings.warn(f"GlobFire file missing at {path}. Skipping verification.")
+            return
+
+        path = Path(path)
+        if path.is_dir():
+            candidates = list(path.glob("*.gpkg")) + list(path.glob("*.shp")) + list(path.glob("*.geojson"))
+            if not candidates:
+                warnings.warn(f"No GlobFire vector files found in {path}. Skipping verification.")
+                return
+            path = candidates[0]
+
+        try:
+            min_lat, max_lat = self.df_area['latitude'].min() - 0.1, self.df_area['latitude'].max() + 0.1
+            min_lon, max_lon = self.df_area['longitude'].min() - 0.1, self.df_area['longitude'].max() + 0.1
+
+            try:
+                gdf_globfire = gpd.read_file(path, bbox=(min_lon, min_lat, max_lon, max_lat))
+            except Exception:
+                gdf_globfire = gpd.read_file(path)
+
+            if gdf_globfire.empty:
+                warnings.warn(f"No GlobFire data in this bbox. Dropping all {len(self.df_area)} points.")
+                self.df_area = self.df_area.iloc[0:0]
+                return
+
+            gdf_globfire = gdf_globfire.to_crs("EPSG:4326")
+            
+            cols_lower = {c.lower(): c for c in gdf_globfire.columns}
+            init_col = next((cols_lower[k] for k in cols_lower if 'init' in k or 'start' in k), None)
+            end_col = next((cols_lower[k] for k in cols_lower if 'fin' in k or 'end' in k or 'last' in k), None)
+
+            if init_col and end_col:
+                target_dt = pd.to_datetime(self.fire_date)
+                init_dates = pd.to_datetime(gdf_globfire[init_col], errors='coerce')
+                end_dates = pd.to_datetime(gdf_globfire[end_col], errors='coerce')
+
+                t_min = target_dt - pd.Timedelta(days=tolerance_days)
+                t_max = target_dt + pd.Timedelta(days=tolerance_days)
+                time_mask = (init_dates <= t_max) & (end_dates >= t_min)
+                gdf_globfire = gdf_globfire[time_mask]
+
+                if gdf_globfire.empty:
+                    print(f"  [Verification] GlobFire has no matching events for {self.fire_date}. Dropping all points.")
+                    self.df_area = self.df_area.iloc[0:0]
+                    return
+
+            gdf_points = gpd.GeoDataFrame(
+                self.df_area.copy(),
+                geometry=gpd.points_from_xy(self.df_area['longitude'], self.df_area['latitude']),
+                crs="EPSG:4326",
+            )
+
+            # Accurate dynamic UTM projection for correct buffering
+            utm_crs = gdf_points.estimate_utm_crs()
+            gdf_points_buffered = gdf_points.to_crs(utm_crs)
+            gdf_points_buffered['geometry'] = gdf_points_buffered.geometry.buffer(buffer_meters)
+            gdf_points_buffered = gdf_points_buffered.to_crs("EPSG:4326")
+
+            joined = gpd.sjoin(gdf_points_buffered, gdf_globfire, how="inner", predicate="intersects")
+            valid_indices = joined.index.unique()
+
+            dropped_count = len(self.df_area) - len(valid_indices)
+            if dropped_count > 0:
+                print(f"  [Verification] Retained {len(valid_indices)} GlobFire-verified fires (dropped {dropped_count} unverified)")
+
+            self.df_area = self.df_area.loc[self.df_area.index.isin(valid_indices)].reset_index(drop=True)
+        except Exception as e:
+            warnings.warn(f"Error verifying against GlobFire: {e}")
 
     def _sample_spatially_diverse(self, bin_df: pd.DataFrame, n_needed: int = 5) -> pd.DataFrame:
         """sample representative points across 2d spatial clusters using kmeans"""
@@ -122,29 +261,43 @@ class Date:
             return bin_df
 
         coords = bin_df[['latitude', 'longitude']].values
-        n_clusters = min(n_needed, len(bin_df))
-
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+        kmeans = KMeans(n_clusters=min(n_needed, len(bin_df)), random_state=42, n_init=10)
         bin_df = bin_df.copy()
         bin_df['spatial_cluster'] = kmeans.fit_predict(coords)
 
         idx = bin_df.groupby('spatial_cluster')['frp'].idxmax()
         return bin_df.loc[idx].drop(columns=['spatial_cluster'])
 
-    def filter_fires(self, epsilon: float = 0.012, lookback_days: int = 15, ignition_radius_km: float = 20.0):
-        """filter fires within country, cluster with dbscan, and retain only fresh ignition points"""
-        if self.df_area.empty:
-            return
+    def filter_fires(
+        self,
+        epsilon: float = 0.012, # intended to remain radians 
+        lookback_days: int = 15,
+        ignition_radius_km: float = 20.0,
+        industrial_radius_km: float = 2.0,
+        globfire_buffer_m: float = 500.0,
+        globfire_tolerance_days: int = 3,
+        verify_industrial: bool = True,
+        verify_globfire: bool = True,
+    ):
+        if self.df_area.empty: return
 
-        # 1. Filter points inside country landmass
-        self.df_area = self.df_area[
-            self.df_area.apply(lambda r: self.is_within_country(r['latitude'], r['longitude']), axis=1)
-        ].reset_index(drop=True)
+        # 1. Vectorized Point-in-Country check
+        pts = gpd.points_from_xy(self.df_area['longitude'], self.df_area['latitude'])
+        mask = pts.within(self.geometry)
+        self.df_area = self.df_area[mask].reset_index(drop=True)
 
-        if self.df_area.empty:
-            return
+        if self.df_area.empty: return
 
-        # 2. DBSCAN clustering and noise handling
+        if verify_industrial:
+            self._filter_industrial_hotspots(industrial_radius_km=industrial_radius_km)
+
+        if self.df_area.empty: return
+
+        if verify_globfire:
+            self._verify_globfire_burned_areas(buffer_meters=globfire_buffer_m, tolerance_days=globfire_tolerance_days)
+
+        if self.df_area.empty: return
+
         X = np.radians(self.df_area[['latitude', 'longitude']].values)
         dbscan = DBSCAN(eps=epsilon, metric='haversine')
         self.df_area['cluster_id'] = dbscan.fit_predict(X)
@@ -156,46 +309,32 @@ class Date:
         idx = self.df_area.groupby('cluster_id')['bright_ti4'].idxmax()
         self.df_area_filtered = self.df_area.loc[idx].copy()
 
-        # 3. Lookback Filter: Keep only fresh ignition points (no fires in past 15 days)
+        # 5. Vectorized Lookback Filter using cKDTree
         df_window_fires = self._fetch_window_fires(buffer_days=lookback_days)
         if not df_window_fires.empty:
-            past_fires = df_window_fires[
-                pd.to_datetime(df_window_fires['acq_date']) < pd.to_datetime(self.fire_date)
-            ]
-
+            past_fires = df_window_fires[pd.to_datetime(df_window_fires['acq_date']) < pd.to_datetime(self.fire_date)]
             if not past_fires.empty:
-                fresh_ignition_indices = []
-                for row_idx, pos_row in self.df_area_filtered.iterrows():
-                    distances = self._haversine_distance_km(
-                        pos_row['latitude'], pos_row['longitude'],
-                        past_fires['latitude'].values,
-                        past_fires['longitude'].values
-                    )
-                    # Discard if it was already burning in past 15 days
-                    if distances.min() > ignition_radius_km:
-                        fresh_ignition_indices.append(row_idx)
+                past_xyz = self._get_xyz(past_fires['latitude'].values, past_fires['longitude'].values)
+                tree = cKDTree(past_xyz)
+                curr_xyz = self._get_xyz(self.df_area_filtered['latitude'].values, self.df_area_filtered['longitude'].values)
+                chord_dist = 2.0 * np.sin(ignition_radius_km / (2.0 * 6371.0))
+                
+                dists, _ = tree.query(curr_xyz, k=1)
+                valid_mask = dists > chord_dist
+                self.df_area_filtered = self.df_area_filtered[valid_mask].copy()
 
-                self.df_area_filtered = self.df_area_filtered.loc[fresh_ignition_indices].copy()
+        if self.df_area_filtered.empty: return
 
-        if self.df_area_filtered.empty:
-            return
-
-        # 4. FRP stratification and 2D sampling
         if len(self.df_area_filtered) > 5 and self.df_area_filtered['frp'].nunique() > 1:
-            self.df_area_filtered['frp_bin'] = pd.qcut(
-                self.df_area_filtered['frp'],
-                q=min(3, self.df_area_filtered['frp'].nunique()),
-                duplicates="drop"
+            # fixed pandas 2.2 deprecation warning using include_groups=False
+            self.df_area_filtered['frp_bin'] = pd.qcut(self.df_area_filtered['frp'], q=min(3, self.df_area_filtered['frp'].nunique()), duplicates="drop")
+            self.df_area_filtered = self.df_area_filtered.groupby('frp_bin', group_keys=False, observed=False).apply(
+                lambda b: self._sample_spatially_diverse(b, n_needed=5), include_groups=False
             )
-            self.df_area_filtered = self.df_area_filtered.groupby(
-                'frp_bin', group_keys=False, observed=False
-            ).apply(lambda bin_group: self._sample_spatially_diverse(bin_group, n_needed=5))
         elif len(self.df_area_filtered) > 5:
             self.df_area_filtered = self._sample_spatially_diverse(self.df_area_filtered, n_needed=5)
 
-        self.df_area_filtered = self.df_area_filtered[
-            ['latitude', 'longitude', 'acq_date', 'acq_time', 'bright_ti4', 'frp']
-        ].copy()
+        self.df_area_filtered = self.df_area_filtered[['latitude', 'longitude', 'acq_date', 'acq_time', 'bright_ti4', 'frp']].copy()
         self.df_area_filtered['is_fire'] = 1
 
     def generate_hard_negatives(
@@ -207,73 +346,64 @@ class Date:
         buffer_days: int = 15,
         max_attempts: int = 30
     ) -> pd.DataFrame:
-        """generate spatially shifted hard negatives verified against window fires"""
         if self.df_area_filtered.empty:
             return pd.DataFrame()
 
         df_window_fires = self._fetch_window_fires(buffer_days=buffer_days)
-        negative_points = []
+        fire_tree = None
+        safe_chord = 2.0 * np.sin(safe_radius_km / (2.0 * 6371.0))
+        if not df_window_fires.empty:
+            fire_xyz = self._get_xyz(df_window_fires['latitude'].values, df_window_fires['longitude'].values)
+            fire_tree = cKDTree(fire_xyz)
+
+        neg_dist_chord = 2.0 * np.sin(min_neg_dist_km / (2.0 * 6371.0))
+        valid_negatives = []
 
         for _, pos_row in self.df_area_filtered.iterrows():
-            pos_lat = pos_row['latitude']
-            pos_lon = pos_row['longitude']
-            pos_time = pos_row['acq_time']
+            pos_lat, pos_lon = pos_row['latitude'], pos_row['longitude']
+            
+            dist_km = np.random.uniform(min_shift_km, max_shift_km, size=max_attempts)
+            angle_rad = np.random.uniform(0, 2 * np.pi, size=max_attempts)
+            delta_lat = (dist_km * np.cos(angle_rad)) / 111.0
+            delta_lon = (dist_km * np.sin(angle_rad)) / (111.0 * np.cos(np.radians(pos_lat)))
+            
+            cand_lats, cand_lons = pos_lat + delta_lat, pos_lon + delta_lon
 
-            valid_neg_found = False
-            attempts = 0
+            pts = gpd.points_from_xy(cand_lons, cand_lats)
+            mask_country = pts.within(self.geometry)
+            cand_lats, cand_lons = cand_lats[mask_country], cand_lons[mask_country]
 
-            while not valid_neg_found and attempts < max_attempts:
-                attempts += 1
+            if len(cand_lats) == 0: continue
 
-                dist_km = np.random.uniform(min_shift_km, max_shift_km)
-                angle_rad = np.random.uniform(0, 2 * np.pi)
+            if fire_tree is not None:
+                cand_xyz = self._get_xyz(cand_lats, cand_lons)
+                dists, _ = fire_tree.query(cand_xyz, k=1)
+                safe_mask = dists > safe_chord
+                cand_lats, cand_lons = cand_lats[safe_mask], cand_lons[safe_mask]
 
-                delta_lat = (dist_km * np.cos(angle_rad)) / 111.0
-                delta_lon = (dist_km * np.sin(angle_rad)) / (111.0 * np.cos(np.radians(pos_lat)))
+            for cand_lat, cand_lon in zip(cand_lats, cand_lons):
+                conflict = False
+                cand_xyz = self._get_xyz([cand_lat], [cand_lon])[0]
+                
+                # Check against already added negatives to keep spread
+                existing = valid_negatives + self.df_negatives.to_dict('records')
+                if existing:
+                    ex_xyz = self._get_xyz([e['latitude'] for e in existing], [e['longitude'] for e in existing])
+                    tree = cKDTree(ex_xyz)
+                    d, _ = tree.query(cand_xyz, k=1)
+                    if d <= neg_dist_chord:
+                        conflict = True
+                
+                if not conflict:
+                    valid_negatives.append({
+                        'latitude': round(cand_lat, 5), 'longitude': round(cand_lon, 5),
+                        'acq_date': self.fire_date, 'acq_time': int(pos_row['acq_time']),
+                        'bright_ti4': 0.0, 'frp': 0.0, 'is_fire': 0
+                    })
+                    break
 
-                neg_lat = pos_lat + delta_lat
-                neg_lon = pos_lon + delta_lon
-
-                if not self.is_within_country(neg_lat, neg_lon):
-                    continue
-
-                if not df_window_fires.empty:
-                    fire_distances = self._haversine_distance_km(
-                        neg_lat, neg_lon,
-                        df_window_fires['latitude'].values,
-                        df_window_fires['longitude'].values
-                    )
-                    if fire_distances.min() <= safe_radius_km:
-                        continue
-
-                all_current_negatives = negative_points.copy()
-                if not self.df_negatives.empty:
-                    all_current_negatives.extend(self.df_negatives[['latitude', 'longitude']].to_dict('records'))
-
-                if all_current_negatives:
-                    prev_neg_lats = np.array([p['latitude'] for p in all_current_negatives])
-                    prev_neg_lons = np.array([p['longitude'] for p in all_current_negatives])
-                    neg_distances = self._haversine_distance_km(neg_lat, neg_lon, prev_neg_lats, prev_neg_lons)
-                    if neg_distances.min() <= min_neg_dist_km:
-                        continue
-
-                valid_neg_found = True
-
-            if valid_neg_found:
-                negative_points.append({
-                    'latitude': round(neg_lat, 5),
-                    'longitude': round(neg_lon, 5),
-                    'acq_date': self.fire_date,
-                    'acq_time': int(pos_time),
-                    'bright_ti4': 0.0,
-                    'frp': 0.0,
-                    'is_fire': 0
-                })
-
-        if negative_points:
-            df_new_neg = pd.DataFrame(negative_points)
-            self.df_negatives = pd.concat([self.df_negatives, df_new_neg], ignore_index=True)
-
+        if valid_negatives:
+            self.df_negatives = pd.concat([self.df_negatives, pd.DataFrame(valid_negatives)], ignore_index=True)
         return self.df_negatives
 
     def generate_random_negatives(
@@ -286,148 +416,101 @@ class Date:
         direction_east: float = 0.0,
         intensity: float = 0.0
     ) -> pd.DataFrame:
-        """generate random background negatives across country landmass with adaptive directional bias"""
         df_window_fires = self._fetch_window_fires(buffer_days=buffer_days)
-        random_negatives = []
-
         default_time = int(self.df_area_filtered['acq_time'].median()) if not self.df_area_filtered.empty else 1900
-        def biased_sample(min_val: float, max_val: float, weight: float, intens: float) -> float:
+
+        fire_tree = None
+        safe_chord = 2.0 * np.sin(safe_radius_km / (2.0 * 6371.0))
+        if not df_window_fires.empty:
+            fire_xyz = self._get_xyz(df_window_fires['latitude'].values, df_window_fires['longitude'].values)
+            fire_tree = cKDTree(fire_xyz)
+
+        neg_dist_chord = 2.0 * np.sin(min_neg_dist_km / (2.0 * 6371.0))
+        valid_negatives = []
+
+        def biased_sample_vec(min_val, max_val, weight, intens, size):
             if intens <= 0.0 or weight == 0.0:
-                return np.random.uniform(min_val, max_val)
-            
-            u = np.random.uniform(0, 1)
+                return np.random.uniform(min_val, max_val, size)
+            u = np.random.uniform(0, 1, size)
             power = 1.0 + (intens * abs(weight) * 49.0)
-            
-            if weight > 0:
-                u_biased = u ** (1.0 / power)
-            else:
-                u_biased = u ** power
-                
+            u_biased = u ** (1.0 / power) if weight > 0 else u ** power
             return min_val + u_biased * (max_val - min_val)
 
         attempts = 0
-        max_allowed_attempts = max(500, n_points * 100) # Збільшений ліміт для жорстких векторів
-
-        while len(random_negatives) < n_points and attempts < max_allowed_attempts:
+        batch_size = max(100, n_points * 20)
+        
+        while len(valid_negatives) < n_points and attempts < 10:
             attempts += 1
-            
-            rand_lat = biased_sample(self.lat_range[0], self.lat_range[1], direction_north, intensity)
-            rand_lon = biased_sample(self.lon_range[0], self.lon_range[1], direction_east, intensity)
+            rand_lat = biased_sample_vec(self.lat_range[0], self.lat_range[1], direction_north, intensity, batch_size)
+            rand_lon = biased_sample_vec(self.lon_range[0], self.lon_range[1], direction_east, intensity, batch_size)
 
-            if not self.is_within_country(rand_lat, rand_lon):
-                continue
+            pts = gpd.points_from_xy(rand_lon, rand_lat)
+            mask_country = pts.within(self.geometry)
+            rand_lat, rand_lon = rand_lat[mask_country], rand_lon[mask_country]
 
-            if not df_window_fires.empty:
-                distances = self._haversine_distance_km(
-                    rand_lat, rand_lon,
-                    df_window_fires['latitude'].values,
-                    df_window_fires['longitude'].values
-                )
-                if distances.min() <= safe_radius_km:
-                    continue
+            if len(rand_lat) == 0: continue
 
-            all_current_negatives = random_negatives.copy()
-            if not self.df_negatives.empty:
-                all_current_negatives.extend(self.df_negatives[['latitude', 'longitude']].to_dict('records'))
+            if fire_tree is not None:
+                cand_xyz = self._get_xyz(rand_lat, rand_lon)
+                dists, _ = fire_tree.query(cand_xyz, k=1)
+                safe_mask = dists > safe_chord
+                rand_lat, rand_lon = rand_lat[safe_mask], rand_lon[safe_mask]
 
-            if all_current_negatives:
-                prev_lats = np.array([p['latitude'] for p in all_current_negatives])
-                prev_lons = np.array([p['longitude'] for p in all_current_negatives])
-                neg_distances = self._haversine_distance_km(rand_lat, rand_lon, prev_lats, prev_lons)
-                if neg_distances.min() <= min_neg_dist_km:
-                    continue
+            for lat, lon in zip(rand_lat, rand_lon):
+                if len(valid_negatives) >= n_points: break
+                
+                conflict = False
+                cand_xyz = self._get_xyz([lat], [lon])[0]
+                existing = valid_negatives + self.df_negatives.to_dict('records')
+                if existing:
+                    ex_xyz = self._get_xyz([e['latitude'] for e in existing], [e['longitude'] for e in existing])
+                    tree = cKDTree(ex_xyz)
+                    d, _ = tree.query(cand_xyz, k=1)
+                    if d <= neg_dist_chord:
+                        conflict = True
 
-            random_negatives.append({
-                'latitude': round(rand_lat, 5),
-                'longitude': round(rand_lon, 5),
-                'acq_date': self.fire_date,
-                'acq_time': default_time,
-                'bright_ti4': 0.0,
-                'frp': 0.0,
-                'is_fire': 0
-            })
+                if not conflict:
+                    valid_negatives.append({
+                        'latitude': round(lat, 5), 'longitude': round(lon, 5),
+                        'acq_date': self.fire_date, 'acq_time': default_time,
+                        'bright_ti4': 0.0, 'frp': 0.0, 'is_fire': 0
+                    })
 
-        if random_negatives:
-            df_new_rand = pd.DataFrame(random_negatives)
-            self.df_negatives = pd.concat([self.df_negatives, df_new_rand], ignore_index=True)
-
+        if valid_negatives:
+            self.df_negatives = pd.concat([self.df_negatives, pd.DataFrame(valid_negatives)], ignore_index=True)
         return self.df_negatives
 
     def get_combined_dataset(self) -> pd.DataFrame:
-        """return combined dataset of positive and negative points"""
         if self.df_area_filtered.empty and self.df_negatives.empty:
             return pd.DataFrame()
-
         return pd.concat([self.df_area_filtered, self.df_negatives], ignore_index=True)
 
     def plot_static_scatter(self):
-        """plot points on top of landmass map"""
         df_plot = self.get_combined_dataset()
-        if df_plot.empty:
-            return
+        if df_plot.empty: return
 
         fig, ax = plt.subplots(figsize=(12, 8))
-
         if self.geometry is not None:
-            gpd.GeoSeries([self.geometry]).plot(
-                ax=ax,
-                color='#e2e8f0',
-                edgecolor='#64748b',
-                linewidth=0.8,
-                alpha=0.9
-            )
+            gpd.GeoSeries([self.geometry]).plot(ax=ax, color='#e2e8f0', edgecolor='#64748b', linewidth=0.8, alpha=0.9)
 
         sns.scatterplot(
-            data=df_plot,
-            x='longitude',
-            y='latitude',
-            hue='is_fire',
-            style='is_fire',
-            palette={1: '#e11d48', 0: '#16a34a'},
-            markers={1: 'X', 0: 'o'},
-            s=120,
-            edgecolor='black',
-            linewidth=0.8,
-            ax=ax,
-            zorder=3
+            data=df_plot, x='longitude', y='latitude', hue='is_fire', style='is_fire',
+            palette={1: '#e11d48', 0: '#16a34a'}, markers={1: 'X', 0: 'o'}, s=120,
+            edgecolor='black', linewidth=0.8, ax=ax, zorder=3
         )
-
+        
         plt.title(f"fires (1) vs negatives (0) on map of {self.country_code} ({self.fire_date})", fontsize=14, pad=12)
         plt.xlabel("longitude", fontsize=11)
         plt.ylabel("latitude", fontsize=11)
-
-        handles, _ = ax.get_legend_handles_labels()
-        ax.legend(
-            handles=handles,
-            labels=['hard/random negative (0)', 'active fire (1)'],
-            loc='lower left',
-            frameon=True,
-            facecolor='white',
-            framealpha=0.9
-        )
-
         plt.grid(True, linestyle=':', alpha=0.4)
         plt.tight_layout()
         plt.show()
 
-
 if __name__ == "__main__":
     test_date = date(2023, 6, 15)
     date_obj = Date(test_date, country_code="CAN")
-
     date_obj.generate_fires()
-    date_obj.filter_fires(epsilon=0.012)
-    date_obj.generate_hard_negatives(buffer_days=15)
-    
-    # Тестуємо з адаптивним вектором: зміщуємо точки на Північ (1.0) та трохи на Схід (0.3)
-    date_obj.generate_random_negatives(
-        n_points=5, 
-        buffer_days=15, 
-        direction_north=1.0, 
-        direction_east=0.3, 
-        intensity=0.2
-    )
-
-    df_day = date_obj.get_combined_dataset()
-    print(df_day[['latitude', 'longitude', 'acq_date', 'acq_time', 'frp', 'is_fire']])
-    date_obj.plot_static_scatter()
+    date_obj.filter_fires()
+    date_obj.generate_hard_negatives()
+    date_obj.generate_random_negatives(n_points=5, direction_north=1.0, direction_east=0.3, intensity=0.8)
+    print(date_obj.get_combined_dataset())
