@@ -110,5 +110,5 @@ preemptfire/
 
 - **Geospatial Processing:** GDAL, Rasterio, GeoPandas, PySTAC Client, PyOsmium, OSMnx
 - **Numerical and Physics Modeling:** NumPy, SciPy, Numba, Van Wagner CFFDRS Engine
-- **Machine Learning Frameworks:** PyTorch, TorchGeo, CatBoost
+- **Machine Learning Frameworks:** PyTorch
 - **Data Persistence:** HDF5 (h5py) with LZF compression and memory-efficient chunking
