@@ -109,7 +109,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--csv",
         type=str,
-        default="data/raw/master_points_iberia.csv",
+        default="data/interim/points_dataset_thinned.csv",
         help="Path to the input CSV file containing lat/lon and is_fire columns",
     )
     parser.add_argument(

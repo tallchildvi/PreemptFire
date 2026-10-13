@@ -143,6 +143,6 @@ if __name__ == "__main__":
         direction_north=1.0,                 
         direction_east=0.3,                 
         intensity=0.1,                       
-        output_filename="master_points_iberia.csv",
+        output_filename="master_points_dataset.csv",
         max_workers=6,                   
     )
