@@ -7,11 +7,11 @@ from src.config import RAW_DATA_DIR, INTERIM_DATA_DIR
 
 def spatiotemporal_thinning(
     df: pd.DataFrame, 
-    min_dist_km: float = 40.0, 
+    min_dist_km: float = 20.0, 
     min_days: int = 15, 
     random_state: int = 42
 ) -> pd.DataFrame:
-    """Greedy spatiotemporal thinning based on distance (km) and time (days) thresholds"""
+    """greedy spatiotemporal thinning prioritizing fire centroids (1) over negatives (0)"""
     np.random.seed(random_state)
     df = df.copy().reset_index(drop=True)
     
@@ -22,10 +22,12 @@ def spatiotemporal_thinning(
     disabled = np.zeros(n, dtype=bool)
     selected_indices = []
     
-    # random permutation to prevent systematic ordering bias
-    permuted_indices = np.random.permutation(n)
+    # process confirmed fires (1) first in random order, then negatives (0) in random order
+    fire_indices = np.random.permutation(df.index[df['is_fire'] == 1].values)
+    neg_indices = np.random.permutation(df.index[df['is_fire'] == 0].values)
+    ordered_indices = np.concatenate([fire_indices, neg_indices])
     
-    for idx in permuted_indices:
+    for idx in ordered_indices:
         if disabled[idx]:
             continue
             
