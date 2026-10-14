@@ -200,7 +200,7 @@ if __name__ == "__main__":
         "--years",
         type=int,
         nargs="+",
-        default=[2020, 2021, 2022, 2023, 2024],
+        default=[2018, 2019, 2020, 2021, 2022, 2023, 2024, 2025],
         help="list of years to fetch (e.g. 2020 2021)",
     )
 

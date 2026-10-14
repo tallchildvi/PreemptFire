@@ -134,7 +134,7 @@ if __name__ == "__main__":
     iberia_bounds = (35.9, -9.5, 43.9, 3.4)
 
     generate_master_dataset(
-        start_year=2020,
+        start_year=2018,
         end_year=2025,
         months=[2, 3, 4, 5, 6, 7, 8, 9, 10], 
         days=[1, 15],

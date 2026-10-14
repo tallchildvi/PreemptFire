@@ -113,7 +113,9 @@ class Date:
             np.sin(lat_rad),
         ])
 
+    # =========================================================================
     # STAGE 1: EARLY POINT-LEVEL FILTERING (RAW ANOMALIES -> VERIFIED POINTS)
+    # =========================================================================
 
     def _get_industrial_tree(self) -> Optional[cKDTree]:
         """load and cache ckdtree of industrial/agricultural hotspots"""
@@ -305,7 +307,7 @@ class Date:
         verify_industrial: bool = True,
         verify_globfire: bool = True,
     ) -> pd.DataFrame:
-        """run all early point-level filters on self.df_area before fire clustering"""
+        """run all early point-level filters on self.df_area before centroid aggregation"""
         if self.df_area.empty:
             self._points_prefiltered = True
             return self.df_area
@@ -401,7 +403,6 @@ class Date:
             return self.df_window_fires
 
         raw_window = pd.concat(dfs, ignore_index=True)
-        # pre-filter window points so persistent industrial flares are not treated as past wildfires
         self.df_window_fires = self._filter_df_by_country_and_blacklist(
             raw_window,
             industrial_radius_km=industrial_radius_km,
@@ -410,10 +411,41 @@ class Date:
         )
         return self.df_window_fires
 
-    # STAGE 2: FIRE-LEVEL FILTERING (CLUSTERING, FRESH IGNITION, STRATIFICATION)
+    # =========================================================================
+    # STAGE 2: CENTROID AGGREGATION & FIRE-LEVEL FILTERING (LOOKBACK)
+    # =========================================================================
+
+    def _aggregate_to_centroids(self, cluster_radius_km: float = 3.0) -> pd.DataFrame:
+        """merge nearby verified fire pixels belonging to the same fire into a single centroid"""
+        if self.df_area.empty:
+            return pd.DataFrame()
+
+        eps_rad = cluster_radius_km / 6371.0
+        coords_rad = np.radians(self.df_area[["latitude", "longitude"]].values)
+
+        # min_samples=1 ensures every isolated point or group forms a valid cluster
+        dbscan = DBSCAN(eps=eps_rad, metric="haversine", min_samples=1)
+        df_clustered = self.df_area.copy()
+        df_clustered["cluster_id"] = dbscan.fit_predict(coords_rad)
+
+        # compute geometric centroid (mean lat/lon), earliest detection time, and peak intensity
+        centroids = (
+            df_clustered.groupby("cluster_id", as_index=False)
+            .agg(
+                latitude=("latitude", "mean"),
+                longitude=("longitude", "mean"),
+                acq_date=("acq_date", "first"),
+                acq_time=("acq_time", "min"),
+                bright_ti4=("bright_ti4", "max"),
+                frp=("frp", "max"),
+            )
+        )
+        centroids["latitude"] = centroids["latitude"].round(5)
+        centroids["longitude"] = centroids["longitude"].round(5)
+        return centroids.drop(columns=["cluster_id"])
 
     def _sample_spatially_diverse(self, bin_df: pd.DataFrame, n_needed: int = 5) -> pd.DataFrame:
-        """sample representative points across 2d spatial clusters using kmeans"""
+        """optional helper: sample representative points across 2d spatial clusters using kmeans"""
         if len(bin_df) <= n_needed:
             return bin_df
 
@@ -427,7 +459,8 @@ class Date:
 
     def filter_fires(
         self,
-        epsilon: float = 0.012,  # intended to remain radians
+        cluster_radius_km: float = 3.0,
+        epsilon: Optional[float] = None,
         lookback_days: int = 15,
         ignition_radius_km: float = 20.0,
         industrial_radius_km: float = 2.0,
@@ -435,12 +468,17 @@ class Date:
         globfire_tolerance_days: int = 3,
         verify_industrial: bool = True,
         verify_globfire: bool = True,
+        max_fires_per_bin: Optional[int] = None,
     ):
-        """aggregate verified fire points into distinct fire events, filter ongoing burns, and stratify"""
+        """
+        stage 1: ensure raw points are filtered (country, blacklist, burned area).
+        stage 2: merge pixels of the same fire into centroids.
+        stage 3: filter out ongoing fires using 15-day lookback window.
+        """
         if self.df_area.empty:
             return
 
-        # ensure Stage 1 point pre-filtering was executed if generate_fires was called with early_filter=False
+        # 1. ensure early point-level filtering was executed
         if not self._points_prefiltered:
             self.prefilter_points(
                 industrial_radius_km=industrial_radius_km,
@@ -453,19 +491,18 @@ class Date:
         if self.df_area.empty:
             return
 
-        # 1. dbscan spatial clustering of verified fire points
-        X = np.radians(self.df_area[["latitude", "longitude"]].values)
-        dbscan = DBSCAN(eps=epsilon, metric="haversine")
-        self.df_area["cluster_id"] = dbscan.fit_predict(X)
+        # 2. merge nearby points into fire centroids
+        # (if legacy epsilon in radians is passed and small, convert it; otherwise use cluster_radius_km)
+        effective_radius_km = cluster_radius_km
+        if epsilon is not None and epsilon < 0.005:
+            effective_radius_km = epsilon * 6371.0
 
-        noise_mask = self.df_area["cluster_id"] == -1
-        if noise_mask.any():
-            self.df_area.loc[noise_mask, "cluster_id"] = np.arange(100000, 100000 + noise_mask.sum())
+        self.df_area_filtered = self._aggregate_to_centroids(cluster_radius_km=effective_radius_km)
 
-        idx = self.df_area.groupby("cluster_id")["bright_ti4"].idxmax()
-        self.df_area_filtered = self.df_area.loc[idx].copy()
+        if self.df_area_filtered.empty:
+            return
 
-        # 2. vectorized lookback filter using pre-cleaned window fires
+        # 3. vectorized lookback filter: retain only fresh ignitions (no fires within ignition_radius_km in past 15 days)
         df_window_fires = self._fetch_window_fires(
             buffer_days=lookback_days,
             industrial_radius_km=industrial_radius_km,
@@ -486,33 +523,38 @@ class Date:
 
                 dists, _ = tree.query(curr_xyz, k=1)
                 valid_mask = dists > chord_dist
-                self.df_area_filtered = self.df_area_filtered[valid_mask].copy()
+                self.df_area_filtered = self.df_area_filtered[valid_mask].reset_index(drop=True)
 
         if self.df_area_filtered.empty:
             return
 
-        # 3. frp stratification and 2d spatial sampling
-        if len(self.df_area_filtered) > 5 and self.df_area_filtered["frp"].nunique() > 1:
-            self.df_area_filtered["frp_bin"] = pd.qcut(
-                self.df_area_filtered["frp"],
-                q=min(3, self.df_area_filtered["frp"].nunique()),
-                duplicates="drop",
-            )
-            sampled_bins = [
-                self._sample_spatially_diverse(group.drop(columns=["frp_bin"]), n_needed=5)
-                for _, group in self.df_area_filtered.groupby("frp_bin", observed=False)
-                if not group.empty
-            ]
-            self.df_area_filtered = pd.concat(sampled_bins, ignore_index=True)
-        elif len(self.df_area_filtered) > 5:
-            self.df_area_filtered = self._sample_spatially_diverse(self.df_area_filtered, n_needed=5)
+        # 4. optional daily subsampling (disabled by default so spatial_gate.py gets the full dataset)
+        if max_fires_per_bin is not None:
+            if len(self.df_area_filtered) > max_fires_per_bin and self.df_area_filtered["frp"].nunique() > 1:
+                self.df_area_filtered["frp_bin"] = pd.qcut(
+                    self.df_area_filtered["frp"],
+                    q=min(3, self.df_area_filtered["frp"].nunique()),
+                    duplicates="drop",
+                )
+                sampled_bins = [
+                    self._sample_spatially_diverse(group.drop(columns=["frp_bin"]), n_needed=max_fires_per_bin)
+                    for _, group in self.df_area_filtered.groupby("frp_bin", observed=False)
+                    if not group.empty
+                ]
+                self.df_area_filtered = pd.concat(sampled_bins, ignore_index=True)
+            elif len(self.df_area_filtered) > max_fires_per_bin:
+                self.df_area_filtered = self._sample_spatially_diverse(
+                    self.df_area_filtered, n_needed=max_fires_per_bin
+                )
 
         self.df_area_filtered = self.df_area_filtered[
             ["latitude", "longitude", "acq_date", "acq_time", "bright_ti4", "frp"]
         ].copy()
         self.df_area_filtered["is_fire"] = 1
 
+    # =========================================================================
     # STAGE 3: NEGATIVE SAMPLING
+    # =========================================================================
 
     def generate_hard_negatives(
         self,
@@ -733,10 +775,10 @@ class Date:
 
 
 if __name__ == "__main__":
-    test_date = date(2023, 6, 15)
+    test_date = date(2023, 7, 15)
     date_obj = Date(test_date, country_code="ESP")
     date_obj.generate_fires()
-    date_obj.filter_fires()
+    date_obj.filter_fires(cluster_radius_km=3.0)
     date_obj.generate_hard_negatives()
     date_obj.generate_random_negatives(n_points=5, direction_north=1.0, direction_east=0.3, intensity=0.8)
     print(date_obj.get_combined_dataset())
