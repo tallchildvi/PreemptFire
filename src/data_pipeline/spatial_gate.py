@@ -78,11 +78,10 @@ def find_best_moran_subset(
     target_n: int = 1000,
     n_iterations: int = 500,
     k_neighbors: int = 5,
-    max_neg_ratio: float = 2.0,
 ) -> pd.DataFrame:
     """
-    find subset of points minimizing absolute moran's i while preserving all fires
-    when possible or maintaining class balance.
+    find strictly 50/50 class-balanced subset (equal fires and negatives)
+    minimizing absolute moran's i spatial autocorrelation.
     """
     if df.empty:
         return df
@@ -91,36 +90,35 @@ def find_best_moran_subset(
     negs_df = df[df["is_fire"] == 0]
     print(f"thinned pool composition: {len(fires_df)} fires (1), {len(negs_df)} negatives (0)")
 
-    if len(df) <= target_n:
-        w = KNN.from_array(df[["latitude", "longitude"]].values, k=min(k_neighbors, len(df) - 1))
+    # enforce strict 50/50 balance based on the smaller class pool
+    n_per_class = min(len(fires_df), len(negs_df), target_n // 2)
+    if n_per_class == 0:
+        print("error: one of the classes has 0 points after thinning")
+        return pd.DataFrame()
+
+    total_target = n_per_class * 2
+    print(
+        f"targeting strict 50/50 balance: {total_target} points total "
+        f"({n_per_class} fires, {n_per_class} negatives)..."
+    )
+
+    # if pool sizes match n_per_class exactly, there is only one valid combination
+    if len(fires_df) == n_per_class and len(negs_df) == n_per_class:
+        sample_df = pd.concat([fires_df, negs_df], ignore_index=True)
+        w = KNN.from_array(sample_df[["latitude", "longitude"]].values, k=min(k_neighbors, total_target - 1))
         w.transform = "R"
-        mi = Moran(df["is_fire"].values, w)
-        print(
-            f"pool size ({len(df)}) <= target_n ({target_n}); retaining all thinned points "
-            f"(moran's i = {mi.I:.5f}, p = {mi.p_sim:.3f})"
-        )
-        return df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        mi = Moran(sample_df["is_fire"].values, w)
+        print(f"exact pool match: moran's i = {mi.I:.5f} (p = {mi.p_sim:.3f})")
+        return sample_df.sample(frac=1.0, random_state=42).reset_index(drop=True)
 
     best_df = None
     best_moran_abs = float("inf")
     best_stats = {}
 
-    # determine balanced class counts for target_n
-    n_fires_target = min(len(fires_df), int(round(target_n / (1.0 + max_neg_ratio))))
-    # if we have more capacity and fires available, keep up to 50% fires
-    n_fires_target = min(len(fires_df), max(n_fires_target, target_n // 2))
-    n_negs_target = min(len(negs_df), target_n - n_fires_target)
-    if n_fires_target + n_negs_target < target_n:
-        n_fires_target = min(len(fires_df), target_n - n_negs_target)
-
-    print(
-        f"optimizing subset from {len(df)} to {n_fires_target + n_negs_target} points "
-        f"({n_fires_target} fires, {n_negs_target} negatives)..."
-    )
-
     for i in range(n_iterations):
-        sampled_fires = fires_df.sample(n=n_fires_target, random_state=i)
-        sampled_negs = negs_df.sample(n=n_negs_target, random_state=i + 10000)
+        # sample an equal count from each class on every iteration
+        sampled_fires = fires_df.sample(n=n_per_class, random_state=i)
+        sampled_negs = negs_df.sample(n=n_per_class, random_state=i + 10000)
         sample_df = pd.concat([sampled_fires, sampled_negs], ignore_index=True)
 
         w = KNN.from_array(sample_df[["latitude", "longitude"]].values, k=k_neighbors)
@@ -154,7 +152,7 @@ if __name__ == "__main__":
     df_thinned = spatiotemporal_thinning(df_raw, min_dist_km=20.0, min_days=15)
     print(f"points after spatiotemporal thinning: {len(df_thinned)}")
 
-    # optimize subset minimizing moran's i
+    # optimize subset minimizing moran's i with strict 50/50 class balance
     df_final = find_best_moran_subset(df_thinned, target_n=1000, n_iterations=500)
     df_final.to_csv(output_file, index=False)
     print(f"saved thinned dataset to: {output_file}")
