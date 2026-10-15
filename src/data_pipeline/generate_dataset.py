@@ -211,6 +211,6 @@ if __name__ == "__main__":
         stride=256,
         max_invalid_ratio=0.20,
         osm_mode="local_history",
-        max_workers=4, # 4 is optimal to avoid triggering NASA/MS planetary computer rate limits
+        max_workers=2,
     )
     generator.run(max_scenes=10)
