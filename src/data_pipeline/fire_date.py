@@ -233,6 +233,46 @@ class Date:
     # STAGE 1: EARLY POINT-LEVEL FILTERING & POLYGON PRE-CHECK
     # =========================================================================
 
+    def _land_filter(
+        self,
+        lats: np.ndarray,
+        lons: np.ndarray,
+        tile_km: float = 20.48,
+        min_land_fraction: float = 0.1,
+        grid: int = 7,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        keep candidates whose centre is on land; coastal tiles are allowed.
+        returns (mask, land_fraction) where land_fraction is the share of land
+        in a grid x grid sample over the tile footprint.
+        """
+        try:
+            from global_land_mask import globe
+        except ImportError:
+            warnings.warn("global-land-mask not installed; skipping land filter.")
+            return np.ones(len(lats), dtype=bool), np.full(len(lats), np.nan)
+
+        lats = np.asarray(lats, dtype=float)
+        lons = np.asarray(lons, dtype=float)
+
+        # centre must be on land
+        center_land = globe.is_land(lats, lons)
+
+        # land fraction over the tile footprint (approximate square sampling)
+        offs = np.linspace(-tile_km / 2, tile_km / 2, grid)
+        dy, dx = np.meshgrid(offs, offs, indexing="ij")
+        dy, dx = dy.ravel(), dx.ravel()  # km offsets, shape (grid*grid,)
+
+        s_lat = lats[:, None] + dy[None, :] / 111.0
+        cos_lat = np.cos(np.radians(lats))[:, None]
+        s_lon = lons[:, None] + dx[None, :] / (111.0 * cos_lat)
+        s_lat = np.clip(s_lat, -90.0, 90.0)
+
+        land_fraction = globe.is_land(s_lat, s_lon).mean(axis=1)
+
+        mask = center_land & (land_fraction >= min_land_fraction)
+        return mask, land_fraction
+
     def _get_industrial_tree(self) -> Optional[cKDTree]:
         """load and cache ckdtree of industrial/agricultural hotspots"""
         path = self.industrial_blacklist_path
@@ -720,6 +760,12 @@ class Date:
             if len(cand_lats) == 0:
                 continue
 
+            land_mask, _ = self._land_filter(cand_lats, cand_lons)
+            cand_lats, cand_lons = cand_lats[land_mask], cand_lons[land_mask]
+
+            if len(cand_lats) == 0:
+                continue
+
             if ind_tree is not None:
                 cand_xyz = self._get_xyz(cand_lats, cand_lons)
                 matches = ind_tree.query_ball_point(cand_xyz, r=ind_chord)
@@ -808,6 +854,12 @@ class Date:
                 pts = gpd.points_from_xy(rand_lon, rand_lat)
                 mask_country = pts.within(self.geometry)
                 rand_lat, rand_lon = rand_lat[mask_country], rand_lon[mask_country]
+
+            if len(rand_lat) == 0:
+                continue
+
+            land_mask, _ = self._land_filter(rand_lat, rand_lon)
+            rand_lat, rand_lon = rand_lat[land_mask], rand_lon[land_mask]
 
             if len(rand_lat) == 0:
                 continue
