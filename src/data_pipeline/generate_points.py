@@ -186,7 +186,7 @@ if __name__ == "__main__":
         days=None,  # scan all calendar days (effis pre-check + 10d cache makes this fast)
         country_codes=["ESP", "PRT"],
         bounds=iberia_bounds,
-        cluster_radius_km=15.0,
+        cluster_radius_km=20.0,
         lookback_days=15,
         n_random_negatives=2,
         direction_north=1.0,
