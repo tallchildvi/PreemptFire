@@ -12,7 +12,7 @@ def process_single_date(
     target_date: date,
     country_code: str,
     bounds: Optional[Tuple[float, float, float, float]] = None,
-    cluster_radius_km: float = 3.0,
+    cluster_radius_km: float = 15.0,
     lookback_days: int = 15,
     n_random_negatives: int = 2,
     direction_north: float = 0.0,
@@ -22,29 +22,14 @@ def process_single_date(
     """process single date and return combined daily dataframe of verified fire centroids and negatives"""
     date_str = target_date.strftime("%Y-%m-%d")
     try:
-        date_obj = Date(target_date, country_code=country_code)
+        # pass bounds directly so ESP and PRT share the 5d firms cache and clip overseas islands
+        date_obj = Date(target_date, country_code=country_code, bounds=bounds)
         date_obj.generate_fires()
 
         if date_obj.df_area.empty:
             return None
 
-        # optional spatial filtering by bounding box (min_lat, min_lon, max_lat, max_lon)
-        if bounds is not None:
-            min_lat, min_lon, max_lat, max_lon = bounds
-            lat_col = "latitude" if "latitude" in date_obj.df_area.columns else "lat"
-            lon_col = "longitude" if "longitude" in date_obj.df_area.columns else "lon"
-
-            date_obj.df_area = date_obj.df_area[
-                (date_obj.df_area[lat_col] >= min_lat)
-                & (date_obj.df_area[lat_col] <= max_lat)
-                & (date_obj.df_area[lon_col] >= min_lon)
-                & (date_obj.df_area[lon_col] <= max_lon)
-            ].reset_index(drop=True)
-
-            if date_obj.df_area.empty:
-                return None
-
-        # aggregate verified points into 3 km fire centroids and filter ongoing burns via lookback
+        # aggregate verified points into fire centroids and filter ongoing burns via lookback
         date_obj.filter_fires(
             cluster_radius_km=cluster_radius_km,
             lookback_days=lookback_days,
@@ -57,7 +42,7 @@ def process_single_date(
         # generate 1 hard negative per confirmed fire centroid
         date_obj.generate_hard_negatives(buffer_days=lookback_days)
 
-        # scale random negatives with found fires so single-fire days do not flood dataset with negatives
+        # scale random negatives with found fires
         n_rand = min(n_random_negatives, n_fires) if n_random_negatives > 0 else 0
         if n_rand > 0:
             date_obj.generate_random_negatives(
@@ -76,7 +61,6 @@ def process_single_date(
     except Exception as e:
         print(f"error processing date {date_str} ({country_code}): {e}")
     return None
-
 
 def _build_date_tasks(
     start_year: int,
