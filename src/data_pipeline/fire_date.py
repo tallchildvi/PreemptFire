@@ -1,6 +1,9 @@
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Optional
+import random
+import threading
+import time
+from typing import Optional, Tuple
 import warnings
 import requests
 
@@ -11,6 +14,7 @@ import numpy as np
 import pandas as pd
 from scipy.spatial import cKDTree
 import seaborn as sns
+from shapely.geometry import box
 from sklearn.cluster import DBSCAN, KMeans
 
 from src.config import BASE_DIR
@@ -20,23 +24,29 @@ load_dotenv(BASE_DIR / ".env")
 DEFAULT_INDUSTRIAL_HOTSPOTS_PATH = BASE_DIR / "data" / "raw" / "industrial_hotspots.csv"
 DEFAULT_GLOBFIRE_PATH = BASE_DIR / "data" / "raw" / "globfire"
 BOUNDARIES_CACHE_DIR = BASE_DIR / "data" / "raw" / "boundaries"
+FIRMS_CACHE_DIR = BASE_DIR / "data" / "raw" / "firms_cache"
 
 
 class Date:
-    # class-level cache to avoid reloading static files across multiple dates
+    # class-level caches shared across threads to prevent redundant disk/network i/o
     _industrial_tree_cache: dict[str, Optional[cKDTree]] = {}
     _boundary_cache: dict[str, tuple] = {}
+    _globfire_gdf_cache: dict[str, gpd.GeoDataFrame] = {}
+    _cache_lock = threading.Lock()
+    _chunk_locks: dict[str, threading.Lock] = {}
 
     def __init__(
         self,
         fire_date: date,
         country_code: str = "CAN",
+        bounds: Optional[Tuple[float, float, float, float]] = None,
         industrial_blacklist_path: Optional[Path | str] = None,
         globfire_path: Optional[Path | str] = None,
     ):
         self.fire_date_obj = fire_date
         self.fire_date = fire_date.strftime("%Y-%m-%d")
         self.country_code = country_code.upper()
+        self.custom_bounds = bounds  # (min_lat, min_lon, max_lat, max_lon)
 
         self.industrial_blacklist_path = (
             Path(industrial_blacklist_path)
@@ -57,49 +67,78 @@ class Date:
 
         self.geometry = None
         self.bbox_str = "-180,-90,180,90"
+        self.cache_prefix = self.country_code
         self.lat_range = (-90.0, 90.0)
         self.lon_range = (-180.0, 180.0)
 
         self._load_country_bounds()
 
     def _get_api_keys(self):
-        """yield available firms api keys from env safely"""
+        """yield available firms api keys in randomized order to balance rate limits across threads"""
         config = dotenv_values(BASE_DIR / ".env")
-        for env_name, env_value in config.items():
-            if env_name.startswith("FIRMS_API_KEY") and env_value:
-                yield env_value
+        keys = [
+            env_value
+            for env_name, env_value in config.items()
+            if env_name.startswith("FIRMS_API_KEY") and env_value
+        ]
+        random.shuffle(keys)
+        for key in keys:
+            yield key
 
     def _load_country_bounds(self):
-        """load country geometry, cache locally and in memory, and calculate bounding box"""
-        if self.country_code in self._boundary_cache:
-            self.geometry, self.bbox_str, self.lat_range, self.lon_range = self._boundary_cache[self.country_code]
-            return
+        """load country geometry, clip to optional bounds, and cache in memory"""
+        cache_key = f"{self.country_code}_{self.custom_bounds}"
+        with self._cache_lock:
+            if cache_key in self._boundary_cache:
+                (
+                    self.geometry,
+                    self.bbox_str,
+                    self.cache_prefix,
+                    self.lat_range,
+                    self.lon_range,
+                ) = self._boundary_cache[cache_key]
+                return
 
         BOUNDARIES_CACHE_DIR.mkdir(parents=True, exist_ok=True)
         local_path = BOUNDARIES_CACHE_DIR / f"{self.country_code}.geo.json"
 
         try:
-            if not local_path.exists():
-                url = f"https://raw.githubusercontent.com/johan/world.geo.json/master/countries/{self.country_code}.geo.json"
-                response = requests.get(url, timeout=15)
-                response.raise_for_status()
-                with open(local_path, "w", encoding="utf-8") as f:
-                    f.write(response.text)
+            with self._cache_lock:
+                if not local_path.exists():
+                    url = f"https://raw.githubusercontent.com/johan/world.geo.json/master/countries/{self.country_code}.geo.json"
+                    response = requests.get(url, timeout=15)
+                    response.raise_for_status()
+                    with open(local_path, "w", encoding="utf-8") as f:
+                        f.write(response.text)
 
             gdf = gpd.read_file(local_path)
-            minx, miny, maxx, maxy = gdf.total_bounds
+            geom = gdf.union_all() if hasattr(gdf, "union_all") else gdf.unary_union
 
-            self.geometry = gdf.union_all() if hasattr(gdf, "union_all") else gdf.unary_union
-            self.bbox_str = f"{minx:.1f},{miny:.1f},{maxx:.1f},{maxy:.1f}"
+            if self.custom_bounds is not None:
+                b_min_lat, b_min_lon, b_max_lat, b_max_lon = self.custom_bounds
+                clip_box = box(b_min_lon, b_min_lat, b_max_lon, b_max_lat)
+                geom = geom.intersection(clip_box)
+                # shared bbox_str and cache_prefix so ESP and PRT reuse the same 5d firms cache
+                self.bbox_str = f"{b_min_lon:.1f},{b_min_lat:.1f},{b_max_lon:.1f},{b_max_lat:.1f}"
+                self.cache_prefix = f"BBOX_{b_min_lon:.1f}_{b_min_lat:.1f}_{b_max_lon:.1f}_{b_max_lat:.1f}"
+            else:
+                minx, miny, maxx, maxy = geom.bounds
+                self.bbox_str = f"{minx:.1f},{miny:.1f},{maxx:.1f},{maxy:.1f}"
+                self.cache_prefix = self.country_code
+
+            minx, miny, maxx, maxy = geom.bounds
+            self.geometry = geom
             self.lat_range = (miny, maxy)
             self.lon_range = (minx, maxx)
 
-            self._boundary_cache[self.country_code] = (
-                self.geometry,
-                self.bbox_str,
-                self.lat_range,
-                self.lon_range,
-            )
+            with self._cache_lock:
+                self._boundary_cache[cache_key] = (
+                    self.geometry,
+                    self.bbox_str,
+                    self.cache_prefix,
+                    self.lat_range,
+                    self.lon_range,
+                )
         except Exception as e:
             warnings.warn(f"error loading geojson for {self.country_code}: {e}. falling back to global bbox.")
 
@@ -114,20 +153,139 @@ class Date:
         ])
 
     # =========================================================================
-    # STAGE 1: EARLY POINT-LEVEL FILTERING (RAW ANOMALIES -> VERIFIED POINTS)
+    # FIRMS 5-DAY CHUNK DISK CACHE (NASA API MAX DAY_RANGE IS 5)
     # =========================================================================
+
+    def _get_chunk_lock(self, chunk_key: str) -> threading.Lock:
+        with self._cache_lock:
+            if chunk_key not in self._chunk_locks:
+                self._chunk_locks[chunk_key] = threading.Lock()
+            return self._chunk_locks[chunk_key]
+
+    def _fetch_5d_block(self, block_start: date, days_count: int) -> pd.DataFrame:
+        """fetch a single <=5-day firms block (nasa api max limit) and cache it on disk"""
+        FIRMS_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        start_str = block_start.strftime("%Y-%m-%d")
+        cache_file = FIRMS_CACHE_DIR / f"{self.cache_prefix}_{start_str}_{days_count}d.csv"
+        chunk_lock = self._get_chunk_lock(str(cache_file))
+
+        with chunk_lock:
+            if cache_file.exists():
+                try:
+                    return pd.read_csv(cache_file)
+                except pd.errors.EmptyDataError:
+                    return pd.DataFrame()
+                except Exception:
+                    pass
+
+            for attempt in range(2):
+                for key in self._get_api_keys():
+                    url = (
+                        f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
+                        f"{key}/VIIRS_SNPP_SP/{self.bbox_str}/{days_count}/{start_str}"
+                    )
+                    try:
+                        df_chunk = pd.read_csv(url)
+                        if "latitude" in df_chunk.columns:
+                            tmp_file = cache_file.with_suffix(f".{ threading.get_ident() }.tmp")
+                            df_chunk.to_csv(tmp_file, index=False)
+                            tmp_file.replace(cache_file)
+                            return df_chunk
+                    except Exception:
+                        continue
+                if attempt == 0:
+                    time.sleep(2.0)
+
+            print(f"failed to query firms api block {start_str} ({days_count}d) for {self.cache_prefix}")
+            return pd.DataFrame()
+
+    def _fetch_firms_range(self, start_date: date, end_date: date) -> pd.DataFrame:
+        """cover any [start_date, end_date] interval using deterministic 5-day cached blocks"""
+        blocks = []
+        curr = start_date
+        while curr <= end_date:
+            # align block start to deterministic 5-day calendar boundaries within each year
+            doy_zero = (curr - date(curr.year, 1, 1)).days
+            block_start = date(curr.year, 1, 1) + timedelta(days=(doy_zero // 5) * 5)
+            year_end = date(curr.year, 12, 31)
+            block_end = min(year_end, block_start + timedelta(days=4))
+            days_count = (block_end - block_start).days + 1
+
+            blocks.append((block_start, days_count))
+            curr = block_end + timedelta(days=1)
+
+        dfs = []
+        for b_start, b_days in blocks:
+            df_b = self._fetch_5d_block(b_start, b_days)
+            if not df_b.empty and "acq_date" in df_b.columns:
+                dfs.append(df_b)
+
+        if not dfs:
+            return pd.DataFrame()
+
+        combined = pd.concat(dfs, ignore_index=True)
+        s_str = start_date.strftime("%Y-%m-%d")
+        e_str = end_date.strftime("%Y-%m-%d")
+        mask = (combined["acq_date"] >= s_str) & (combined["acq_date"] <= e_str)
+        return combined[mask].reset_index(drop=True)
+
+    # =========================================================================
+    # STAGE 1: EARLY POINT-LEVEL FILTERING & POLYGON PRE-CHECK
+    # =========================================================================
+
+    def _land_filter(
+        self,
+        lats: np.ndarray,
+        lons: np.ndarray,
+        tile_km: float = 20.48,
+        min_land_fraction: float = 0.1,
+        grid: int = 7,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        keep candidates whose centre is on land; coastal tiles are allowed.
+        returns (mask, land_fraction) where land_fraction is the share of land
+        in a grid x grid sample over the tile footprint.
+        """
+        try:
+            from global_land_mask import globe
+        except ImportError:
+            warnings.warn("global-land-mask not installed; skipping land filter.")
+            return np.ones(len(lats), dtype=bool), np.full(len(lats), np.nan)
+
+        lats = np.asarray(lats, dtype=float)
+        lons = np.asarray(lons, dtype=float)
+
+        # centre must be on land
+        center_land = globe.is_land(lats, lons)
+
+        # land fraction over the tile footprint (approximate square sampling)
+        offs = np.linspace(-tile_km / 2, tile_km / 2, grid)
+        dy, dx = np.meshgrid(offs, offs, indexing="ij")
+        dy, dx = dy.ravel(), dx.ravel()  # km offsets, shape (grid*grid,)
+
+        s_lat = lats[:, None] + dy[None, :] / 111.0
+        cos_lat = np.cos(np.radians(lats))[:, None]
+        s_lon = lons[:, None] + dx[None, :] / (111.0 * cos_lat)
+        s_lat = np.clip(s_lat, -90.0, 90.0)
+
+        land_fraction = globe.is_land(s_lat, s_lon).mean(axis=1)
+
+        mask = center_land & (land_fraction >= min_land_fraction)
+        return mask, land_fraction
 
     def _get_industrial_tree(self) -> Optional[cKDTree]:
         """load and cache ckdtree of industrial/agricultural hotspots"""
         path = self.industrial_blacklist_path
         cache_key = str(path.resolve()) if path is not None else "none"
 
-        if cache_key in self._industrial_tree_cache:
-            return self._industrial_tree_cache[cache_key]
+        with self._cache_lock:
+            if cache_key in self._industrial_tree_cache:
+                return self._industrial_tree_cache[cache_key]
 
         if path is None or not Path(path).exists():
             warnings.warn(f"industrial blacklist not found at {path}. skipping filtering.")
-            self._industrial_tree_cache[cache_key] = None
+            with self._cache_lock:
+                self._industrial_tree_cache[cache_key] = None
             return None
 
         try:
@@ -138,7 +296,8 @@ class Date:
                 ind_gdf = gpd.read_file(path)
                 ind_df = pd.DataFrame({"latitude": ind_gdf.geometry.y, "longitude": ind_gdf.geometry.x})
             else:
-                self._industrial_tree_cache[cache_key] = None
+                with self._cache_lock:
+                    self._industrial_tree_cache[cache_key] = None
                 return None
 
             lat_col = "latitude" if "latitude" in ind_df.columns else "lat"
@@ -146,60 +305,20 @@ class Date:
             ind_df = ind_df.dropna(subset=[lat_col, lon_col])
 
             if ind_df.empty:
-                self._industrial_tree_cache[cache_key] = None
+                with self._cache_lock:
+                    self._industrial_tree_cache[cache_key] = None
                 return None
 
             ind_xyz = self._get_xyz(ind_df[lat_col].values, ind_df[lon_col].values)
             tree = cKDTree(ind_xyz)
-            self._industrial_tree_cache[cache_key] = tree
+            with self._cache_lock:
+                self._industrial_tree_cache[cache_key] = tree
             return tree
         except Exception as e:
             warnings.warn(f"error loading industrial hotspots: {e}")
-            self._industrial_tree_cache[cache_key] = None
+            with self._cache_lock:
+                self._industrial_tree_cache[cache_key] = None
             return None
-
-    def _filter_df_by_country_and_blacklist(
-        self,
-        df: pd.DataFrame,
-        industrial_radius_km: float = 2.0,
-        verify_industrial: bool = True,
-        verbose: bool = True,
-    ) -> pd.DataFrame:
-        """early filtering: drop low-confidence sensor noise, out-of-country points, and industrial zones"""
-        if df.empty:
-            return df
-
-        # 1. drop low confidence satellite detections if column exists
-        if "confidence" in df.columns:
-            conf_str = df["confidence"].astype(str).str.lower()
-            df = df[conf_str != "l"].reset_index(drop=True)
-            if df.empty:
-                return df
-
-        # 2. vectorized point-in-country check
-        if self.geometry is not None:
-            pts = gpd.points_from_xy(df["longitude"], df["latitude"])
-            mask = pts.within(self.geometry)
-            df = df[mask].reset_index(drop=True)
-            if df.empty:
-                return df
-
-        # 3. industrial and agricultural blacklist check
-        if verify_industrial:
-            tree = self._get_industrial_tree()
-            if tree is not None:
-                pts_xyz = self._get_xyz(df["latitude"].values, df["longitude"].values)
-                chord_dist = 2.0 * np.sin(industrial_radius_km / (2.0 * 6371.0))
-                matches = tree.query_ball_point(pts_xyz, r=chord_dist)
-                clean_mask = np.array([len(m) == 0 for m in matches], dtype=bool)
-
-                dropped_count = len(df) - int(clean_mask.sum())
-                if verbose and dropped_count > 0:
-                    print(f"  [early filter] dropped {dropped_count} points near industrial/agro sources (< {industrial_radius_km} km)")
-
-                df = df[clean_mask].reset_index(drop=True)
-
-        return df
 
     def _resolve_globfire_file(self) -> Optional[Path]:
         """find the burned area vector file matching the target year"""
@@ -229,6 +348,104 @@ class Date:
         warnings.warn(f"no burned area file specifically for year {target_year} in {path}. skipping verification.")
         return None
 
+    def _load_year_burned_polygons(self) -> Optional[gpd.GeoDataFrame]:
+        """load and cache the entire year's burned area polygons in memory"""
+        vector_file = self._resolve_globfire_file()
+        if vector_file is None:
+            return None
+
+        cache_key = str(vector_file.resolve())
+        with self._cache_lock:
+            if cache_key in self._globfire_gdf_cache:
+                return self._globfire_gdf_cache[cache_key]
+
+        try:
+            gdf = gpd.read_file(vector_file)
+            if not gdf.empty:
+                gdf = gdf.to_crs("EPSG:4326")
+                cols_lower = {c.lower(): c for c in gdf.columns}
+                init_col = next((cols_lower[k] for k in cols_lower if "init" in k or "start" in k or "firedate" in k), None)
+                end_col = next((cols_lower[k] for k in cols_lower if "fin" in k or "end" in k or "last" in k), None)
+
+                if init_col and end_col:
+                    gdf["_init_dt"] = pd.to_datetime(gdf[init_col], errors="coerce")
+                    gdf["_end_dt"] = pd.to_datetime(gdf[end_col], errors="coerce")
+
+            with self._cache_lock:
+                self._globfire_gdf_cache[cache_key] = gdf
+            return gdf
+        except Exception as e:
+            warnings.warn(f"error reading burned area file {vector_file}: {e}")
+            return None
+
+    def _get_active_burned_polygons(self, tolerance_days: int = 3) -> Optional[gpd.GeoDataFrame]:
+        """return burned area polygons active on self.fire_date within the country geometry"""
+        gdf_year = self._load_year_burned_polygons()
+        if gdf_year is None:
+            return None
+        if gdf_year.empty:
+            return gdf_year
+
+        gdf_sub = gdf_year
+        if "_init_dt" in gdf_sub.columns and "_end_dt" in gdf_sub.columns:
+            target_dt = pd.to_datetime(self.fire_date)
+            t_min = target_dt - pd.Timedelta(days=tolerance_days)
+            t_max = target_dt + pd.Timedelta(days=tolerance_days)
+            time_mask = (gdf_sub["_init_dt"] <= t_max) & (gdf_sub["_end_dt"] >= t_min)
+            gdf_sub = gdf_sub[time_mask]
+
+        if gdf_sub.empty:
+            return gdf_sub
+
+        min_lat, max_lat = self.lat_range[0] - 0.05, self.lat_range[1] + 0.05
+        min_lon, max_lon = self.lon_range[0] - 0.05, self.lon_range[1] + 0.05
+        gdf_sub = gdf_sub.cx[min_lon:max_lon, min_lat:max_lat]
+
+        if not gdf_sub.empty and self.geometry is not None:
+            gdf_sub = gdf_sub[gdf_sub.geometry.intersects(self.geometry)]
+
+        return gdf_sub
+
+    def _filter_df_by_country_and_blacklist(
+        self,
+        df: pd.DataFrame,
+        industrial_radius_km: float = 2.0,
+        verify_industrial: bool = True,
+        verbose: bool = True,
+    ) -> pd.DataFrame:
+        """early filtering: drop low-confidence sensor noise, out-of-country points, and industrial zones"""
+        if df.empty:
+            return df
+
+        if "confidence" in df.columns:
+            conf_str = df["confidence"].astype(str).str.lower()
+            df = df[conf_str != "l"].reset_index(drop=True)
+            if df.empty:
+                return df
+
+        if self.geometry is not None:
+            pts = gpd.points_from_xy(df["longitude"], df["latitude"])
+            mask = pts.within(self.geometry)
+            df = df[mask].reset_index(drop=True)
+            if df.empty:
+                return df
+
+        if verify_industrial:
+            tree = self._get_industrial_tree()
+            if tree is not None:
+                pts_xyz = self._get_xyz(df["latitude"].values, df["longitude"].values)
+                chord_dist = 2.0 * np.sin(industrial_radius_km / (2.0 * 6371.0))
+                matches = tree.query_ball_point(pts_xyz, r=chord_dist)
+                clean_mask = np.array([len(m) == 0 for m in matches], dtype=bool)
+
+                dropped_count = len(df) - int(clean_mask.sum())
+                if verbose and dropped_count > 0:
+                    print(f"  [early filter] dropped {dropped_count} points near industrial/agro sources (< {industrial_radius_km} km)")
+
+                df = df[clean_mask].reset_index(drop=True)
+
+        return df
+
     def _verify_df_against_burned_areas(
         self,
         df: pd.DataFrame,
@@ -239,43 +456,14 @@ class Date:
         if df.empty:
             return df
 
-        vector_file = self._resolve_globfire_file()
-        if vector_file is None:
+        gdf_burned = self._get_active_burned_polygons(tolerance_days=tolerance_days)
+        if gdf_burned is None:
             return df
 
+        if gdf_burned.empty:
+            return df.iloc[0:0].copy()
+
         try:
-            min_lat, max_lat = df["latitude"].min() - 0.1, df["latitude"].max() + 0.1
-            min_lon, max_lon = df["longitude"].min() - 0.1, df["longitude"].max() + 0.1
-
-            try:
-                gdf_burned = gpd.read_file(vector_file, bbox=(min_lon, min_lat, max_lon, max_lat))
-            except Exception:
-                gdf_burned = gpd.read_file(vector_file)
-
-            if gdf_burned.empty:
-                print(f"  [early filter] no burned area polygons in bbox for {self.fire_date}. dropping all {len(df)} points.")
-                return df.iloc[0:0].copy()
-
-            gdf_burned = gdf_burned.to_crs("EPSG:4326")
-
-            cols_lower = {c.lower(): c for c in gdf_burned.columns}
-            init_col = next((cols_lower[k] for k in cols_lower if "init" in k or "start" in k or "firedate" in k), None)
-            end_col = next((cols_lower[k] for k in cols_lower if "fin" in k or "end" in k or "last" in k), None)
-
-            if init_col and end_col:
-                target_dt = pd.to_datetime(self.fire_date)
-                init_dates = pd.to_datetime(gdf_burned[init_col], errors="coerce")
-                end_dates = pd.to_datetime(gdf_burned[end_col], errors="coerce")
-
-                t_min = target_dt - pd.Timedelta(days=tolerance_days)
-                t_max = target_dt + pd.Timedelta(days=tolerance_days)
-                time_mask = (init_dates <= t_max) & (end_dates >= t_min)
-                gdf_burned = gdf_burned[time_mask]
-
-                if gdf_burned.empty:
-                    print(f"  [early filter] no matching burned area events for {self.fire_date}. dropping all points.")
-                    return df.iloc[0:0].copy()
-
             gdf_points = gpd.GeoDataFrame(
                 df.copy(),
                 geometry=gpd.points_from_xy(df["longitude"], df["latitude"]),
@@ -338,23 +526,22 @@ class Date:
         verify_industrial: bool = True,
         verify_globfire: bool = True,
     ):
-        """fetch active thermal anomalies from firms api and immediately pre-filter raw points"""
+        """
+        check if local effis polygons exist for this date first;
+        if yes, load/fetch 5-day cached firms block and pre-filter points.
+        """
         self._points_prefiltered = False
-        fetched = False
 
-        for key in self._get_api_keys():
-            url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/VIIRS_SNPP_SP/{self.bbox_str}/1/{self.fire_date}"
-            try:
-                df = pd.read_csv(url)
-                if not df.empty and "latitude" in df.columns:
-                    self.df_area = df
-                    fetched = True
-                    break
-            except Exception:
-                continue
+        # polygon-first pre-check: skip nasa firms api completely if effis has 0 active fires in country
+        if early_filter and verify_globfire:
+            active_polys = self._get_active_burned_polygons(tolerance_days=globfire_tolerance_days)
+            if active_polys is not None and active_polys.empty:
+                self.df_area = pd.DataFrame()
+                self._points_prefiltered = True
+                return
 
-        if not fetched:
-            print(f"failed to query firms api for {self.fire_date}")
+        self.df_area = self._fetch_firms_range(self.fire_date_obj, self.fire_date_obj)
+        if self.df_area.empty:
             return
 
         if early_filter:
@@ -372,37 +559,18 @@ class Date:
         industrial_radius_km: float = 2.0,
         verify_industrial: bool = True,
     ) -> pd.DataFrame:
-        """fetch +/- buffer_days window and clean out industrial hotspots so flares do not poison lookback"""
+        """fetch +/- buffer_days window using 5-day cached blocks and clean out industrial hotspots"""
         if not self.df_window_fires.empty:
             return self.df_window_fires
 
         start_date = self.fire_date_obj - timedelta(days=buffer_days)
         end_date = self.fire_date_obj + timedelta(days=buffer_days)
 
-        dfs = []
-        curr_date = start_date
-
-        while curr_date <= end_date:
-            days_to_fetch = min(5, (end_date - curr_date).days + 1)
-            date_str = curr_date.strftime("%Y-%m-%d")
-
-            for key in self._get_api_keys():
-                url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/VIIRS_SNPP_SP/{self.bbox_str}/{days_to_fetch}/{date_str}"
-                try:
-                    df_chunk = pd.read_csv(url)
-                    if not df_chunk.empty and "latitude" in df_chunk.columns:
-                        dfs.append(df_chunk)
-                        break
-                except Exception:
-                    continue
-
-            curr_date += timedelta(days=days_to_fetch)
-
-        if not dfs:
+        raw_window = self._fetch_firms_range(start_date, end_date)
+        if raw_window.empty:
             self.df_window_fires = pd.DataFrame()
             return self.df_window_fires
 
-        raw_window = pd.concat(dfs, ignore_index=True)
         self.df_window_fires = self._filter_df_by_country_and_blacklist(
             raw_window,
             industrial_radius_km=industrial_radius_km,
@@ -415,20 +583,18 @@ class Date:
     # STAGE 2: CENTROID AGGREGATION & FIRE-LEVEL FILTERING (LOOKBACK)
     # =========================================================================
 
-    def _aggregate_to_centroids(self, cluster_radius_km: float = 3.0) -> pd.DataFrame:
-        """merge nearby verified fire pixels belonging to the same fire into a single centroid"""
+    def _aggregate_to_centroids(self, cluster_radius_km: float = 15.0) -> pd.DataFrame:
+        """merge nearby verified fire pixels belonging to the same fire complex into a single centroid"""
         if self.df_area.empty:
             return pd.DataFrame()
 
         eps_rad = cluster_radius_km / 6371.0
         coords_rad = np.radians(self.df_area[["latitude", "longitude"]].values)
 
-        # min_samples=1 ensures every isolated point or group forms a valid cluster
         dbscan = DBSCAN(eps=eps_rad, metric="haversine", min_samples=1)
         df_clustered = self.df_area.copy()
         df_clustered["cluster_id"] = dbscan.fit_predict(coords_rad)
 
-        # compute geometric centroid (mean lat/lon), earliest detection time, and peak intensity
         centroids = (
             df_clustered.groupby("cluster_id", as_index=False)
             .agg(
@@ -459,7 +625,7 @@ class Date:
 
     def filter_fires(
         self,
-        cluster_radius_km: float = 3.0,
+        cluster_radius_km: float = 15.0,
         epsilon: Optional[float] = None,
         lookback_days: int = 15,
         ignition_radius_km: float = 20.0,
@@ -472,13 +638,12 @@ class Date:
     ):
         """
         stage 1: ensure raw points are filtered (country, blacklist, burned area).
-        stage 2: merge pixels of the same fire into centroids.
+        stage 2: merge pixels of the same fire into centroids (15 km default).
         stage 3: filter out ongoing fires using 15-day lookback window.
         """
         if self.df_area.empty:
             return
 
-        # 1. ensure early point-level filtering was executed
         if not self._points_prefiltered:
             self.prefilter_points(
                 industrial_radius_km=industrial_radius_km,
@@ -491,8 +656,6 @@ class Date:
         if self.df_area.empty:
             return
 
-        # 2. merge nearby points into fire centroids
-        # (if legacy epsilon in radians is passed and small, convert it; otherwise use cluster_radius_km)
         effective_radius_km = cluster_radius_km
         if epsilon is not None and epsilon < 0.005:
             effective_radius_km = epsilon * 6371.0
@@ -502,7 +665,6 @@ class Date:
         if self.df_area_filtered.empty:
             return
 
-        # 3. vectorized lookback filter: retain only fresh ignitions (no fires within ignition_radius_km in past 15 days)
         df_window_fires = self._fetch_window_fires(
             buffer_days=lookback_days,
             industrial_radius_km=industrial_radius_km,
@@ -528,7 +690,6 @@ class Date:
         if self.df_area_filtered.empty:
             return
 
-        # 4. optional daily subsampling (disabled by default so spatial_gate.py gets the full dataset)
         if max_fires_per_bin is not None:
             if len(self.df_area_filtered) > max_fires_per_bin and self.df_area_filtered["frp"].nunique() > 1:
                 self.df_area_filtered["frp_bin"] = pd.qcut(
@@ -595,6 +756,12 @@ class Date:
                 pts = gpd.points_from_xy(cand_lons, cand_lats)
                 mask_country = pts.within(self.geometry)
                 cand_lats, cand_lons = cand_lats[mask_country], cand_lons[mask_country]
+
+            if len(cand_lats) == 0:
+                continue
+
+            land_mask, _ = self._land_filter(cand_lats, cand_lons)
+            cand_lats, cand_lons = cand_lats[land_mask], cand_lons[land_mask]
 
             if len(cand_lats) == 0:
                 continue
@@ -691,6 +858,12 @@ class Date:
             if len(rand_lat) == 0:
                 continue
 
+            land_mask, _ = self._land_filter(rand_lat, rand_lon)
+            rand_lat, rand_lon = rand_lat[land_mask], rand_lon[land_mask]
+
+            if len(rand_lat) == 0:
+                continue
+
             if ind_tree is not None:
                 cand_xyz = self._get_xyz(rand_lat, rand_lon)
                 matches = ind_tree.query_ball_point(cand_xyz, r=ind_chord)
@@ -772,13 +945,3 @@ class Date:
         plt.grid(True, linestyle=":", alpha=0.4)
         plt.tight_layout()
         plt.show()
-
-
-if __name__ == "__main__":
-    test_date = date(2023, 7, 15)
-    date_obj = Date(test_date, country_code="ESP")
-    date_obj.generate_fires()
-    date_obj.filter_fires(cluster_radius_km=3.0)
-    date_obj.generate_hard_negatives()
-    date_obj.generate_random_negatives(n_points=5, direction_north=1.0, direction_east=0.3, intensity=0.8)
-    print(date_obj.get_combined_dataset())
