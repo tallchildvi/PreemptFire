@@ -19,8 +19,8 @@ class PatchExtractor:
         # spatial accessibility and proximity features
         "Travel_Time_Roads", "Travel_Time_Trails",
         "Dist_to_Railways", "Dist_to_Camps", "Dist_to_Powerlines",
-        # socio-economic and soil moisture features
-        "Nightlight_Potential", "Population_Potential", "Soil_Moisture",
+        # socio-economic features moved to 1D context vector
+        "Soil_Moisture",
         # optical quality masks
         "MASK_WATER", "MASK_SNOW", "MASK_CLOUDS", "MASK_CLOUD_SHADOWS",
         # modality validity indicator
@@ -50,17 +50,14 @@ class PatchExtractor:
 
             h_full, w_full = loss_mask.shape
 
-            # 1. Чесна попіксельна маска валідності Sentinel-1
             sar_vv = rasters_2d.get("SAR_VV")
             if sar_vv is not None and isinstance(sar_vv, np.ndarray):
-                # Валідними є лише скінченні пікселі з реальним фізичним сигналом > 0
                 sar_valid_mask = (np.isfinite(sar_vv) & (sar_vv > 0.0)).astype(np.float32)
                 has_sar_scene = bool(sar_valid_mask.max() > 0.0)
             else:
                 sar_valid_mask = np.zeros((h_full, w_full), dtype=np.float32)
                 has_sar_scene = False
 
-            # 2. Збірка 2D-тензора за канонічною схемою
             canonical_rasters = []
             for ch in self.CANONICAL_2D_CHANNELS:
                 if ch == "MASK_SAR_VALID":
@@ -84,7 +81,6 @@ class PatchExtractor:
 
                     patch_loss_mask = loss_mask[row_slice, col_slice]
 
-                    # Фільтр дефектів оптики (хмари, тіні, порожні краї)
                     invalid_ratio = float((patch_loss_mask > 0.5).mean())
                     if invalid_ratio > self.max_invalid_ratio:
                         continue
@@ -93,8 +89,6 @@ class PatchExtractor:
                     patch_target = target[:, row_slice, col_slice]
                     patch_sar_mask = sar_valid_mask[row_slice, col_slice]
 
-                    # 3. Чесний локальний вектор присутності для конкретного патча
-                    # Якщо хоча б 50% площі патча покрито радаром - вважаємо модальність доступною
                     patch_has_sar = float(patch_sar_mask.mean() >= 0.50)
 
                     validity_flags = []
@@ -135,4 +129,4 @@ class PatchExtractor:
                         "context_names_1d": sorted_context_keys,
                     }
 
-                    patch_idx += 1
+                    patch_idx += 1 

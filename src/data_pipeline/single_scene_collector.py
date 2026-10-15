@@ -1,14 +1,12 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import time
-from typing import Any, Dict, List, Optional, Tuple
-import matplotlib.pyplot as plt
+from typing import Any, Dict, Optional
 import numpy as np
 
 from src.data_pipeline.cffdrs_fetcher import CFFDRSFetcher
 from src.data_pipeline.era5_fetcher import ERA5Fetcher
 from src.data_pipeline.index_calculator import IndexCalculator
-from src.data_pipeline.nightlight_fetcher import NightlightFetcher
 from src.data_pipeline.osm_dem_fetcher import SpatialFeatureFetcher
 from src.data_pipeline.population_fetcher import PopulationFetcher
 from src.data_pipeline.sentinel_fetcher import SentinelFetcher
@@ -25,7 +23,6 @@ class SingleSceneCollector:
         self.sentinel_fetcher = SentinelFetcher()
         self.index_calc = IndexCalculator()
         self.spatial_fetcher = SpatialFeatureFetcher(osm_mode=osm_mode)
-        self.nightlight_fetcher = NightlightFetcher()
         self.population_fetcher = PopulationFetcher()
         self.era5_fetcher = ERA5Fetcher()
         self.weather_fetcher = WeatherFetcher()
@@ -74,20 +71,12 @@ class SingleSceneCollector:
             timings["dem_osm_fetch"] = time.perf_counter() - t0
             return res
 
-        def _fetch_nightlight():
+        def _fetch_population_1d():
             t0 = time.perf_counter()
-            res = self.nightlight_fetcher.fetch_nightlight_potential(
-                grid_info=grid_info, year=target_year
+            res = self.population_fetcher.fetch_population_1d(
+                lat=lat, lon=lon, year=min(target_year, 2020)
             )
-            timings["nightlight_gee"] = time.perf_counter() - t0
-            return res
-
-        def _fetch_population():
-            t0 = time.perf_counter()
-            res = self.population_fetcher.fetch_population(
-                grid_info=grid_info, year=min(target_year, 2020)
-            )
-            timings["population_gee"] = time.perf_counter() - t0
+            timings["population_gee_1d"] = time.perf_counter() - t0
             return res
 
         def _fetch_soil():
@@ -114,17 +103,15 @@ class SingleSceneCollector:
             timings["weather_t0"] = time.perf_counter() - t0
             return res
 
-        with ThreadPoolExecutor(max_workers=6) as pool:
+        with ThreadPoolExecutor(max_workers=5) as pool:
             f_spatial = pool.submit(_fetch_dem_osm)
-            f_nightlight = pool.submit(_fetch_nightlight)
-            f_population = pool.submit(_fetch_population)
+            f_population = pool.submit(_fetch_population_1d)
             f_soil = pool.submit(_fetch_soil)
             f_cffdrs = pool.submit(_fetch_cffdrs)
             f_weather = pool.submit(_fetch_weather_t0)
 
             spatial_features = f_spatial.result()
-            nightlight_potential = f_nightlight.result()
-            pop_potential = f_population.result()
+            pop_context_1d = f_population.result()
             soil_moisture = f_soil.result()
             cffdrs_metrics = f_cffdrs.result()
             weather_t0 = f_weather.result()
@@ -180,8 +167,6 @@ class SingleSceneCollector:
             **sar_bands,
             **clean_indices,
             **spatial_features,
-            "Nightlight_Potential": nightlight_potential,
-            "Population_Potential": pop_potential,
             "Soil_Moisture": soil_moisture,
             "MASK_WATER": masks_t0.get("MASK_WATER", np.zeros(grid_info["shape"], dtype=np.uint8)),
             "MASK_SNOW": masks_t0.get("MASK_SNOW", np.zeros(grid_info["shape"], dtype=np.uint8)),
@@ -192,10 +177,12 @@ class SingleSceneCollector:
             k: v for k, v in raw_rasters.items() if isinstance(v, np.ndarray) and v.ndim == 2
         }
 
+        # attach population to 1d context vector
         context_1d = {
             **weather_t0,
             **tri_intervals,
             **cffdrs_metrics,
+            **pop_context_1d,
         }
 
         return {
