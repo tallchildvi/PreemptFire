@@ -516,7 +516,7 @@ class Date:
     # STAGE 2: CENTROID AGGREGATION & FIRE-LEVEL FILTERING (LOOKBACK)
     # =========================================================================
 
-    def _aggregate_to_centroids(self, cluster_radius_km: float = 3.0) -> pd.DataFrame:
+    def _aggregate_to_centroids(self, cluster_radius_km: float = 15.0) -> pd.DataFrame:
         """merge nearby verified fire pixels belonging to the same fire into a single centroid"""
         if self.df_area.empty:
             return pd.DataFrame()
