@@ -150,8 +150,6 @@ class WeatherFetcher:
             "target_rh_mean": float(np.nanmean(h_rh)),
             "target_vpd_max": float(np.nanmax(vpd)),
             "target_vpd_mean": float(np.nanmean(vpd)),
-            "target_c_haines_max": c_haines_max,
-            "target_c_haines_mean": c_haines_mean,
             "target_wind_speed_max": float(np.nanmax(h_wind)),
             "target_wind_direction_mean": float(np.nanmean(h_wdir)),
             "target_surface_pressure_mean": float(np.nanmean(h_press)),
