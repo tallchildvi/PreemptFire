@@ -140,10 +140,11 @@ class SentinelFetcher:
         max_cloud_cover: float = 60.0,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], str]:
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-        start_dt = target_dt - timedelta(days=lookback_days)
+        end_dt = target_dt - timedelta(days=1)
+        start_dt = end_dt - timedelta(days=lookback_days)
 
         bbox = grid_info["bbox_wgs84"]
-        date_range = f"{start_dt.strftime('%Y-%m-%d')}/{target_dt.strftime('%Y-%m-%d')}"
+        date_range = f"{start_dt.strftime('%Y-%m-%d')}/{end_dt.strftime('%Y-%m-%d')}"
 
         try:
             search = self.stac_client.search(
@@ -270,7 +271,7 @@ class SentinelFetcher:
         tprev_probe = (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=25)).strftime("%Y-%m-%d")
 
         with ThreadPoolExecutor(max_workers=3) as pool:
-            f_t0    = pool.submit(self.fetch_sentinel2_scene, grid_info, target_date, 15)
+            f_t0    = pool.submit(self.fetch_sentinel2_scene, grid_info, target_date, 25)
             f_tprev = pool.submit(self.fetch_sentinel2_scene, grid_info, tprev_probe, 30)
             f_sar   = pool.submit(self.fetch_sentinel1_sar, grid_info, target_date, 30)
 
