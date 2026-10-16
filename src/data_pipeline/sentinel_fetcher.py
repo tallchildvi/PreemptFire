@@ -140,11 +140,10 @@ class SentinelFetcher:
         max_cloud_cover: float = 60.0,
     ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], str]:
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-        end_dt = target_dt - timedelta(days=1)
-        start_dt = end_dt - timedelta(days=lookback_days)
+        start_dt = target_dt - timedelta(days=lookback_days)
 
         bbox = grid_info["bbox_wgs84"]
-        date_range = f"{start_dt.strftime('%Y-%m-%d')}/{end_dt.strftime('%Y-%m-%d')}"
+        date_range = f"{start_dt.strftime('%Y-%m-%d')}/{target_dt.strftime('%Y-%m-%d')}"
 
         try:
             search = self.stac_client.search(
@@ -156,7 +155,6 @@ class SentinelFetcher:
             )
             items = list(search.items())
         except Exception as e:
-            print(f"  [S2] STAC search failed ({e}).")
             return {}, {}, ""
 
         if not items:
@@ -178,13 +176,7 @@ class SentinelFetcher:
 
             nodata_ratio = float((mosaicked_scl == 0).mean())
             if nodata_ratio > self.max_nodata_fraction:
-                print(
-                    f"  [Skip] date {candidate_date} ({len(date_items)} tiles) rejected: "
-                    f"NoData {nodata_ratio * 100:.1f}% (> {self.max_nodata_fraction * 100:.0f}%)"
-                )
                 continue
-
-            print(f"  [S2] selected date {candidate_date} mosaicking {len(date_items)} tile(s) (NoData: {nodata_ratio * 100:.1f}%)")
 
             aligned_bands: Dict[str, np.ndarray] = {}
             remaining_bands = [b for b in self.OPTICAL_BANDS if b != "SCL"]
@@ -199,38 +191,29 @@ class SentinelFetcher:
                         b_name, b_arr = future.result()
                         if b_arr is not None:
                             aligned_bands[b_name] = b_arr
-                    except Exception as e:
-                        band = future_map[future]
-                        print(f"  [Warning] thread exception for band {band}: {e}")
+                    except Exception:
+                        continue
 
             aligned_bands["SCL"] = mosaicked_scl
             masks = self.extract_scl_masks(mosaicked_scl)
             return aligned_bands, masks, candidate_date
 
-        print(f"  [Error] no date found with combined NoData < {self.max_nodata_fraction * 100:.0f}%.")
         return {}, {}, ""
 
     def fetch_sentinel1_sar(
         self, grid_info: Dict, target_date_str: str, lookback_days: int = 30
     ) -> Dict[str, np.ndarray]:
-        """
-        fetches the most recent pre-fire sentinel-1 rtc sar pair strictly before target_date
-        to prevent target leakage (post-fire burn scar detection).
-        """
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-        
-        end_dt = target_dt - timedelta(days=1)
-        start_dt = end_dt - timedelta(days=lookback_days)
+        start_dt = target_dt - timedelta(days=lookback_days)
 
         try:
             search = self.stac_client.search(
                 collections=["sentinel-1-rtc"],
                 bbox=grid_info["bbox_wgs84"],
-                datetime=f"{start_dt.strftime('%Y-%m-%d')}/{end_dt.strftime('%Y-%m-%d')}",
+                datetime=f"{start_dt.strftime('%Y-%m-%d')}/{target_dt.strftime('%Y-%m-%d')}",
             )
             items = list(search.items())
         except Exception as e:
-            print(f"  [S1] STAC search failed ({e}).")
             return {}
 
         if not items:
@@ -261,25 +244,31 @@ class SentinelFetcher:
             if len(sar_bands) == 2:
                 return sar_bands
 
-        print("  [S1] no complete mosaicked VV+VH pair found prior to target date.")
         return {}
 
-    
     def fetch_all_radar_optical(self, lat: float, lon: float, target_date: str) -> Dict[str, Any]:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
 
-        tprev_probe = (datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=25)).strftime("%Y-%m-%d")
+        pre_fire_dt = datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=1)
+        pre_fire_date = pre_fire_dt.strftime("%Y-%m-%d")
 
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            f_t0    = pool.submit(self.fetch_sentinel2_scene, grid_info, target_date, 25)
+        bands_t0, masks_t0, t0_date = self.fetch_sentinel2_scene(
+            grid_info, pre_fire_date, lookback_days=25
+        )
+        if not bands_t0 or not t0_date:
+            return {}
+
+        t0_dt = datetime.strptime(t0_date, "%Y-%m-%d")
+        tprev_probe = (t0_dt - timedelta(days=12)).strftime("%Y-%m-%d")
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
             f_tprev = pool.submit(self.fetch_sentinel2_scene, grid_info, tprev_probe, 30)
-            f_sar   = pool.submit(self.fetch_sentinel1_sar, grid_info, target_date, 30)
+            f_sar = pool.submit(self.fetch_sentinel1_sar, grid_info, pre_fire_date, 30)
 
-            bands_t0, masks_t0, t0_date          = f_t0.result()
             bands_tprev, masks_tprev, tprev_date = f_tprev.result()
-            sar_bands                             = f_sar.result()
+            sar_bands = f_sar.result()
 
-        if not bands_t0:
+        if not bands_tprev or not tprev_date or tprev_date >= t0_date:
             return {}
 
         return {
@@ -292,7 +281,6 @@ class SentinelFetcher:
             "masks_tprev": masks_tprev,
             "sar_bands": sar_bands,
         }
-
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt

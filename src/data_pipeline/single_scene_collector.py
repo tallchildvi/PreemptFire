@@ -43,6 +43,9 @@ class SingleSceneCollector:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
         target_year = datetime.strptime(target_date, "%Y-%m-%d").year
 
+        pre_fire_dt = datetime.strptime(target_date, "%Y-%m-%d") - timedelta(days=1)
+        pre_fire_date = pre_fire_dt.strftime("%Y-%m-%d")
+
         t_s2 = time.perf_counter()
         sentinel_data = self.sentinel_fetcher.fetch_all_radar_optical(lat, lon, target_date)
         timings["sentinel_fetch"] = time.perf_counter() - t_s2
@@ -83,7 +86,7 @@ class SingleSceneCollector:
         def _fetch_soil():
             t0 = time.perf_counter()
             res = self.era5_fetcher.fetch_soil_moisture(
-                grid_info=grid_info, target_date=target_date
+                grid_info=grid_info, target_date=pre_fire_date
             )
             timings["soil_moisture_gee"] = time.perf_counter() - t0
             return res
@@ -91,7 +94,7 @@ class SingleSceneCollector:
         def _fetch_cffdrs():
             t0 = time.perf_counter()
             res = self.cffdrs_fetcher.fetch_cffdrs_metrics(
-                lat=lat, lon=lon, date_t0=target_date
+                lat=lat, lon=lon, date_t0=pre_fire_date
             )
             timings["cffdrs_calc"] = time.perf_counter() - t0
             return res
@@ -99,7 +102,7 @@ class SingleSceneCollector:
         def _fetch_weather_t0():
             t0 = time.perf_counter()
             res = self.weather_fetcher.fetch_target_day_metrics(
-                lat=lat, lon=lon, target_date=target_date
+                lat=lat, lon=lon, target_date=pre_fire_date
             )
             timings["weather_t0"] = time.perf_counter() - t0
             return res
@@ -119,7 +122,7 @@ class SingleSceneCollector:
 
         t_tri = time.perf_counter()
         tri_intervals = self.weather_fetcher.fetch_tri_interval_metrics(
-            lat=lat, lon=lon, target_date=target_date, t0_date=t0_date, tprev_date=tprev_date
+            lat=lat, lon=lon, target_date=pre_fire_date, t0_date=t0_date, tprev_date=tprev_date
         )
         timings["weather_tri_intervals"] = time.perf_counter() - t_tri
 
@@ -157,7 +160,7 @@ class SingleSceneCollector:
         )
         snow_mask = masks_t0.get("MASK_SNOW", np.zeros(grid_info["shape"], dtype=np.float32))
         loss_mask = np.where(snow_mask > 0.5, 0.0, raw_invalid).astype(np.float32)
-        
+
         timings["target_builder"] = time.perf_counter() - t_tgt
 
         total_elapsed = time.perf_counter() - total_start
@@ -178,7 +181,6 @@ class SingleSceneCollector:
             k: v for k, v in raw_rasters.items() if isinstance(v, np.ndarray) and v.ndim == 2
         }
 
-        # attach population to 1d context vector
         context_1d = {
             **weather_t0,
             **tri_intervals,
@@ -191,6 +193,7 @@ class SingleSceneCollector:
                 "lat": lat,
                 "lon": lon,
                 "target_date": target_date,
+                "pre_fire_date": pre_fire_date,
                 "t0_date": t0_date,
                 "tprev_date": tprev_date,
                 "is_fire": int(is_fire),
@@ -204,7 +207,6 @@ class SingleSceneCollector:
             "loss_mask": loss_mask,
             "target": target_tensor,
         }
-
 if __name__ == "__main__":
     from src.data_pipeline.patch_extractor import PatchExtractor
 
