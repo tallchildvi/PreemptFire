@@ -210,11 +210,16 @@ class SentinelFetcher:
         return {}, {}, ""
 
     def fetch_sentinel1_sar(
-        self, grid_info: Dict, target_date_str: str, window_days: int = 20
+        self, grid_info: Dict, target_date_str: str, lookback_days: int = 30
     ) -> Dict[str, np.ndarray]:
+        """
+        fetches the most recent pre-fire sentinel-1 rtc sar pair strictly before target_date
+        to prevent target leakage (post-fire burn scar detection).
+        """
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-        start_dt = target_dt - timedelta(days=window_days)
-        end_dt = target_dt + timedelta(days=window_days)
+        
+        end_dt = target_dt - timedelta(days=1)
+        start_dt = end_dt - timedelta(days=lookback_days)
 
         try:
             search = self.stac_client.search(
@@ -235,10 +240,7 @@ class SentinelFetcher:
             d_str = item.datetime.strftime("%Y-%m-%d")
             items_by_date[d_str].append(item)
 
-        sorted_dates = sorted(
-            items_by_date.keys(),
-            key=lambda d: abs((datetime.strptime(d, "%Y-%m-%d") - target_dt).days),
-        )
+        sorted_dates = sorted(items_by_date.keys(), reverse=True)
 
         for d_str in sorted_dates:
             date_items = items_by_date[d_str]
@@ -258,9 +260,10 @@ class SentinelFetcher:
             if len(sar_bands) == 2:
                 return sar_bands
 
-        print("  [S1] no complete mosaicked VV+VH pair found in search window.")
+        print("  [S1] no complete mosaicked VV+VH pair found prior to target date.")
         return {}
 
+    
     def fetch_all_radar_optical(self, lat: float, lon: float, target_date: str) -> Dict[str, Any]:
         grid_info = self.aligner.get_master_grid_info(lat, lon)
 
@@ -269,7 +272,7 @@ class SentinelFetcher:
         with ThreadPoolExecutor(max_workers=3) as pool:
             f_t0    = pool.submit(self.fetch_sentinel2_scene, grid_info, target_date, 15)
             f_tprev = pool.submit(self.fetch_sentinel2_scene, grid_info, tprev_probe, 30)
-            f_sar   = pool.submit(self.fetch_sentinel1_sar, grid_info, target_date)
+            f_sar   = pool.submit(self.fetch_sentinel1_sar, grid_info, target_date, 30)
 
             bands_t0, masks_t0, t0_date          = f_t0.result()
             bands_tprev, masks_tprev, tprev_date = f_tprev.result()
