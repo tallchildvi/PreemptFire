@@ -3,6 +3,7 @@ from datetime import datetime
 import time
 from typing import Any, Dict, Optional
 import numpy as np
+import matplotlib.pyplot as plt
 
 from src.data_pipeline.cffdrs_fetcher import CFFDRSFetcher
 from src.data_pipeline.era5_fetcher import ERA5Fetcher
@@ -203,3 +204,113 @@ class SingleSceneCollector:
             "loss_mask": loss_mask,
             "target": target_tensor,
         }
+
+if __name__ == "__main__":
+    from src.data_pipeline.patch_extractor import PatchExtractor
+
+    # initialize collector and patch extractor
+    collector = SingleSceneCollector(osm_mode="local_history")
+    extractor = PatchExtractor(patch_size=256, stride=256, max_invalid_ratio=0.20)
+
+    # test wildfire scene in spain (castilla y leon / zamora)
+    test_lat = 41.6986
+    test_lon = -7.0011
+    test_date = "2022-08-09"
+
+    print(f"=== fetching scene [{test_lat}, {test_lon}] on {test_date} ===")
+    sample = collector.collect_sample(
+        lat=test_lat, lon=test_lon, target_date=test_date, is_fire=1
+    )
+
+    if not sample:
+        print("[error] failed to collect scene or missing sentinel-2 optical pair.")
+        exit(1)
+
+    # print 1d context feature vector to console
+    context_1d = sample["context_1d"]
+    print("\n" + "=" * 65)
+    print(f" 1D CONTEXT VECTOR (total features: {len(context_1d)})")
+    print("=" * 65)
+    for key in sorted(context_1d.keys()):
+        val = context_1d[key]
+        if isinstance(val, (int, float, np.floating)):
+            print(f"  {key:<32}: {val:>12.4f}")
+        else:
+            print(f"  {key:<32}: {str(val):>12}")
+    print("=" * 65 + "\n")
+
+    # extract patches using patchextractor
+    scene_id = f"SCENE_{test_lat:.4f}_{test_lon:.4f}_{test_date.replace('-', '')}"
+    patches = list(extractor.extract_patches(sample, scene_id=scene_id))
+    print(f"extracted {len(patches)} valid patches out of 64 possible (max invalid ratio <= 20%).")
+
+    if not patches:
+        print("[warning] zero patches passed quality threshold.")
+        exit(0)
+
+    # sequential visualization of 2d channels on reconstructed master grid
+    channel_names = patches[0]["channel_names_2d"]
+    num_channels = len(channel_names)
+    full_h, full_w = sample["loss_mask"].shape
+
+    print(f"\nstarting visualization for {num_channels} channels.")
+    print("close current window to display next channel...\n")
+
+    for ch_idx, ch_name in enumerate(channel_names):
+        # empty canvas initialized with nan so rejected patches stay transparent/blank
+        canvas = np.full((full_h, full_w), np.nan, dtype=np.float32)
+
+        # place each valid 256x256 patch into its original grid position
+        for p in patches:
+            r = p["metadata"]["row_offset"]
+            c = p["metadata"]["col_offset"]
+            canvas[r : r + 256, c : c + 256] = p["X_2d"][ch_idx]
+
+        fig, ax = plt.subplots(figsize=(9, 9))
+
+        # select colormap based on sensor and feature type
+        if "MASK" in ch_name or "SCL" in ch_name:
+            cmap = "gray"
+        elif "SAR" in ch_name:
+            cmap = "plasma"
+        elif any(idx in ch_name for idx in ["NDVI", "EVI", "NDRE"]):
+            cmap = "YlGn"
+        elif any(idx in ch_name for idx in ["NDMI", "MSI", "NMDI", "NBR"]):
+            cmap = "coolwarm"
+        elif ch_name in ["Elevation", "Slope"]:
+            cmap = "terrain"
+        else:
+            cmap = "viridis"
+
+        valid_pixels = canvas[np.isfinite(canvas)]
+        if len(valid_pixels) > 0 and "MASK" not in ch_name:
+            vmin, vmax = np.percentile(valid_pixels, [2, 98])
+        else:
+            vmin = np.nanmin(canvas) if len(valid_pixels) > 0 else 0.0
+            vmax = np.nanmax(canvas) if len(valid_pixels) > 0 else 1.0
+
+        im = ax.imshow(canvas, cmap=cmap, origin="upper", vmin=vmin, vmax=vmax)
+
+        # draw 8x8 patch grid lines (every 256 pixels)
+        for offset in range(0, full_h + 1, 256):
+            ax.axhline(offset - 0.5, color="red", linestyle="--", linewidth=0.7, alpha=0.7)
+            ax.axvline(offset - 0.5, color="red", linestyle="--", linewidth=0.7, alpha=0.7)
+
+        ax.set_title(
+            f"[{ch_idx + 1}/{num_channels}] channel: {ch_name}\n"
+            f"valid patches: {len(patches)}/64 | canvas shape: {full_h}x{full_w}",
+            fontsize=12,
+            fontweight="bold",
+            pad=12,
+        )
+        ax.set_xlabel("x pixel (10m)")
+        ax.set_ylabel("y pixel (10m)")
+
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label("value")
+
+        plt.tight_layout()
+        plt.show()
+        plt.close(fig)
+
+    print("visualization completed.")

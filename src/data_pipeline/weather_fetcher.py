@@ -19,10 +19,30 @@ class WeatherFetcher:
         cb = np.clip(0.3333 * (t850 - dp850) - 1.0, 0.0, 9.0)
         return ca + cb
 
+    @staticmethod
+    def _compute_dew_point(temp: np.ndarray, rh: np.ndarray) -> np.ndarray:
+        """calculates dew point from temperature (C) and relative humidity (%) via magnus formula."""
+        rh_clipped = np.clip(rh, 1.0, 100.0)
+        a, b = 17.27, 237.3
+        alpha = ((a * temp) / (b + temp)) + np.log(rh_clipped / 100.0)
+        return (b * alpha) / (a - alpha)
+
+    @staticmethod
+    def _safe_hourly_array(hourly_dict: dict, var_name: str, n_last: Optional[int] = None) -> np.ndarray:
+        """safely extracts hourly series handling potential nulls and model suffixes."""
+        raw_vals = hourly_dict.get(var_name)
+        if raw_vals is None:
+            raw_vals = hourly_dict.get(f"{var_name}_era5", [])
+        
+        arr = np.array([np.nan if v is None else v for v in raw_vals], dtype=np.float32)
+        if n_last is not None and len(arr) >= n_last:
+            return arr[-n_last:]
+        return arr
+
     def _fetch_raw_archive(
         self, lat: float, lon: float, start_date: str, end_date: str
     ) -> Dict:
-        """helper to query open-meteo archive with all surface and pressure level bands."""
+        """helper to query open-meteo archive with all surface and pressure level bands via era5."""
         params = {
             "latitude": lat,
             "longitude": lon,
@@ -36,9 +56,6 @@ class WeatherFetcher:
                 "surface_pressure",
                 "wind_speed_10m",
                 "wind_direction_10m",
-                "temperature_850hPa",
-                "temperature_700hPa",
-                "dew_point_850hPa",
             ],
             "daily": ["precipitation_sum"],
             "timezone": "UTC",
@@ -50,10 +67,10 @@ class WeatherFetcher:
     def _aggregate_hourly_slice(self, raw_data: Dict, prefix: str) -> Dict[str, float]:
         """aggregates temperature, vpd, humidity, wind and rain over an arbitrary hourly slice."""
         hourly = raw_data.get("hourly", {})
-        temp = np.array(hourly.get("temperature_2m", []), dtype=np.float32)
-        rh = np.array(hourly.get("relative_humidity_2m", []), dtype=np.float32)
-        wind = np.array(hourly.get("wind_speed_10m", []), dtype=np.float32)
-        precip = np.array(hourly.get("precipitation", []), dtype=np.float32)
+        temp = self._safe_hourly_array(hourly, "temperature_2m")
+        rh = self._safe_hourly_array(hourly, "relative_humidity_2m")
+        wind = self._safe_hourly_array(hourly, "wind_speed_10m")
+        precip = self._safe_hourly_array(hourly, "precipitation")
 
         if len(temp) == 0:
             return {
@@ -87,33 +104,40 @@ class WeatherFetcher:
         history_start = (target_dt - timedelta(days=60)).strftime("%Y-%m-%d")
 
         data = self._fetch_raw_archive(lat, lon, history_start, target_date)
-        daily_precip = np.array(data["daily"]["precipitation_sum"], dtype=np.float32)
-        target_day_precip = float(daily_precip[-1])
+        daily_precip_raw = data.get("daily", {}).get("precipitation_sum", [])
+        daily_precip = np.array([0.0 if p is None else p for p in daily_precip_raw], dtype=np.float32)
+        target_day_precip = float(daily_precip[-1]) if len(daily_precip) > 0 else 0.0
 
         # calculate drought days
         days_since_rain = 0.0
-        if target_day_precip < self.rain_threshold_mm:
+        if target_day_precip < self.rain_threshold_mm and len(daily_precip) > 1:
             for p in reversed(daily_precip[:-1]):
                 if p >= self.rain_threshold_mm:
                     break
                 days_since_rain += 1.0
 
-        # target day slice (last 24 hours)
-        t850 = np.array(data["hourly"]["temperature_850hPa"][-24:], dtype=np.float32)
-        t700 = np.array(data["hourly"]["temperature_700hPa"][-24:], dtype=np.float32)
-        dp850 = np.array(data["hourly"]["dew_point_850hPa"][-24:], dtype=np.float32)
+        hourly = data.get("hourly", {})
+
+        # upper-air pressure levels for continuous haines (last 24 hours)
+        t850 = self._safe_hourly_array(hourly, "temperature_850hPa", n_last=24)
+        t700 = self._safe_hourly_array(hourly, "temperature_700hPa", n_last=24)
+        rh850 = self._safe_hourly_array(hourly, "relative_humidity_850hPa", n_last=24)
 
         c_haines_mean, c_haines_max = 0.0, 0.0
-        if not np.isnan(t850).all() and not np.isnan(t700).all():
-            ch_arr = self.compute_continuous_haines(t850, t700, dp850)
-            c_haines_mean = float(np.nanmean(ch_arr))
-            c_haines_max = float(np.nanmax(ch_arr))
+        if len(t850) > 0 and len(t700) > 0 and len(rh850) > 0:
+            if not np.isnan(t850).all() and not np.isnan(t700).all() and not np.isnan(rh850).all():
+                dp850 = self._compute_dew_point(t850, rh850)
+                ch_arr = self.compute_continuous_haines(t850, t700, dp850)
+                if not np.isnan(ch_arr).all():
+                    c_haines_mean = float(np.nanmean(ch_arr))
+                    c_haines_max = float(np.nanmax(ch_arr))
 
-        h_temp = np.array(data["hourly"]["temperature_2m"][-24:], dtype=np.float32)
-        h_rh = np.array(data["hourly"]["relative_humidity_2m"][-24:], dtype=np.float32)
-        h_wind = np.array(data["hourly"]["wind_speed_10m"][-24:], dtype=np.float32)
-        h_wdir = np.array(data["hourly"]["wind_direction_10m"][-24:], dtype=np.float32)
-        h_press = np.array(data["hourly"]["surface_pressure"][-24:], dtype=np.float32)
+        # surface conditions (last 24 hours)
+        h_temp = self._safe_hourly_array(hourly, "temperature_2m", n_last=24)
+        h_rh = self._safe_hourly_array(hourly, "relative_humidity_2m", n_last=24)
+        h_wind = self._safe_hourly_array(hourly, "wind_speed_10m", n_last=24)
+        h_wdir = self._safe_hourly_array(hourly, "wind_direction_10m", n_last=24)
+        h_press = self._safe_hourly_array(hourly, "surface_pressure", n_last=24)
 
         svp = 0.61078 * np.exp((17.27 * h_temp) / (h_temp + 237.3))
         avp = svp * (h_rh / 100.0)
@@ -147,9 +171,6 @@ class WeatherFetcher:
         t_base_dt = tprev_dt - timedelta(days=delta_days)
 
         start_str = t_base_dt.strftime("%Y-%m-%d")
-        end_str = t_tgt_dt.strftime("%Y-%m-%d")
-
-        raw_all = self._fetch_raw_archive(lat, lon, start_str, end_str)
 
         # interval 1: [t0 -> target_date]
         d1 = self._fetch_raw_archive(lat, lon, t0_date, target_date)
@@ -170,3 +191,57 @@ class WeatherFetcher:
             "interval_delta_days": float(delta_days),
         }
 
+if __name__ == "__main__":
+    import time
+
+    fetcher = WeatherFetcher(rain_threshold_mm=1.5)
+
+    # Тестова точка: пожежа на кордоні Іспанії та Португалії (серпень 2022)
+    test_lat = 41.6986
+    test_lon = -7.0011
+    test_target_date = "2022-08-09"
+    test_t0_date = "2022-08-07"
+    test_tprev_date = "2022-07-13"
+
+    print(f"=== Testing WeatherFetcher for [{test_lat}, {test_lon}] on {test_target_date} ===")
+    t_start = time.perf_counter()
+
+    # 1. Запит добових метрик дня пожежі (приземні + ізобаричні рівні 850/700 гПа)
+    print("\n1. Fetching target day metrics (surface + upper-air levels)...")
+    target_metrics = fetcher.fetch_target_day_metrics(
+        lat=test_lat, lon=test_lon, target_date=test_target_date
+    )
+
+    # 2. Запит триінтервальної динаміки посухи та погоди
+    print("2. Fetching tri-interval metrics (baseline -> tprev -> t0 -> target)...")
+    tri_metrics = fetcher.fetch_tri_interval_metrics(
+        lat=test_lat,
+        lon=test_lon,
+        target_date=test_target_date,
+        t0_date=test_t0_date,
+        tprev_date=test_tprev_date,
+    )
+
+    elapsed = time.perf_counter() - t_start
+    print(f"\nCompleted in {elapsed:.2f}s")
+
+    # Вивід метрик цільового дня
+    print("\n")
+    print(" TARGET DAY METRICS (Last 24h)")
+
+    for k, v in sorted(target_metrics.items()):
+        print(f"  {k:<32}: {v:>12.4f}")
+
+    # Окрема перевірка індексу нестабільності Хейнса
+    ch_max = target_metrics.get("target_c_haines_max", 0.0)
+    ch_mean = target_metrics.get("target_c_haines_mean", 0.0)
+    print("\n")
+    if ch_max > 0.0:
+        print(f"  [VALIDATION: OK] Continuous Haines Index: mean={ch_mean:.2f}, max={ch_max:.2f}")
+    else:
+        print("  [VALIDATION: FAILED] Continuous Haines is 0.0000 (check ERA5 upper-air response)")
+
+    print(" TRI-INTERVAL DYNAMICS")
+    print("\n")    
+    for k, v in sorted(tri_metrics.items()):
+        print(f"  {k:<32}: {v:>12.4f}")
