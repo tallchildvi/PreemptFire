@@ -477,6 +477,7 @@ def get_or_create_snapshot_pbf(osh_path: Path, target_date_str: str) -> Path:
         if snapshot_path.exists():
             return snapshot_path
 
+        tmp_snapshot_path = osh_path.parent / f"{osh_path.stem}_{date_tag}.tmp.osm.pbf"
         iso_timestamp = f"{target_date_str.split(' ')[0]}T23:59:59Z"
         print(f"  [OSM Time-Filter] Generating snapshot for {iso_timestamp}")
         t0 = time.perf_counter()
@@ -485,25 +486,26 @@ def get_or_create_snapshot_pbf(osh_path: Path, target_date_str: str) -> Path:
             "osmium", "time-filter",
             str(osh_path),
             iso_timestamp,
-            "-o", str(snapshot_path),
+            "-o", str(tmp_snapshot_path),
             "--overwrite"
         ]
 
         res = subprocess.run(cmd, capture_output=True, text=True)
         if res.returncode != 0:
+            tmp_snapshot_path.unlink(missing_ok=True)
             raise RuntimeError(f"osmium time-filter failed: {res.stderr}")
 
+        tmp_snapshot_path.replace(snapshot_path)
         print(f"  [OSM Time-Filter] Snapshot created: {snapshot_path.name} in {time.perf_counter() - t0:.2f}s")
 
         existing_snaps = sorted(
-            osh_path.parent.glob("*-history_*.osm.pbf"),
+            [p for p in osh_path.parent.glob("*-history_*.osm.pbf") if not p.name.endswith(".tmp.osm.pbf")],
             key=lambda p: p.stat().st_mtime,
         )
-        for old_snap in existing_snaps[:-4]:
+        for old_snap in existing_snaps[:-10]:
             old_snap.unlink(missing_ok=True)
 
     return snapshot_path
-
 
 def extract_scene_bbox_pbf(
     source_pbf: Path,
