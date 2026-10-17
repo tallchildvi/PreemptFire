@@ -45,6 +45,7 @@ class HDF5Writer:
             chunks=(1, c_2d, h, w),
             compression=self.compression,
             compression_opts=self.compression_opts,
+            shuffle=True,
         )
 
         # 1d environmental context vector: [n, k]
@@ -74,6 +75,7 @@ class HDF5Writer:
             chunks=(1, c_y, h, w),
             compression=self.compression,
             compression_opts=self.compression_opts,
+            shuffle=True
         )
 
         # 2d binary loss mask: [n, h, w]
@@ -85,6 +87,7 @@ class HDF5Writer:
             chunks=(1, h, w),
             compression=self.compression,
             compression_opts=self.compression_opts,
+            shuffle=True
         )
 
         # metadata storage as stringified json
