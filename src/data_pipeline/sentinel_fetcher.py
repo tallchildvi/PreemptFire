@@ -174,7 +174,7 @@ class SentinelFetcher:
             if mosaicked_scl is None:
                 continue
 
-            nodata_ratio = float((mosaicked_scl == 0).mean())
+            nodata_ratio = float(np.isin(mosaicked_scl, [0, 1, 2, 3, 8, 9, 10]).mean())
             if nodata_ratio > self.max_nodata_fraction:
                 continue
 

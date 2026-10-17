@@ -1,3 +1,5 @@
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 import numpy as np
@@ -8,6 +10,9 @@ class WeatherFetcher:
     """fetches multi-interval open-meteo metrics and upper-air atmospheric stability."""
 
     def __init__(self, rain_threshold_mm: float = 1.5):
+        self.session = requests.Session()
+        retries = Retry(total=5, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
+        self.session.mount("https://", HTTPAdapter(max_retries=retries))
         self.rain_threshold_mm = rain_threshold_mm
         self.base_url = "https://archive-api.open-meteo.com/v1/archive"
 
@@ -60,7 +65,7 @@ class WeatherFetcher:
             "daily": ["precipitation_sum"],
             "timezone": "UTC",
         }
-        res = requests.get(self.base_url, params=params, timeout=20)
+        res = self.session.get(self.base_url, params=params, timeout=20)
         res.raise_for_status()
         return res.json()
 
