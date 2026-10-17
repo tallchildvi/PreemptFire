@@ -117,6 +117,11 @@ class DatasetGenerator:
 
     def _process_single_scene(self, scene: dict) -> str:
         """Worker function that fully processes one scene and writes it to its own HDF5 shard."""
+        import shutil
+        free_gb = shutil.disk_usage(self.output_shards_dir).free / (1024**3)
+        if free_gb < 5.0:
+            return f"[{scene['scene_id']}] STOPPED: Low disk space ({free_gb:.1f} GB free)"
+
         scene_id = scene["scene_id"]
         lat, lon = scene["lat"], scene["lon"]
         target_date = scene["target_date"]
@@ -126,7 +131,6 @@ class DatasetGenerator:
         t_start = time.perf_counter()
 
         try:
-            # 1. Collect Multi-modal Data
             sample = self.collector.collect_sample(
                 lat=lat, lon=lon, target_date=target_date, is_fire=is_fire
             )
@@ -135,7 +139,6 @@ class DatasetGenerator:
                 self._update_status(scene_id, status="SKIPPED_NO_DATA", error_msg="Missing S2 optical pair or heavy clouds")
                 return f"[{scene_id}] SKIPPED (No data)"
 
-            # 2. Extract Patches (Extractor is lightweight, safe to instantiate per thread)
             extractor = PatchExtractor(
                 patch_size=self.patch_size,
                 stride=self.stride,
@@ -147,8 +150,8 @@ class DatasetGenerator:
                 self._update_status(scene_id, status="SKIPPED_EMPTY_PATCHES", error_msg="0 valid patches passed quality gate")
                 return f"[{scene_id}] SKIPPED (0 valid patches)"
 
-            # 3. Write to Isolated Shard File
             shard_path = self.output_shards_dir / f"{scene_id}.h5"
+            shard_path.unlink(missing_ok=True)  # захист від дублювання при ретраях
             writer = HDF5Writer(output_path=shard_path, patch_size=self.patch_size)
             written_count = writer.write_patches_batch(patches)
 
@@ -160,6 +163,7 @@ class DatasetGenerator:
             self._update_status(scene_id, status="FAILED", error_msg=str(e))
             return f"[{scene_id}] FAILED: {str(e)}"
 
+        
     def run(self, max_scenes: Optional[int] = None):
         """Executes parallel batch collection."""
         df_points = pd.read_csv(self.points_csv_path)
@@ -174,7 +178,7 @@ class DatasetGenerator:
                 SELECT scene_id, lat, lon, target_date, is_fire 
                 FROM scenes_tracker 
                 WHERE status IN ('PENDING', 'FAILED')
-                ORDER BY is_fire DESC, target_date ASC
+                ORDER BY target_date ASC, scene_id ASC
                 """
             )
             pending_scenes = [dict(r) for r in cursor.fetchall()]
@@ -213,4 +217,4 @@ if __name__ == "__main__":
         osm_mode="local_history",
         max_workers=2,
     )
-    generator.run(max_scenes=10)
+    generator.run(max_scenes=None)
