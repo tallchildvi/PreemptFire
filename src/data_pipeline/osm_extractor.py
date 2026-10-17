@@ -495,6 +495,13 @@ def get_or_create_snapshot_pbf(osh_path: Path, target_date_str: str) -> Path:
 
         print(f"  [OSM Time-Filter] Snapshot created: {snapshot_path.name} in {time.perf_counter() - t0:.2f}s")
 
+        existing_snaps = sorted(
+            osh_path.parent.glob("*-history_*.osm.pbf"),
+            key=lambda p: p.stat().st_mtime,
+        )
+        for old_snap in existing_snaps[:-4]:
+            old_snap.unlink(missing_ok=True)
+
     return snapshot_path
 
 
