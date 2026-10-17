@@ -78,16 +78,16 @@ class HDF5Writer:
             shuffle=True
         )
 
-        # 2d binary loss mask: [n, h, w]
+        # 2d categorical scene classification layer: [n, h, w] (uint8: 0..11)
         h5_file.create_dataset(
-            "loss_mask",
+            "scl",
             shape=(0, h, w),
             maxshape=(None, h, w),
-            dtype="float32",
+            dtype="uint8",
             chunks=(1, h, w),
             compression=self.compression,
             compression_opts=self.compression_opts,
-            shuffle=True
+            shuffle=True,
         )
 
         # metadata storage as stringified json
@@ -137,9 +137,7 @@ class HDF5Writer:
         ], axis=0).astype(np.float32)
 
         b_y = np.stack([p["Y"] for p in patches], axis=0).astype(np.float32)
-        b_mask = np.stack([p["loss_mask"] for p in patches], axis=0).astype(
-            np.float32
-        )
+        b_scl = np.stack([p["scl"] for p in patches], axis=0).astype(np.uint8)
         b_ids = [str(p["patch_id"]) for p in patches]
         b_meta = [json.dumps(p["metadata"]) for p in patches]
 
@@ -157,7 +155,7 @@ class HDF5Writer:
             f["X_1d"].resize((new_len, *b_x1d.shape[1:]))
             f["channel_validity"].resize((new_len, *b_val.shape[1:]))
             f["Y"].resize((new_len, *b_y.shape[1:]))
-            f["loss_mask"].resize((new_len, *b_mask.shape[1:]))
+            f["scl"].resize((new_len, *b_scl.shape[1:]))
             f["metadata"].resize((new_len,))
             f["patch_id"].resize((new_len,))
 
@@ -166,7 +164,7 @@ class HDF5Writer:
             f["X_1d"][curr_len:new_len] = b_x1d
             f["channel_validity"][curr_len:new_len] = b_val
             f["Y"][curr_len:new_len] = b_y
-            f["loss_mask"][curr_len:new_len] = b_mask
+            f["scl"][curr_len:new_len] = b_scl
             f["metadata"][curr_len:new_len] = b_meta
             f["patch_id"][curr_len:new_len] = b_ids
 

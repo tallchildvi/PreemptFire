@@ -206,6 +206,7 @@ class SingleSceneCollector:
             "rasters_2d": rasters_2d,
             "context_1d": context_1d,
             "loss_mask": loss_mask,
+            "scl": bands_t0["SCL"].astype(np.uint8),  
             "target": target_tensor,
         }
 if __name__ == "__main__":
