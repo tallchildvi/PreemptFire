@@ -44,6 +44,7 @@ class PatchExtractor:
         ) -> Generator[Dict[str, Any], None, None]:
             rasters_2d = sample["rasters_2d"]
             loss_mask = sample["loss_mask"]
+            scl = sample["scl"]
             target = sample["target"]
             context_1d = sample["context_1d"]
             metadata = sample["metadata"]
@@ -63,7 +64,9 @@ class PatchExtractor:
                 if ch == "MASK_SAR_VALID":
                     canonical_rasters.append(sar_valid_mask)
                 elif ch in rasters_2d and rasters_2d[ch] is not None:
-                    canonical_rasters.append(np.nan_to_num(rasters_2d[ch], nan=0.0).astype(np.float32))
+                    canonical_rasters.append(
+                        np.nan_to_num(rasters_2d[ch], nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32)
+                    )
                 else:
                     canonical_rasters.append(np.zeros((h_full, w_full), dtype=np.float32))
 
@@ -88,7 +91,7 @@ class PatchExtractor:
                     patch_2d = stacked_2d[:, row_slice, col_slice]
                     patch_target = target[:, row_slice, col_slice]
                     patch_sar_mask = sar_valid_mask[row_slice, col_slice]
-
+                    patch_scl = scl[row_slice, col_slice]
                     patch_has_sar = float(patch_sar_mask.mean() >= 0.50)
 
                     validity_flags = []
@@ -123,6 +126,7 @@ class PatchExtractor:
                         "X_1d": context_vec,
                         "channel_validity": patch_channel_validity,
                         "loss_mask": patch_loss_mask,
+                        "scl": patch_scl,
                         "Y": patch_target,
                         "metadata": patch_meta,
                         "channel_names_2d": self.CANONICAL_2D_CHANNELS,
