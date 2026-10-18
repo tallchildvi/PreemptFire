@@ -63,6 +63,7 @@ class SingleSceneCollector:
             return None
 
         masks_t0 = sentinel_data.get("masks_t0") or {}
+        masks_tprev = sentinel_data.get("masks_tprev") or {}
         sar_bands = sentinel_data.get("sar_bands") or {}
 
         def _fetch_dem_osm():
@@ -156,11 +157,10 @@ class SingleSceneCollector:
         target_tensor = self.target_builder.build_target(
             grid_info=grid_info, lat=lat, lon=lon, is_fire=is_fire
         )
-        raw_invalid = masks_t0.get(
-            "MASK_INVALID", np.zeros(grid_info["shape"], dtype=np.float32)
-        )
+        raw_invalid_t0 = masks_t0.get("MASK_INVALID", np.zeros(grid_info["shape"], dtype=np.float32))
+        raw_invalid_tprev = masks_tprev.get("MASK_INVALID", np.zeros(grid_info["shape"], dtype=np.float32))
         snow_mask = masks_t0.get("MASK_SNOW", np.zeros(grid_info["shape"], dtype=np.float32))
-        loss_mask = np.where(snow_mask > 0.5, 0.0, raw_invalid).astype(np.float32)
+        loss_mask = np.where(snow_mask > 0.5, 0.0, np.maximum(raw_invalid_t0, raw_invalid_tprev)).astype(np.float32)
 
         timings["target_builder"] = time.perf_counter() - t_tgt
 
