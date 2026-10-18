@@ -7,7 +7,7 @@ RAW_DATA_DIR = DATA_DIR / "raw"
 INTERIM_DATA_DIR = DATA_DIR / "interim"
 PROCESSED_H5_DIR = DATA_DIR / "processed"
 
-GRID_SIZE_PX = 2048          
+GRID_SIZE_PX = 1280        
 PATCH_SIZE_PX = 256          
 PIXEL_SCALE_METERS = 10.0   
 

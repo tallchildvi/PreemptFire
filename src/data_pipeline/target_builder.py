@@ -10,12 +10,12 @@ class TargetBuilder:
 
     Generates smooth, unclipped 4-channel Gaussian fields across the entire raster grid:
         Channel 0: Immediate Footprint   (sigma = 250m)
-        Channel 1: Sub-Regional Hazard   (sigma = 1000m)
-        Channel 2: Macro Risk Field      (sigma = 3000m)
-        Channel 3: Regional Macro-Field  (sigma = 4000m)
+        Channel 1: Sub-Regional Hazard   (sigma = 500m)
+        Channel 2: Macro Risk Field      (sigma = 1000m)
+        Channel 3: Regional Macro-Field  (sigma = 2000m)
     """
 
-    SIGMAS_M: Tuple[float, float, float, float] = (250.0, 1000.0, 3000.0, 4000.0)
+    SIGMAS_M: Tuple[float, float, float, float] = (250.0, 500.0, 1000.0, 2000.0)
 
     def __init__(self, pixel_size_m: float = 10.0):
         self.pixel_size_m = float(pixel_size_m)
@@ -88,9 +88,9 @@ if __name__ == "__main__":
 
     scales_metadata = [
         ("Immediate Footprint", "inferno", 250.0),
-        ("Sub-Regional Hazard", "magma", 1000.0),
-        ("Macro Risk Field", "viridis", 3000.0),
-        ("Regional Macro-Field", "plasma", 4000.0),
+        ("Sub-Regional Hazard", "magma", 500.0),
+        ("Macro Risk Field", "viridis", 1000.0),
+        ("Regional Macro-Field", "plasma", 2000.0),
     ]
 
     print(f"Generated target tensor shape: {target_tensor.shape}")

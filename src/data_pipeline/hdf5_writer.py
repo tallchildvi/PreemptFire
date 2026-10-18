@@ -4,6 +4,10 @@ from typing import Any
 import h5py
 import numpy as np
 
+# Safe bounds for IEEE 754 float16 (max representable value is 65504.0)
+FP16_MAX = 65500.0
+FP16_MIN = -65500.0
+
 
 class HDF5Writer:
     """manages streaming append of multimodal wildfire patches into hdf5 archives."""
@@ -23,6 +27,12 @@ class HDF5Writer:
         self.compression_opts = compression_opts
         self._is_initialized = False
 
+    @staticmethod
+    def _sanitize_fp16(arr: np.ndarray, min_val: float = FP16_MIN, max_val: float = FP16_MAX) -> np.ndarray:
+        """replaces nan/inf and clips values to safe float16 range before casting."""
+        cleaned = np.nan_to_num(arr, nan=0.0, posinf=max_val, neginf=min_val)
+        return np.clip(cleaned, min_val, max_val).astype(np.float16)
+
     def _init_storage(
         self,
         sample_patch: dict[str, Any],
@@ -31,7 +41,7 @@ class HDF5Writer:
         """allocates resizable datasets and stores channel schemas in root attributes."""
         c_2d, h, w = sample_patch["X_2d"].shape
         c_1d = sample_patch["X_1d"].shape[0]
-        
+
         val_vec = sample_patch.get("channel_validity")
         c_val = val_vec.shape[0] if val_vec is not None else c_2d
         c_y = sample_patch["Y"].shape[0]
@@ -41,14 +51,14 @@ class HDF5Writer:
             "X_2d",
             shape=(0, c_2d, h, w),
             maxshape=(None, c_2d, h, w),
-            dtype="float32",
+            dtype="float16",
             chunks=(1, c_2d, h, w),
             compression=self.compression,
             compression_opts=self.compression_opts,
             shuffle=True,
         )
 
-        # 1d environmental context vector: [n, k]
+        # 1d environmental context vector: [n, k] (kept in float32)
         h5_file.create_dataset(
             "X_1d",
             shape=(0, c_1d),
@@ -62,7 +72,7 @@ class HDF5Writer:
             "channel_validity",
             shape=(0, c_val),
             maxshape=(None, c_val),
-            dtype="float32",
+            dtype="float16",
             chunks=True,
         )
 
@@ -71,11 +81,11 @@ class HDF5Writer:
             "Y",
             shape=(0, c_y, h, w),
             maxshape=(None, c_y, h, w),
-            dtype="float32",
+            dtype="float16",
             chunks=(1, c_y, h, w),
             compression=self.compression,
             compression_opts=self.compression_opts,
-            shuffle=True
+            shuffle=True,
         )
 
         # 2d categorical scene classification layer: [n, h, w] (uint8: 0..11)
@@ -117,26 +127,32 @@ class HDF5Writer:
         self._is_initialized = True
 
     def write_patches_batch(self, patches: list[dict[str, Any]]) -> int:
-        """appends a batch of patches to the hdf5 storage in a single io pass."""
+        """appends a batch of patches to the hdf5 storage in a single io pass with float16 overflow protection."""
         if not patches:
             return 0
 
         batch_size = len(patches)
 
-        # stack batch arrays in memory
-        b_x2d = np.stack([p["X_2d"] for p in patches], axis=0).astype(
-            np.float32
-        )
-        b_x1d = np.stack([p["X_1d"] for p in patches], axis=0).astype(
-            np.float32
-        )
+        # stack and sanitize 2d features -> safe float16 [-65500, 65500]
+        raw_x2d = np.stack([p["X_2d"] for p in patches], axis=0)
+        b_x2d = self._sanitize_fp16(raw_x2d, min_val=FP16_MIN, max_val=FP16_MAX)
+
+        # stack and sanitize 1d context -> safe float32 (no nan/inf)
+        raw_x1d = np.stack([p["X_1d"] for p in patches], axis=0).astype(np.float32)
+        b_x1d = np.nan_to_num(raw_x1d, nan=0.0, posinf=1e6, neginf=-1e6).astype(np.float32)
+
+        # stack and sanitize channel validity mask -> safe float16 [0.0, 1.0]
         num_channels_2d = b_x2d.shape[1]
-        b_val = np.stack([
+        raw_val = np.stack([
             p.get("channel_validity", np.ones(num_channels_2d, dtype=np.float32))
             for p in patches
-        ], axis=0).astype(np.float32)
+        ], axis=0)
+        b_val = self._sanitize_fp16(raw_val, min_val=0.0, max_val=1.0)
 
-        b_y = np.stack([p["Y"] for p in patches], axis=0).astype(np.float32)
+        # stack and sanitize targets -> safe float16 [0.0, 1.0]
+        raw_y = np.stack([p["Y"] for p in patches], axis=0)
+        b_y = self._sanitize_fp16(raw_y, min_val=0.0, max_val=1.0)
+
         b_scl = np.stack([p["scl"] for p in patches], axis=0).astype(np.uint8)
         b_ids = [str(p["patch_id"]) for p in patches]
         b_meta = [json.dumps(p["metadata"]) for p in patches]
@@ -170,28 +186,29 @@ class HDF5Writer:
 
         return batch_size
 
+
 def inspect_h5_structure(h5_path: Path | str) -> None:
-        """inspects and logs datasets, shapes, dtypes, and attributes of the generated hdf5 archive."""
-        path = Path(h5_path)
-        if not path.exists():
-            print(f"  [HDF5 Inspect] File not found at: {path}")
-            return
+    """inspects and logs datasets, shapes, dtypes, and attributes of the generated hdf5 archive."""
+    path = Path(h5_path)
+    if not path.exists():
+        print(f"  [HDF5 Inspect] File not found at: {path}")
+        return
 
-        with h5py.File(path, "r") as f:
-            print(f"\n{'='*55}\nHDF5 Archive Inspection: {path.name}\n{'='*55}")
-            print("Datasets:")
-            for key in f.keys():
-                ds = f[key]
-                print(f"  - {key:<18} shape: {str(ds.shape):<20} dtype: {ds.dtype}")
+    with h5py.File(path, "r") as f:
+        print(f"\n{'='*55}\nHDF5 Archive Inspection: {path.name}\n{'='*55}")
+        print("Datasets:")
+        for key in f.keys():
+            ds = f[key]
+            print(f"  - {key:<18} shape: {str(ds.shape):<20} dtype: {ds.dtype}")
 
-            print("\nRoot Attributes:")
-            for attr_name, attr_val in f.attrs.items():
-                if isinstance(attr_val, str) and (attr_val.startswith("[") or attr_val.startswith("{")):
-                    try:
-                        parsed = json.loads(attr_val)
-                        print(f"  - {attr_name}: {len(parsed)} registered items")
-                    except Exception:
-                        print(f"  - {attr_name}: {attr_val[:60]}...")
-                else:
-                    print(f"  - {attr_name}: {attr_val}")
-            print(f"{'='*55}\n")    
+        print("\nRoot Attributes:")
+        for attr_name, attr_val in f.attrs.items():
+            if isinstance(attr_val, str) and (attr_val.startswith("[") or attr_val.startswith("{")):
+                try:
+                    parsed = json.loads(attr_val)
+                    print(f"  - {attr_name}: {len(parsed)} registered items")
+                except Exception:
+                    print(f"  - {attr_name}: {attr_val[:60]}...")
+            else:
+                print(f"  - {attr_name}: {attr_val}")
+        print(f"{'='*55}\n")

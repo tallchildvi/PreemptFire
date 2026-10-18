@@ -352,6 +352,9 @@ class SpatialFeatureFetcher:
 
         try:
             mask_50m = self._rasterize_geometries(gdf_subset, buf_shape_50m, buf_transform_50m, value=1, fill=0)
+            if not np.any(mask_50m == 1):
+                return fallback
+
             dist_50m = (distance_transform_edt(1 - mask_50m) * 50.0).astype(np.float32)
 
             dist_10m = np.full(grid_info["shape"], max_dist_m, dtype=np.float32)
