@@ -109,6 +109,12 @@ class SentinelFetcher:
                 raw_data, src_transform, src_crs = self._read_band_window(
                     asset_url, grid_info["bbox_wgs84"]
                 )
+                
+                if not is_scl and band_name in self.OPTICAL_BANDS:
+                    baseline = str(item.properties.get("s2:processing_baseline", "02.00"))
+                    if baseline >= "04.00":
+                        raw_data = np.where(np.isfinite(raw_data), np.maximum(raw_data - 1000.0, 0.0), np.nan)
+                    raw_data = raw_data / 10000.0
 
                 aligned = self.aligner.align_raster_to_master(
                     src_array=raw_data,

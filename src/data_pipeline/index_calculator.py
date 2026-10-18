@@ -33,8 +33,9 @@ class IndexCalculator:
     def calc_evi(nir: np.ndarray, red: np.ndarray, blue: np.ndarray, eps: float = 1e-6) -> np.ndarray:
         """Enhanced Vegetation Index: 2.5 * (B08 - B04) / (B08 + 6*B04 - 7.5*B02 + 1)."""
         numerator = 2.5 * (nir - red)
-        denominator = nir + 6.0 * red - 7.5 * blue + 1.0 + eps
-        return (numerator / denominator).astype(np.float32)
+        denominator = nir + 6.0 * red - 7.5 * blue + 1.0
+        safe_denom = np.where(np.abs(denominator) < 1e-3, np.where(denominator >= 0, 1e-3, -1e-3), denominator)
+        return np.clip(numerator / safe_denom, -2.0, 2.0).astype(np.float32)
 
     @staticmethod
     def calc_ndre(nir: np.ndarray, red_edge: np.ndarray, eps: float = 1e-6) -> np.ndarray:
@@ -42,9 +43,9 @@ class IndexCalculator:
         return ((nir - red_edge) / (nir + red_edge + eps)).astype(np.float32)
 
     @staticmethod
-    def calc_msi(swir1: np.ndarray, nir: np.ndarray, eps: float = 1e-6) -> np.ndarray:
+    def calc_msi(swir1: np.ndarray, nir: np.ndarray, eps: float = 1e-3) -> np.ndarray:
         """Moisture Stress Index: B11 / B08."""
-        return ((swir1 + eps) / (nir + eps)).astype(np.float32)
+        return np.clip((swir1 + eps) / (nir + eps), 0.0, 10.0).astype(np.float32)
 
     @staticmethod
     def calc_nmdi(
@@ -56,8 +57,9 @@ class IndexCalculator:
         """Normalized Multi-band Drought Index: (B08 - (B11 - B12)) / (B08 + (B11 - B12))."""
         diff_swir = swir1 - swir2
         numerator = nir - diff_swir
-        denominator = nir + diff_swir + eps
-        return (numerator / denominator).astype(np.float32)
+        denominator = nir + diff_swir
+        safe_denom = np.where(np.abs(denominator) < 1e-3, np.where(denominator >= 0, 1e-3, -1e-3), denominator)
+        return np.clip(numerator / safe_denom, -2.0, 2.0).astype(np.float32)
 
     @staticmethod
     def calc_sar_ratio(vh: np.ndarray, vv: np.ndarray, eps: float = 1e-6) -> np.ndarray:

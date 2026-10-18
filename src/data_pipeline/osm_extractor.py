@@ -465,7 +465,6 @@ def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Pa
 
 
 def get_or_create_snapshot_pbf(osh_path: Path, target_date_str: str) -> Path:
-    """Generates provincial point-in-time snapshot via C++ Osmium (cached per date)."""
     date_tag = target_date_str.split(" ")[0].replace("-", "")
     snapshot_path = osh_path.parent / f"{osh_path.stem}_{date_tag}.osm.pbf"
     lock_path = snapshot_path.with_suffix(".lock")
@@ -476,7 +475,6 @@ def get_or_create_snapshot_pbf(osh_path: Path, target_date_str: str) -> Path:
     with FileLock(str(lock_path), timeout=1800):
         if snapshot_path.exists():
             return snapshot_path
-
         tmp_snapshot_path = osh_path.parent / f"{osh_path.stem}_{date_tag}.tmp.osm.pbf"
         iso_timestamp = f"{target_date_str.split(' ')[0]}T23:59:59Z"
         print(f"  [OSM Time-Filter] Generating snapshot for {iso_timestamp}")
