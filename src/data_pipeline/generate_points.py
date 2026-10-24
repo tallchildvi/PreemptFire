@@ -164,8 +164,8 @@ if __name__ == "__main__":
     iberia_bounds = (35.9, -9.5, 43.9, 3.4)
 
     generate_master_dataset(
-        start_year=2018,
-        end_year=2025,
+        start_year=2015,
+        end_year=2017,
         months=[2, 3, 4, 5, 6, 7, 8, 9, 10],
         days=None,  # scan all calendar days (effis pre-check + 10d cache makes this fast)
         country_codes=["ESP", "PRT"],

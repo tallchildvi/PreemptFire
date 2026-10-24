@@ -153,6 +153,6 @@ if __name__ == "__main__":
     print(f"points after spatiotemporal thinning: {len(df_thinned)}")
 
     # optimize subset minimizing moran's i with strict 50/50 class balance
-    df_final = find_best_moran_subset(df_thinned, target_n=1300, n_iterations=500)
+    df_final = find_best_moran_subset(df_thinned, target_n=500, n_iterations=500)
     df_final.to_csv(output_file, index=False)
     print(f"saved thinned dataset to: {output_file}")

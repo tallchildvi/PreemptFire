@@ -131,6 +131,7 @@ class DatasetGenerator:
         t_start = time.perf_counter()
 
         try:
+            print(f"  -> [{scene_id}] [Етап 1/3] Збір даних з API (SingleSceneCollector)...")
             sample = self.collector.collect_sample(
                 lat=lat, lon=lon, target_date=target_date, is_fire=is_fire
             )
@@ -139,6 +140,7 @@ class DatasetGenerator:
                 self._update_status(scene_id, status="SKIPPED_NO_DATA", error_msg="Missing S2 optical pair or heavy clouds")
                 return f"[{scene_id}] SKIPPED (No data)"
 
+            print(f"  -> [{scene_id}] [Етап 2/3] Дані зібрано. Нарізка на патчі (PatchExtractor)...")
             extractor = PatchExtractor(
                 patch_size=self.patch_size,
                 stride=self.stride,
@@ -150,6 +152,7 @@ class DatasetGenerator:
                 self._update_status(scene_id, status="SKIPPED_EMPTY_PATCHES", error_msg="0 valid patches passed quality gate")
                 return f"[{scene_id}] SKIPPED (0 valid patches)"
 
+            print(f"  -> [{scene_id}] [Етап 3/3] Відібрано {len(patches)} патчів. Збереження у HDF5...")
             shard_path = self.output_shards_dir / f"{scene_id}.h5"
             shard_path.unlink(missing_ok=True)  # захист від дублювання при ретраях
             writer = HDF5Writer(output_path=shard_path, patch_size=self.patch_size)
@@ -162,43 +165,35 @@ class DatasetGenerator:
         except Exception as e:
             self._update_status(scene_id, status="FAILED", error_msg=str(e))
             return f"[{scene_id}] FAILED: {str(e)}"
-
         
     def run(self, max_scenes: Optional[int] = None):
-        """Executes parallel batch collection."""
-        df_points = pd.read_csv(self.points_csv_path)
-        self.sync_from_csv(df_points)
+            """Executes sequential batch collection to prevent GDAL/Rasterio deadlocks."""
+            df_points = pd.read_csv(self.points_csv_path)
+            self.sync_from_csv(df_points)
 
-        with self._get_connection() as conn:
-            conn.row_factory = sqlite3.Row
-            cursor = conn.cursor()
-            # FAILED are retried automatically, PENDING are new/recovered
-            cursor.execute(
-                """
-                SELECT scene_id, lat, lon, target_date, is_fire 
-                FROM scenes_tracker 
-                WHERE status IN ('PENDING', 'FAILED')
-                ORDER BY target_date ASC, scene_id ASC
-                """
-            )
-            pending_scenes = [dict(r) for r in cursor.fetchall()]
+            with self._get_connection() as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+                # FAILED are retried automatically, PENDING are new/recovered
+                cursor.execute(
+                    """
+                    SELECT scene_id, lat, lon, target_date, is_fire 
+                    FROM scenes_tracker 
+                    WHERE status IN ('PENDING', 'FAILED')
+                    ORDER BY target_date ASC, scene_id ASC
+                    """
+                )
+                pending_scenes = [dict(r) for r in cursor.fetchall()]
 
-        if max_scenes:
-            pending_scenes = pending_scenes[:max_scenes]
+            if max_scenes:
+                pending_scenes = pending_scenes[:max_scenes]
 
-        print(f"\n--- Found {len(pending_scenes)} scenes pending processing ---")
-        print(f"--- Starting parallel execution with {self.max_workers} workers ---")
+            print(f"\n--- Found {len(pending_scenes)} scenes pending processing ---")
+            print("--- Starting sequential execution ---")
 
-        processed_count = 0
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Map futures to scenes for parallel execution
-            futures = {executor.submit(self._process_single_scene, scene): scene for scene in pending_scenes}
-
-            for future in as_completed(futures):
-                processed_count += 1
-                result_msg = future.result()
-                print(f"({processed_count}/{len(pending_scenes)}) {result_msg}")
-
+            for idx, scene in enumerate(pending_scenes, 1):
+                result_msg = self._process_single_scene(scene)
+                print(f"({idx}/{len(pending_scenes)}) {result_msg}")
 
 if __name__ == "__main__":
     csv_input_path = os.path.join("data", "interim", "points_dataset_thinned.csv")
@@ -218,3 +213,4 @@ if __name__ == "__main__":
         max_workers=2,
     )
     generator.run(max_scenes=None)
+    # generator.run(max_scenes=10)
