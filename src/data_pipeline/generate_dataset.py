@@ -180,7 +180,7 @@ class DatasetGenerator:
                     SELECT scene_id, lat, lon, target_date, is_fire 
                     FROM scenes_tracker 
                     WHERE status IN ('PENDING', 'FAILED')
-                    ORDER BY target_date ASC, scene_id ASC
+                    ORDER BY RANDOM()
                     """
                 )
                 pending_scenes = [dict(r) for r in cursor.fetchall()]
@@ -196,8 +196,9 @@ class DatasetGenerator:
                 print(f"({idx}/{len(pending_scenes)}) {result_msg}")
 
 if __name__ == "__main__":
-    csv_input_path = os.path.join("data", "interim", "points_dataset_thinned.csv")
-    output_shards_dir = os.path.join("data", "processed", "shards")
+    from src.config import INTERIM_DATA_DIR, PROCESSED_H5_DIR, COARSE, PATCH_SIZE_PX
+    csv_input_path = os.path.join(INTERIM_DATA_DIR, "points_grid_100m.csv")
+    output_shards_dir = os.path.join(PROCESSED_H5_DIR, "shards")
 
     if not os.path.exists(csv_input_path):
         raise FileNotFoundError(f"input csv file not found: {csv_input_path}")
@@ -206,9 +207,9 @@ if __name__ == "__main__":
     generator = DatasetGenerator(
         points_csv_path=csv_input_path,
         output_shards_dir=output_shards_dir,
-        patch_size=256,
-        stride=256,
-        max_invalid_ratio=0.20,
+        patch_size=PATCH_SIZE_PX,
+        stride=PATCH_SIZE_PX,
+        max_invalid_ratio=0.30 if COARSE else 0.20,
         osm_mode="local_history",
         max_workers=2,
     )

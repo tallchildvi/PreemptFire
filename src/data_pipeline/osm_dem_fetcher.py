@@ -17,6 +17,7 @@ from scipy.ndimage import distance_transform_edt
 from src.data_pipeline.accessibility.solver import dijkstra_kernel
 from src.data_pipeline.osm_temporal_cache import make_temporal_osm_query
 from src.processing.grid_aligner import GridAligner
+from src.config import COARSE
 
 
 class SpatialFeatureFetcher:
@@ -133,17 +134,37 @@ class SpatialFeatureFetcher:
             else self._get_buffered_wgs84_bbox(grid_info, buffer_meters)
         )
 
-        for attempt in range(self.max_retries):
-            try:
-                search = self.stac_client.search(collections=["cop-dem-glo-30"], bbox=bbox)
-                items = list(search.items())
-                if not items:
-                    print(f"  [DEM] No items returned for bbox: {bbox}")
+        # ЖОРСТКИЙ ТАЙМАУТ: 5 секунд і ЖОДНИХ ретраїв
+        env = rasterio.Env(
+            GDAL_HTTP_TIMEOUT="5",
+            GDAL_HTTP_MAX_RETRY="0",  
+            GDAL_DISABLE_READDIR_ON_OPEN="EMPTY_DIR",
+            CPL_VSIL_CURL_USE_IPV6="NO",          
+            CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".tif", 
+            VSI_CACHE="TRUE",                     
+        )
+
+        try:
+            search = self.stac_client.search(collections=["cop-dem-glo-30"], bbox=bbox)
+            items = list(search.items())
+            if not items:
+                return fallback
+
+            with env:
+                src_files = []
+                for item in items:
+                    try:
+                        signed_url = pc.sign(item.assets["data"].href)
+                        src = rasterio.open(signed_url)
+                        src_files.append(src)
+                    except Exception as e:
+                        print(f"  [DEM] Skipped broken tile: {type(e).__name__}")
+                        
+                if not src_files:
                     return fallback
 
-                src_files = [rasterio.open(item.assets["data"].href) for item in items]
                 try:
-                    mosaic_arr, mosaic_transform = merge(src_files)
+                    mosaic_arr, mosaic_transform = merge(src_files, bounds=(bbox[0]-0.01, bbox[1]-0.01, bbox[2]+0.01, bbox[3]+0.01))
                     src_crs = src_files[0].crs
                     src_nodata = src_files[0].nodata
                 finally:
@@ -167,15 +188,11 @@ class SpatialFeatureFetcher:
                 )
                 return dem, target_transform
 
-            except Exception as e:
-                wait = self.retry_backoff ** attempt
-                print(f"  [DEM] Attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s...")
-                time.sleep(wait)
-                self.stac_client = self._init_stac_client()
-
-        print("  [DEM] All retries exhausted — returning NaN array.")
+        except Exception as e:
+            print(f"  [DEM] Fetch failed ({type(e).__name__}) — returning NaN.")
+            
         return fallback
-
+    
     def _fetch_osm_geometries(
         self, grid_info: dict, target_date: str, buffer_meters: float = 0.0
     ) -> Optional[gpd.GeoDataFrame]:
@@ -184,12 +201,10 @@ class SpatialFeatureFetcher:
             west, south, east, north = self._get_buffered_wgs84_bbox(
                 grid_info, buffer_meters=buffer_meters
             )
+            osm_date = f"{target_date[:4]}-07-01" if COARSE else target_date
             return self.osm_extractor.extract_features_for_date(
-                date=target_date,
-                west=west,
-                south=south,
-                east=east,
-                north=north,
+                date=osm_date,
+                west=west, south=south, east=east, north=north,
                 target_crs=grid_info["crs"],
             )
         elif self.osm_mode == "overpass":
@@ -267,7 +282,7 @@ class SpatialFeatureFetcher:
                     src_crs=grid_info["crs"],
                     src_transform=native_transform,
                     grid_info=grid_info,
-                    resampling_method=Resampling.bilinear,
+                    resampling_method=Resampling.max if (COARSE and name == "Slope") else Resampling.bilinear,
                     dst_nodata=np.nan,
                 )
             except Exception as e:
@@ -330,7 +345,7 @@ class SpatialFeatureFetcher:
                 src_crs=grid_info["crs"],
                 dst_transform=grid_info["transform"],
                 dst_crs=grid_info["crs"],
-                resampling=Resampling.bilinear,
+                resampling=Resampling.min if COARSE else Resampling.bilinear,
                 dst_nodata=max_time_cap_hours,
             )
             return master_time_10m

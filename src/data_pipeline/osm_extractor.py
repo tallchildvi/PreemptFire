@@ -614,7 +614,7 @@ class HistoricalOSMExtractor:
                     "osmium",
                     "extract",
                     "--strategy",
-                    "smart",
+                    "simple",
                     "--bbox",
                     f"{west},{south},{east},{north}",
                     str(snapshot_pbf),
@@ -632,7 +632,7 @@ class HistoricalOSMExtractor:
                     filter_type="keep",
                     keep_nodes=True,
                     keep_ways=True,
-                    keep_relations=True,
+                    keep_relations=False,
                 )
                 if gdf_chunk is not None and not gdf_chunk.empty:
                     gathered_gdfs.append(gdf_chunk)

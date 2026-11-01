@@ -7,7 +7,7 @@ from rasterio.transform import from_bounds
 from rasterio.warp import reproject
 from pyproj import Transformer
 
-from src.config import GRID_SIZE_PX, HALF_SCENE_METERS, PIXEL_SCALE_METERS
+from src.config import GRID_SIZE_PX, HALF_SCENE_METERS, PIXEL_SCALE_METERS, COARSE
 
 
 class GridAligner:
@@ -71,6 +71,14 @@ class GridAligner:
         dst_nodata: float | int = np.nan
     ) -> np.ndarray:
         """reprojects and resamples raster array to match master grid with explicit nodata handling"""
+        
+        if COARSE:
+            # 10 м -> 100 м: bilinear бере 4 пікселі (аліасинг), потрібне усереднення по площі
+            if resampling_method == Resampling.bilinear:
+                resampling_method = Resampling.average
+            # NaN у float-масивах не повинні "розтікатися" при усередненні
+            if src_nodata is None and np.issubdtype(src_array.dtype, np.floating):
+                src_nodata = np.nan
         
         # initialize array with nodata values instead of zeros
         if np.isnan(dst_nodata):
