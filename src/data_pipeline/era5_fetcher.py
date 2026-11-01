@@ -1,34 +1,29 @@
+from datetime import datetime, timedelta
 import os
 from typing import Optional
-
+from dotenv import load_dotenv
 import ee
 import matplotlib.pyplot as plt
 import numpy as np
 import rasterio
-import requests
-from dotenv import load_dotenv
-from pyproj import Transformer
 from rasterio.enums import Resampling
 from rasterio.io import MemoryFile
 from rasterio.warp import reproject
+import requests
 
 from src.processing.grid_aligner import GridAligner
 
 
 class ERA5Fetcher:
-    """
-    Fetches volumetric soil moisture from ECMWF ERA5-Land Hourly via GEE,
-    aggregates to daily mean, and reprojects onto the 10m master UTM grid (2048x2048).
-    """
+    """Fetches daily volumetric surface soil moisture (0-7 cm) from ECMWF ERA5-Land via GEE."""
 
-    COLLECTION_HOURLY = "ECMWF/ERA5_LAND/HOURLY"
-
-    def __init__(self, project_id: Optional[str] = None, buffer_meters: float = 20_000.0):
+    def __init__(self, project_id: Optional[str] = None, default_moisture: float = 0.20):
         load_dotenv()
-        self.aligner = GridAligner()
         self.project_id = project_id or os.getenv("GEE_PROJECT")
-        self.buffer_meters = buffer_meters
+        self.default_moisture = float(default_moisture)
+        self.aligner = GridAligner()
         self._init_earth_engine()
+        self.collection_name = "ECMWF/ERA5_LAND/DAILY_AGGR"
 
     def _init_earth_engine(self) -> None:
         try:
@@ -39,108 +34,87 @@ class ERA5Fetcher:
         except Exception as e:
             raise RuntimeError(
                 f"Failed to initialize Earth Engine: {e}\n"
-                f"Run 'ee.Authenticate()' or set GEE_PROJECT in .env"
+                f"Run 'ee.Authenticate()' or verify GEE_PROJECT in your .env"
             )
 
-    def _get_buffered_region(self, grid_info: dict) -> ee.Geometry:
-        min_x, min_y, max_x, max_y = grid_info["utm_bounds"]
-        b_min_x, b_max_x = min_x - self.buffer_meters, max_x + self.buffer_meters
-        b_min_y, b_max_y = min_y - self.buffer_meters, max_y + self.buffer_meters
+    def fetch_soil_moisture(self, grid_info: dict, target_date: str) -> np.ndarray:
+        """Fetches top-layer (0-7 cm) volumetric soil moisture aligned to the master grid."""
+        shape = grid_info["shape"]
+        master_crs = grid_info["crs"]
+        master_transform = grid_info["transform"]
+        min_lon, min_lat, max_lon, max_lat = grid_info["bbox_wgs84"]
 
-        transformer = Transformer.from_crs(grid_info["crs"], "EPSG:4326", always_xy=True)
-        corners = [(b_min_x, b_min_y), (b_min_x, b_max_y), (b_max_x, b_min_y), (b_max_x, b_max_y)]
-        coords_wgs84 = [transformer.transform(x, y) for x, y in corners]
-        lons = [p[0] for p in coords_wgs84]
-        lats = [p[1] for p in coords_wgs84]
-
-        return ee.Geometry.Rectangle(
-            [min(lons), min(lats), max(lons), max(lats)],
+        buf = 0.15
+        region = ee.Geometry.Rectangle(
+            [min_lon - buf, min_lat - buf, max_lon + buf, max_lat + buf],
             proj="EPSG:4326",
             geodesic=False,
         )
 
-    def fetch_soil_moisture(self, grid_info: dict, target_date: str) -> np.ndarray:
-        """
-        Streams volumetric soil moisture (0-7 cm, m3/m3) for target_date (YYYY-MM-DD)
-        and reprojects onto 2048x2048 10m master grid.
-        """
-        shape = grid_info["shape"]
-        region = self._get_buffered_region(grid_info)
-
-        t_start = ee.Date(target_date)
-        t_end = t_start.advance(1, "day")
+        target_dt = datetime.strptime(target_date.split(" ")[0], "%Y-%m-%d")
+        start_str = (target_dt - timedelta(days=5)).strftime("%Y-%m-%d")
+        end_str = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
 
         col = (
-            ee.ImageCollection(self.COLLECTION_HOURLY)
-            .filterDate(t_start, t_end)
+            ee.ImageCollection(self.collection_name)
+            .filterDate(start_str, end_str)
             .select(["volumetric_soil_water_layer_1"])
         )
 
-        if col.size().getInfo() == 0:
-            print(f"[ERA5Fetcher] No ERA5 data found for {target_date}, trying 5-day fallback...")
-            col = (
-                ee.ImageCollection(self.COLLECTION_HOURLY)
-                .filterDate(t_start.advance(-5, "day"), t_end)
-                .select(["volumetric_soil_water_layer_1"])
-            )
-            if col.size().getInfo() == 0:
-                return np.full(shape, 0.25, dtype=np.float32)
-
-        daily_soil_img = col.mean()
-
         try:
-            download_url = daily_soil_img.getDownloadURL({
+            img = col.sort("system:time_start", False).first().unmask(self.default_moisture)
+            download_url = img.getDownloadURL({
                 "region": region,
-                "scale": 9000,
+                "scale": 5000,
                 "crs": "EPSG:4326",
                 "format": "GEO_TIFF",
             })
-            resp = requests.get(download_url, timeout=40)
+            resp = requests.get(download_url, timeout=30)
             resp.raise_for_status()
+
+            soil_raster = np.full(shape, self.default_moisture, dtype=np.float32)
+            with MemoryFile(resp.content) as memfile:
+                with memfile.open() as src:
+                    reproject(
+                        source=rasterio.band(src, 1),
+                        destination=soil_raster,
+                        src_crs=src.crs,
+                        src_transform=src.transform,
+                        dst_crs=master_crs,
+                        dst_transform=master_transform,
+                        resampling=Resampling.bilinear,
+                        src_nodata=src.nodata,
+                        dst_nodata=self.default_moisture,
+                    )
+
+            soil_raster = np.nan_to_num(soil_raster, nan=self.default_moisture)
+            return np.clip(soil_raster, 0.0, 1.0).astype(np.float32)
+
         except Exception as e:
-            print(f"[ERA5Fetcher] GEE stream error: {e}")
-            return np.full(shape, 0.25, dtype=np.float32)
-
-        soil_10m = np.zeros(shape, dtype=np.float32)
-        with MemoryFile(resp.content) as memfile:
-            with memfile.open() as src:
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=soil_10m,
-                    src_crs=src.crs,
-                    src_transform=src.transform,
-                    dst_crs=grid_info["crs"],
-                    dst_transform=grid_info["transform"],
-                    resampling=Resampling.bilinear,
-                    src_nodata=src.nodata,
-                    dst_nodata=0.25,
-                )
-
-        soil_10m = np.nan_to_num(soil_10m, nan=0.25)
-        return np.clip(soil_10m, 0.01, 0.75).astype(np.float32)
+            print(f"  [ERA5Fetcher] Warning: soil moisture fetch failed ({e}), using fallback={self.default_moisture}")
+            return np.full(shape, self.default_moisture, dtype=np.float32)
 
 
 if __name__ == "__main__":
     aligner = GridAligner()
+    fetcher = ERA5Fetcher()
 
-    lat, lon = 53.9057388, -113.2269477
-    date = "2023-07-15"
+    test_lat, test_lon = 41.6986, -7.0011
+    test_date = "2022-08-08"
+    grid_info = aligner.get_master_grid_info(test_lat, test_lon)
 
-    grid_info = aligner.get_master_grid_info(lat=lat, lon=lon)
-    fetcher = ERA5Fetcher(buffer_meters=20_000.0)
+    print(f"Fetching ERA5-Land Soil Moisture for [{test_lat}, {test_lon}] on {test_date}...")
+    sm = fetcher.fetch_soil_moisture(grid_info=grid_info, target_date=test_date)
+    print(f"Shape: {sm.shape} | Range: [{sm.min():.4f}, {sm.max():.4f}] | Mean: {sm.mean():.4f}")
 
-    soil_moisture = fetcher.fetch_soil_moisture(grid_info=grid_info, target_date=date)
-
-    print(f"\n--- ERA5-Land Soil Moisture (0-7 cm) ---")
-    print(f"Shape: {soil_moisture.shape}")
-    print(f"Dtype: {soil_moisture.dtype}")
-    print(f"Range: [{soil_moisture.min():.3f}, {soil_moisture.max():.3f}] m3/m3")
-    print(f"Mean:  {soil_moisture.mean():.3f} m3/m3")
-
-    plt.figure(figsize=(8, 7))
-    plt.imshow(soil_moisture, cmap="YlGnBu", origin="upper", vmin=0.1, vmax=0.45)
-    plt.title(f"ERA5-Land Soil Moisture L1 (0-7 cm)\nDate: {date} | Coords: [{lat:.4f}, {lon:.4f}]", fontweight="bold")
-    plt.axis("off")
-    plt.colorbar(label="Volumetric Soil Water (m³/m³)", fraction=0.046, pad=0.04)
+    fig, ax = plt.subplots(figsize=(7, 6))
+    im = ax.imshow(sm, cmap="YlGnBu", origin="upper", vmin=0.0, vmax=0.6)
+    ax.set_title(
+        f"ERA5-Land Volumetric Soil Moisture (0-7 cm)\nDate: {test_date} | Mean: {sm.mean():.3f} m3/m3",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax.axis("off")
+    plt.colorbar(im, ax=ax, label="Soil Moisture (m3/m3)")
     plt.tight_layout()
     plt.show()

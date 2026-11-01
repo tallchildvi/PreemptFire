@@ -1,4 +1,3 @@
-import os
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -6,19 +5,16 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 DATA_DIR = BASE_DIR / "data"
 RAW_DATA_DIR = DATA_DIR / "raw"
 INTERIM_DATA_DIR = DATA_DIR / "interim"
+PROCESSED_H5_DIR = DATA_DIR / "processed"
 
-PF_MODE = os.getenv("PF_MODE", "100m")
+# Spatial resolution & grid configuration: 12.80 km x 12.80 km at 100m/pixel (1 scene = 1 patch)
+GRID_SIZE_PX = 128
+PATCH_SIZE_PX = 128
+STRIDE_PX = 128
+PIXEL_SCALE_METERS = 100.0
 
-if PF_MODE == "100m":
-    GRID_SIZE_PX = 128
-    PIXEL_SCALE_METERS = 100.0
-    PATCH_SIZE_PX = 128
-    PROCESSED_H5_DIR = DATA_DIR / "processed_100m"
-else:
-    GRID_SIZE_PX = 1280
-    PIXEL_SCALE_METERS = 10.0
-    PATCH_SIZE_PX = 256
-    PROCESSED_H5_DIR = DATA_DIR / "processed"
+HALF_SCENE_METERS = (GRID_SIZE_PX // 2) * PIXEL_SCALE_METERS  # 6400.0 meters
 
-HALF_SCENE_METERS = (GRID_SIZE_PX // 2) * PIXEL_SCALE_METERS   # 6400 м (100m) або 6400 м (10m): сцена 12.8 км
-COARSE = PIXEL_SCALE_METERS >= 50.0
+# Hard quality gate thresholds
+MAX_INVALID_RATIO = 0.20
+MIN_DEM_VALID_RATIO = 0.98

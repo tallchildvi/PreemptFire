@@ -1,29 +1,30 @@
 import os
 from pathlib import Path
+import shutil
 import sqlite3
 import threading
 import time
-from typing import Dict, List, Optional
+from typing import Optional
 import pandas as pd
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
+from src.config import MAX_INVALID_RATIO, PATCH_SIZE_PX, STRIDE_PX
 from src.data_pipeline.hdf5_writer import HDF5Writer
 from src.data_pipeline.patch_extractor import PatchExtractor
 from src.data_pipeline.single_scene_collector import SingleSceneCollector
 
 
 class DatasetGenerator:
-    """Parallel batch processor creating isolated HDF5 shards with robust SQLite recovery."""
+    """Batch processor creating isolated 100m single-patch HDF5 shards with SQLite checkpoint recovery."""
 
     def __init__(
         self,
         points_csv_path: str,
         output_shards_dir: str = "data/processed/shards",
-        patch_size: int = 256,
-        stride: int = 256,
-        max_invalid_ratio: float = 0.20,
+        patch_size: int = PATCH_SIZE_PX,
+        stride: int = STRIDE_PX,
+        max_invalid_ratio: float = MAX_INVALID_RATIO,
         osm_mode: str = "local_history",
-        max_workers: int = 4,
+        max_workers: int = 2,
     ):
         self.points_csv_path = points_csv_path
         self.output_shards_dir = Path(output_shards_dir)
@@ -35,7 +36,6 @@ class DatasetGenerator:
         self._init_db()
         self._recover_stuck_scenes()
 
-        # Collector is thread-safe (mostly network I/O)
         self.collector = SingleSceneCollector(osm_mode=osm_mode)
         self.patch_size = patch_size
         self.stride = stride
@@ -45,7 +45,7 @@ class DatasetGenerator:
         return sqlite3.connect(self.db_path, timeout=60.0)
 
     def _init_db(self):
-        """Creates checkpoint table if not exists."""
+        """Creates checkpoint table if it does not exist."""
         with self._db_lock, self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute(
@@ -66,7 +66,7 @@ class DatasetGenerator:
             conn.commit()
 
     def _recover_stuck_scenes(self):
-        """Resets any scenes that were left in 'PROCESSING' state due to a power outage."""
+        """Resets any scenes left in 'PROCESSING' state due to an unexpected interruption."""
         with self._db_lock, self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("UPDATE scenes_tracker SET status = 'PENDING' WHERE status = 'PROCESSING'")
@@ -76,7 +76,7 @@ class DatasetGenerator:
                 print(f"[RECOVERY] Reverted {recovered} interrupted scenes back to PENDING.")
 
     def sync_from_csv(self, df: pd.DataFrame):
-        """Registers new points from CSV into tracker."""
+        """Registers new points from CSV into SQLite tracker."""
         with self._db_lock, self._get_connection() as conn:
             cursor = conn.cursor()
             now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -100,8 +100,10 @@ class DatasetGenerator:
                 )
             conn.commit()
 
-    def _update_status(self, scene_id: str, status: str, patches_count: int = 0, error_msg: Optional[str] = None):
-        """Thread-safe status update."""
+    def _update_status(
+        self, scene_id: str, status: str, patches_count: int = 0, error_msg: Optional[str] = None
+    ):
+        """Thread-safe SQLite status update."""
         with self._db_lock, self._get_connection() as conn:
             cursor = conn.cursor()
             now = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -116,8 +118,7 @@ class DatasetGenerator:
             conn.commit()
 
     def _process_single_scene(self, scene: dict) -> str:
-        """Worker function that fully processes one scene and writes it to its own HDF5 shard."""
-        import shutil
+        """Processes one scene and writes its single 128x128 patch to an isolated HDF5 shard."""
         free_gb = shutil.disk_usage(self.output_shards_dir).free / (1024**3)
         if free_gb < 5.0:
             return f"[{scene['scene_id']}] STOPPED: Low disk space ({free_gb:.1f} GB free)"
@@ -131,16 +132,20 @@ class DatasetGenerator:
         t_start = time.perf_counter()
 
         try:
-            print(f"  -> [{scene_id}] [Етап 1/3] Збір даних з API (SingleSceneCollector)...")
+            print(f"  -> [{scene_id}] [Stage 1/3] Collecting multi-modal scene data (SingleSceneCollector)...")
             sample = self.collector.collect_sample(
                 lat=lat, lon=lon, target_date=target_date, is_fire=is_fire
             )
 
             if sample is None:
-                self._update_status(scene_id, status="SKIPPED_NO_DATA", error_msg="Missing S2 optical pair or heavy clouds")
-                return f"[{scene_id}] SKIPPED (No data)"
+                self._update_status(
+                    scene_id,
+                    status="SKIPPED_NO_DATA",
+                    error_msg="Missing S2 T0 scene, heavy clouds, or failed DEM/Road quality gate",
+                )
+                return f"[{scene_id}] SKIPPED (Quality gate or missing S2/DEM data)"
 
-            print(f"  -> [{scene_id}] [Етап 2/3] Дані зібрано. Нарізка на патчі (PatchExtractor)...")
+            print(f"  -> [{scene_id}] [Stage 2/3] Extracting full-scene patch ({self.patch_size}x{self.patch_size})...")
             extractor = PatchExtractor(
                 patch_size=self.patch_size,
                 stride=self.stride,
@@ -149,69 +154,70 @@ class DatasetGenerator:
             patches = list(extractor.extract_patches(sample, scene_id=scene_id))
 
             if not patches:
-                self._update_status(scene_id, status="SKIPPED_EMPTY_PATCHES", error_msg="0 valid patches passed quality gate")
+                self._update_status(
+                    scene_id,
+                    status="SKIPPED_EMPTY_PATCHES",
+                    error_msg="0 valid patches passed quality gate",
+                )
                 return f"[{scene_id}] SKIPPED (0 valid patches)"
 
-            print(f"  -> [{scene_id}] [Етап 3/3] Відібрано {len(patches)} патчів. Збереження у HDF5...")
+            print(f"  -> [{scene_id}] [Stage 3/3] Writing {len(patches)} patch(es) to HDF5 shard...")
             shard_path = self.output_shards_dir / f"{scene_id}.h5"
-            shard_path.unlink(missing_ok=True)  # захист від дублювання при ретраях
+            shard_path.unlink(missing_ok=True)
             writer = HDF5Writer(output_path=shard_path, patch_size=self.patch_size)
             written_count = writer.write_patches_batch(patches)
 
             elapsed = time.perf_counter() - t_start
             self._update_status(scene_id, status="COMPLETED", patches_count=written_count)
-            return f"[{scene_id}] SUCCESS: {written_count} patches in {elapsed:.1f}s"
+            return f"[{scene_id}] SUCCESS: {written_count} patch(es) in {elapsed:.1f}s"
 
         except Exception as e:
             self._update_status(scene_id, status="FAILED", error_msg=str(e))
             return f"[{scene_id}] FAILED: {str(e)}"
-        
+
     def run(self, max_scenes: Optional[int] = None):
-            """Executes sequential batch collection to prevent GDAL/Rasterio deadlocks."""
-            df_points = pd.read_csv(self.points_csv_path)
-            self.sync_from_csv(df_points)
+        """Executes sequential batch collection to prevent GDAL/Rasterio deadlocks."""
+        df_points = pd.read_csv(self.points_csv_path)
+        self.sync_from_csv(df_points)
 
-            with self._get_connection() as conn:
-                conn.row_factory = sqlite3.Row
-                cursor = conn.cursor()
-                # FAILED are retried automatically, PENDING are new/recovered
-                cursor.execute(
-                    """
-                    SELECT scene_id, lat, lon, target_date, is_fire 
-                    FROM scenes_tracker 
-                    WHERE status IN ('PENDING', 'FAILED')
-                    ORDER BY RANDOM()
-                    """
-                )
-                pending_scenes = [dict(r) for r in cursor.fetchall()]
+        with self._get_connection() as conn:
+            conn.row_factory = sqlite3.Row
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT scene_id, lat, lon, target_date, is_fire 
+                FROM scenes_tracker 
+                WHERE status IN ('PENDING', 'FAILED')
+                ORDER BY target_date ASC, scene_id ASC
+                """
+            )
+            pending_scenes = [dict(r) for r in cursor.fetchall()]
 
-            if max_scenes:
-                pending_scenes = pending_scenes[:max_scenes]
+        if max_scenes:
+            pending_scenes = pending_scenes[:max_scenes]
 
-            print(f"\n--- Found {len(pending_scenes)} scenes pending processing ---")
-            print("--- Starting sequential execution ---")
+        print(f"\n--- Found {len(pending_scenes)} scenes pending processing ---")
+        print(f"--- Starting sequential execution (Grid: {self.patch_size}x{self.patch_size}) ---")
 
-            for idx, scene in enumerate(pending_scenes, 1):
-                result_msg = self._process_single_scene(scene)
-                print(f"({idx}/{len(pending_scenes)}) {result_msg}")
+        for idx, scene in enumerate(pending_scenes, 1):
+            result_msg = self._process_single_scene(scene)
+            print(f"({idx}/{len(pending_scenes)}) {result_msg}")
+
 
 if __name__ == "__main__":
-    from src.config import INTERIM_DATA_DIR, PROCESSED_H5_DIR, COARSE, PATCH_SIZE_PX
-    csv_input_path = os.path.join(INTERIM_DATA_DIR, "points_grid_100m.csv")
-    output_shards_dir = os.path.join(PROCESSED_H5_DIR, "shards")
+    csv_input_path = os.path.join("data", "interim", "points_dataset_thinned.csv")
+    output_shards_dir = os.path.join("data", "processed", "shards")
 
     if not os.path.exists(csv_input_path):
-        raise FileNotFoundError(f"input csv file not found: {csv_input_path}")
+        raise FileNotFoundError(f"Input CSV file not found: {csv_input_path}")
 
-    print("--- initializing resilient parallel generator ---")
+    print("--- Initializing 100m Single-Patch DatasetGenerator ---")
     generator = DatasetGenerator(
         points_csv_path=csv_input_path,
         output_shards_dir=output_shards_dir,
         patch_size=PATCH_SIZE_PX,
-        stride=PATCH_SIZE_PX,
-        max_invalid_ratio=0.30 if COARSE else 0.20,
+        stride=STRIDE_PX,
+        max_invalid_ratio=MAX_INVALID_RATIO,
         osm_mode="local_history",
-        max_workers=2,
     )
     generator.run(max_scenes=None)
-    # generator.run(max_scenes=10)
