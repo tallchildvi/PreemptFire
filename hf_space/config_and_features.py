@@ -129,9 +129,7 @@ FT_NAMES: List[str] = get_ft_names(128)
 TAB_ALL_NAMES: List[str] = TAB_1D_NAMES + FT_NAMES
 
 
-# =========================================================================
 # SPHERICAL GEOMETRY HELPERS
-# =========================================================================
 
 def to_xyz(lat, lon) -> np.ndarray:
     la, lo = np.radians(np.asarray(lat, float)), np.radians(np.asarray(lon, float))
@@ -147,9 +145,7 @@ def circ(a, b):
     return np.minimum(d, 365 - d)
 
 
-# =========================================================================
 # 1D CONTEXT FEATURES (35 raw -> 39 transformed)
-# =========================================================================
 
 def raw_context_vector(ctx: Dict[str, float]) -> np.ndarray:
     """Extracts the 35 canonical 1D features in exact alphabetical order."""
@@ -186,9 +182,7 @@ def transform_1d_for_nn(x1_raw: np.ndarray) -> np.ndarray:
     return np.column_stack([x1, np.cos(wd)]).astype(np.float32)
 
 
-# =========================================================================
 # 30-DAY FIRE HISTORY (21 tabular features + (30, 5) sequence tensor)
-# =========================================================================
 
 def history_many(
     pts_xyz: np.ndarray,
@@ -249,9 +243,7 @@ def history_single(
     return X_hist[0], HC[0], SEQ[0]
 
 
-# =========================================================================
 # MULTI-YEAR FIRE CLIMATOLOGY (9 features + rate/pday/ncov)
-# =========================================================================
 
 class ClimatologyIndex:
     """In-memory KDTree index of historical FIRMS detections (2017-2025) for fast queries."""
@@ -360,9 +352,7 @@ def get_climatology_index() -> ClimatologyIndex:
     return _CLIM_INDEX
 
 
-# =========================================================================
 # 2D RASTER PREPROCESSING (202 tabular stats for tab_full & 33-ch for SimCLR)
-# =========================================================================
 
 def detect_scales(sample_x2d: np.ndarray) -> Tuple[str, str]:
     """Detects Sentinel-2 (0_1 vs 0_10000) and SAR (db vs linear) scales."""

@@ -1,10 +1,4 @@
-"""Local preparation & verification script before pushing to Hugging Face Spaces.
-
-Run this script on your computer where you have:
-- `preemptfire_full_output/` (with `models/`, `oof_predictions.csv`, `count_metrics.csv`, `summary.json`)
-- `firms_points_2017_2025.csv.gz`
-- (Optional) your local folder of `.npz` training scenes (`scenes/`) to extract `population_cache.csv`
-  so you NEVER need Google Earth Engine credentials on Hugging Face Spaces!
+"""Local preparation and verification script before pushing to Hugging Face Spaces.
 
 Usage:
   python prepare_hf_bundle.py \
@@ -24,7 +18,6 @@ import pandas as pd
 
 
 REQUIRED_MODEL_FILES = [
-    # 1D + History + Climatology CatBoost models
     "tab_clim_full_classifier.cbm",
     "tab_clim_full_regressor_5km.cbm",
     "tab_clim_full_regressor_10km.cbm",
@@ -40,7 +33,6 @@ REQUIRED_MODEL_FILES = [
     "tab_1d_regressor_10km.cbm",
     "tab_1d_regressor_25km.cbm",
     "tab_1d_regressor_50km.cbm",
-    # 2D Satellite Image CatBoost + SimCLR models
     "tab_ssl_full_classifier.cbm",
     "tab_ssl_full_regressor_5km.cbm",
     "tab_ssl_full_regressor_10km.cbm",
@@ -53,7 +45,6 @@ REQUIRED_MODEL_FILES = [
     "tab_full_regressor_10km.cbm",
     "tab_full_regressor_25km.cbm",
     "tab_full_regressor_50km.cbm",
-    # PyTorch GRU + kNN models
     "nn_ts_final_model.pt",
     "coords_classifier_knn.pkl",
     "coords_regressor_knn.pkl",
@@ -62,9 +53,6 @@ REQUIRED_MODEL_FILES = [
 
 
 def extract_population_cache_from_npz(metadata_csv: Path, scenes_dir: Path, out_cache: Path) -> bool:
-    """Extracts exact `population_10km_log1p` and `population_50km_log1p` from local `.npz` files
-    (`X_1d[14]` and `X_1d[15]`) so GEE is not needed on Hugging Face Spaces.
-    """
     if not metadata_csv.exists() or not scenes_dir.exists():
         return False
     df = pd.read_csv(metadata_csv)
@@ -100,7 +88,7 @@ def extract_population_cache_from_npz(metadata_csv: Path, scenes_dir: Path, out_
     if rows:
         out_df = pd.DataFrame(rows)
         out_df.to_csv(out_cache, index=False)
-        print(f"[OK] Extracted population_cache.csv for {len(out_df)} unique points from {scenes_dir}")
+        print(f"Extracted population_cache.csv for {len(out_df)} unique points from {scenes_dir}")
         return True
     return False
 
@@ -119,7 +107,6 @@ def main():
     models_dir.mkdir(parents=True, exist_ok=True)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Copy model files and OOF/metrics from --models-src if provided
     if args.models_src:
         src = Path(args.models_src)
         src_models = src / "models" if (src / "models").exists() else src
@@ -132,13 +119,11 @@ def main():
                 shutil.copy2(cand, out_dir / top_f)
                 shutil.copy2(cand, data_dir / top_f)
 
-    # 2. Copy firms_points_2017_2025.csv.gz if provided
     if args.firms_gz and Path(args.firms_gz).exists():
         shutil.copy2(args.firms_gz, out_dir / "firms_points_2017_2025.csv.gz")
         shutil.copy2(args.firms_gz, data_dir / "firms_points_2017_2025.csv.gz")
-        print(f"[OK] Copied {args.firms_gz}")
+        print(f"Copied {args.firms_gz}")
 
-    # 3. Extract population_cache.csv from local .npz scenes if available
     if args.scenes_dir:
         extract_population_cache_from_npz(
             out_dir / "metadata.csv",
@@ -146,18 +131,17 @@ def main():
             out_dir / "population_cache.csv",
         )
 
-    # 4. Print verification report
-    print("\n================ ПЕРЕВІРКА ФАЙЛІВ ДЛЯ HUGGING FACE SPACES ================")
+    print("\nFile check for Hugging Face Spaces:")
     missing_models = [f for f in REQUIRED_MODEL_FILES if not (models_dir / f).exists()]
-    print(f"Моделі в {models_dir}: {len(REQUIRED_MODEL_FILES) - len(missing_models)}/{len(REQUIRED_MODEL_FILES)} знайдено.")
+    print(f"Models in {models_dir}: {len(REQUIRED_MODEL_FILES) - len(missing_models)}/{len(REQUIRED_MODEL_FILES)} found.")
     if missing_models:
-        print("  Відсутні файли моделей (скопіюйте їх у hf_space/models/):")
+        print("  Missing model files (copy them to hf_space/models/):")
         for m in missing_models:
             print(f"   - {m}")
 
     for df_name in ("metadata.csv", "firms_covered_days.csv", "firms_points_2017_2025.csv.gz", "oof_predictions.csv", "population_cache.csv"):
         exists = (out_dir / df_name).exists() or (data_dir / df_name).exists()
-        status = "✅ Є" if exists else "⚠️ ВІДСУТНІЙ (скопіюйте в hf_space/)"
+        status = "present" if exists else "missing (copy to hf_space/)"
         print(f"  {df_name:32s}: {status}")
 
 

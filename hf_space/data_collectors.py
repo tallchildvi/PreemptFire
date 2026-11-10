@@ -52,9 +52,7 @@ def _make_session() -> requests.Session:
     return s
 
 
-# =========================================================================
 # 1. WEATHER COLLECTOR (Open-Meteo Single & Batched Multi-Point)
-# =========================================================================
 
 HOURLY_VARS = [
     "temperature_2m",
@@ -290,9 +288,7 @@ def fetch_weather_cells(
     return [res[k] for k in key], len(cells)
 
 
-# =========================================================================
 # 2. LAST SENTINEL-2 PASS (STAC metadata only, for 1D single-point scoring)
-# =========================================================================
 
 def last_sentinel_pass(
     lat: float, lon: float, weather_day: date, lookback: int = 30, max_cloud: float = 60.0
@@ -321,9 +317,7 @@ def last_sentinel_pass(
     return weather_day - timedelta(days=3)
 
 
-# =========================================================================
 # 3. POPULATION COLLECTOR (Cache + GEE + KDTree Interpolation Fallback)
-# =========================================================================
 
 def _init_gee() -> bool:
     try:
@@ -494,9 +488,7 @@ def fetch_population_points(pts: pd.DataFrame, cache: Optional[str] = None) -> p
     )
 
 
-# =========================================================================
 # 4. FIRMS FIRE DETECTIONS COLLECTOR (With Local Archive + 5-Day Disk Cache)
-# =========================================================================
 
 def fetch_firms_days(
     lat: float,
@@ -628,9 +620,7 @@ def fetch_firms_days(
     return pts, covered
 
 
-# =========================================================================
 # 5. FULL 2D SCENE COLLECTOR (For Image Models: tab_ssl_full, tab_full)
-# =========================================================================
 
 NEIGHBOR_OFFSETS = np.array(
     [

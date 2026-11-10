@@ -1,24 +1,14 @@
-"""Risk map & visual multi-model comparison over the Iberia scene grid.
-
-Compatible with Claude's CLI interface AND extended with multi-model selection,
-2D satellite scene integration (`tab_ssl_full`, `tab_full`), side-by-side comparison maps,
-and automatic saving to `mini_dataset/`.
+"""Risk map and visual multi-model comparison over the Iberia scene grid.
 
 Usage examples:
-  # Classic single-model run (compatible with Claude's command):
   python make_map.py --date 2025-08-12 --points metadata.csv --oof oof_predictions.csv
-
-  # Run and visually compare two or more models (e.g. tab_clim_full vs nn_ts vs tab_hist):
   python make_map.py --date 2025-08-12 --points metadata.csv --models tab_clim_full,nn_ts,tab_hist --compare tab_clim_full,nn_ts
-
-  # Collect 2D Sentinel-2/S1/DEM/OSM imagery for top-N points (or cached scenes) and compare tab_ssl_full vs tab_clim_full:
   python make_map.py --date 2025-08-12 --points metadata.csv --collect-2d-limit 20 --models tab_ssl_full,tab_full,tab_clim_full --compare tab_ssl_full,tab_clim_full
 """
 from __future__ import annotations
 
 import argparse
 import json
-import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -73,9 +63,6 @@ def build_grid_features(
     reg: Optional[ModelRegistry] = None,
     progress_cb=None,
 ) -> Dict[str, Any]:
-    """Computes or loads all 1D, 30-day history, climatology, sequence, and (cached/collected) 2D features
-    for all grid points on `day`.
-    """
     store = store or MiniDatasetStore(CONFIG.get("MINI_DATASET_DIR", "mini_dataset"))
     reg = reg or ModelRegistry(CONFIG.get("MODEL_DIR", "models"))
 
@@ -84,26 +71,23 @@ def build_grid_features(
     H = int(CONFIG["HISTORY_DAYS"])
 
     if progress_cb:
-        progress_cb(0.10, f"Збір погоди Open-Meteo ERA5 за {wd} для {len(pts)} точок (батчами по 0.25° клітинках)...")
+        progress_cb(0.10, f"Fetching Open-Meteo weather for {wd} across {len(pts)} points...")
     print(f"[1/5] Fetching weather for {wd} across {len(pts)} points...")
     w_list, n_cells = fetch_weather_cells(pts, day, gap)
-    print(f"      Fetched {n_cells} unique 0.25° cells.")
+    print(f"      Fetched {n_cells} unique 0.25 deg cells.")
 
     if progress_cb:
-        progress_cb(0.30, "Завантаження щільності населення (10 км та 50 км)...")
+        progress_cb(0.30, "Loading population features (10 km and 50 km)...")
     print("[2/5] Loading population features...")
     pop = fetch_population_points(pts, cache=CONFIG["POPULATION_CACHE_CSV"], metadata_df=meta_df)
 
-    # Check if any 2D scenes are already cached in mini_dataset/scenes for this date
     scenes_2d: List[Optional[Dict[str, Any]]] = [None] * len(pts)
     s2_dates: List[Optional[str]] = [None] * len(pts)
-    cached_2d_count = 0
     for i, r in pts.iterrows():
         cp = store.has_scene_npz(r.lat, r.lon, day)
         if cp is not None:
             try:
                 scenes_2d[i] = store.load_scene_npz(cp)
-                cached_2d_count += 1
             except Exception:
                 pass
 
@@ -123,16 +107,16 @@ def build_grid_features(
     TAB_1D = np.vstack(tab_1d_list).astype(np.float32)
 
     if progress_cb:
-        progress_cb(0.50, f"Завантаження історії пожеж FIRMS за {H} днів ({day - timedelta(days=H)} .. {wd})...")
-    print(f"[3/5] Fetching {H}-day FIRMS history ({day - timedelta(days=H)} .. {wd})...")
+        progress_cb(0.50, f"Fetching {H}-day FIRMS history ({day - timedelta(days=H)} to {wd})...")
+    print(f"[3/5] Fetching {H}-day FIRMS history ({day - timedelta(days=H)} to {wd})...")
     fire_df, covered = fetch_firms_days(day - timedelta(days=H), wd, bbox=IBERIA_BBOX)
     pts_xyz = to_xyz(pts.lat.values, pts.lon.values)
     HIST_TAB, HC = history_many(pts_xyz, fire_df, covered, day, RADII, H=H)
     print(f"      {len(fire_df)} VIIRS detections across {len(covered)}/{H} covered days.")
 
     if progress_cb:
-        progress_cb(0.65, "Обчислення багаторічної кліматології пожеж (DOY ± 15 днів)...")
-    print("[4/5] Computing historical DOY climatology...")
+        progress_cb(0.65, "Computing historical day-of-year climatology...")
+    print("[4/5] Computing historical day-of-year climatology...")
     CLIM_FEATS = climatology_many(
         pts_xyz,
         day,
@@ -144,9 +128,7 @@ def build_grid_features(
 
     SEQ, STATIC_1D = build_seq_and_static(HC, TAB_1D, CLIM_FEATS, H=H)
 
-    # Optional: collect new 2D satellite scenes for up to `collect_2d_limit` points
     if collect_2d_limit > 0:
-        # Rank candidates by tab_clim_full or persist if strategy == 'top_risk'
         try:
             prelim = reg.predict_model("tab_clim_full", TAB_1D, HIST_TAB, CLIM_FEATS)["p"]
         except Exception:
@@ -165,7 +147,7 @@ def build_grid_features(
             if progress_cb:
                 progress_cb(
                     0.70 + 0.15 * (rank_i / max(len(chosen), 1)),
-                    f"Збір 2D супутникової сцени {rank_i + 1}/{len(chosen)}: ({la:.4f}, {lo:.4f})...",
+                    f"Collecting 2D satellite scene {rank_i + 1}/{len(chosen)}: ({la:.4f}, {lo:.4f})...",
                 )
             print(f"      [2D {rank_i + 1}/{len(chosen)}] Collecting 22-ch patch at ({la:.4f}, {lo:.4f})...")
             try:
@@ -178,7 +160,6 @@ def build_grid_features(
                 )
                 scenes_2d[idx] = sc
                 store.save_scene_npz(sc)
-                # Update TAB_1D[idx] with exact S2 acquisition gap if found
                 if sc.get("s2_Source_Date") and sc["s2_Source_Date"] != "None":
                     r1d_new, t1d_new = one_d_features(
                         w_list[idx],
@@ -194,7 +175,6 @@ def build_grid_features(
 
     FT_2D, EMB32_2D, has_2d_mask = reg.compute_2d_embeddings_and_stats(scenes_2d)
 
-    # Save tabular features to mini_dataset/features/
     feat_df = pd.concat(
         [
             pts.reset_index(drop=True),
@@ -233,12 +213,10 @@ def draw_single_map(
     png_path: str | Path,
     has_2d_mask: Optional[np.ndarray] = None,
 ) -> Path:
-    """Renders the 2-panel risk map (Risk Level + Expected Detections) for one model."""
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    p = model_out["p"]
     lev = model_out["level_idx"]
     t = model_out["thresholds"]
     mu50 = model_out["mu"][50]
@@ -253,8 +231,8 @@ def draw_single_map(
             pts.lat[m],
             c=COLORS[i],
             s=14,
-            label=f"{name} ({m.sum()} сцен, {100 * m.mean():.0f}%)",
-             edgecolors="none",
+            label=f"{name} ({m.sum()} scenes, {100 * m.mean():.0f}%)",
+            edgecolors="none",
         )
     if has_2d_mask is not None and has_2d_mask.any():
         ax[0].scatter(
@@ -264,23 +242,23 @@ def draw_single_map(
             edgecolors="#00e5ff",
             s=42,
             linewidths=1.2,
-            label=f"2D Супутникова сцена ({int(has_2d_mask.sum())})",
+            label=f"2D scene ({int(has_2d_mask.sum())})",
         )
     ax[0].set_title(
-        f"[{m_name}] Рівень пожежної небезпеки на {day}\n"
-        f"(пороги OOF: Low < {t[0]:.2f} ≤ Med < {t[1]:.2f} ≤ High)"
+        f"[{m_name}] Wildfire risk level on {day}\n"
+        f"(OOF thresholds: Low < {t[0]:.2f} <= Med < {t[1]:.2f} <= High)"
     )
-    ax[0].set_xlabel("Довгота (lon)")
-    ax[0].set_ylabel("Широта (lat)")
+    ax[0].set_xlabel("Longitude")
+    ax[0].set_ylabel("Latitude")
     ax[0].legend(loc="lower left", frameon=True, fontsize=8.5)
     ax[0].grid(alpha=0.25)
 
     vmax = max(1.0, float(np.quantile(mu50, 0.98))) if len(mu50) else 1.0
     sc = ax[1].scatter(pts.lon, pts.lat, c=mu50, s=14, cmap="YlOrRd", vmin=0, vmax=vmax, edgecolors="none")
-    plt.colorbar(sc, ax=ax[1], label="E[детекцій VIIRS у радіусі 50 км]")
-    ax[1].set_title(f"[{m_name}] Очікувана к-сть пожеж у радіусі 50 км на {day}")
-    ax[1].set_xlabel("Довгота (lon)")
-    ax[1].set_ylabel("Широта (lat)")
+    plt.colorbar(sc, ax=ax[1], label="E[VIIRS detections within 50 km]")
+    ax[1].set_title(f"[{m_name}] Expected detections within 50 km on {day}")
+    ax[1].set_xlabel("Longitude")
+    ax[1].set_ylabel("Latitude")
     ax[1].grid(alpha=0.25)
 
     plt.tight_layout()
@@ -298,11 +276,6 @@ def draw_comparison_map(
     png_path: str | Path,
     has_2d_mask: Optional[np.ndarray] = None,
 ) -> Tuple[Path, Dict[str, Any]]:
-    """Renders a 3-panel visual comparison between Model A and Model B:
-    - Panel 1: Model A risk levels (Low / Medium / High) + mean P
-    - Panel 2: Model B risk levels (Low / Medium / High) + mean P
-    - Panel 3: Probability difference map ΔP = P(Model A) - P(Model B) + level agreement %
-    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -336,27 +309,27 @@ def draw_comparison_map(
                 edgecolors="#00e5ff",
                 s=40,
                 linewidths=1.1,
-                label=f"2D сцена ({int(has_2d_mask.sum())})",
+                label=f"2D scene ({int(has_2d_mask.sum())})",
             )
         ax[panel_idx].set_title(
-            f"Модель A: {m_name}\nПороги: {t[0]:.2f} / {t[1]:.2f} | Mean P={p_arr.mean():.3f}"
+            f"Model A: {m_name}\nThresholds: {t[0]:.2f} / {t[1]:.2f} | Mean P={p_arr.mean():.3f}"
             if panel_idx == 0
-            else f"Модель B: {m_name}\nПороги: {t[0]:.2f} / {t[1]:.2f} | Mean P={p_arr.mean():.3f}"
+            else f"Model B: {m_name}\nThresholds: {t[0]:.2f} / {t[1]:.2f} | Mean P={p_arr.mean():.3f}"
         )
-        ax[panel_idx].set_xlabel("Довгота (lon)")
-        ax[panel_idx].set_ylabel("Широта (lat)")
+        ax[panel_idx].set_xlabel("Longitude")
+        ax[panel_idx].set_ylabel("Latitude")
         ax[panel_idx].legend(loc="lower left", frameon=True, fontsize=8)
         ax[panel_idx].grid(alpha=0.25)
 
     lim = max(0.15, float(np.quantile(np.abs(dp), 0.98))) if len(dp) else 0.25
     sc = ax[2].scatter(pts.lon, pts.lat, c=dp, s=13, cmap="coolwarm", vmin=-lim, vmax=lim, edgecolors="none")
-    plt.colorbar(sc, ax=ax[2], label=f"ΔP = P({na}) − P({nb})")
+    plt.colorbar(sc, ax=ax[2], label=f"Delta P = P({na}) - P({nb})")
     ax[2].set_title(
-        f"Різниця ймовірностей ΔP ({na} − {nb})\n"
-        f"Збіг класів: {100 * agree:.1f}% | Кореляція r = {corr:.3f}"
+        f"Probability Difference ({na} - {nb})\n"
+        f"Level agreement: {100 * agree:.1f}% | Correlation r = {corr:.3f}"
     )
-    ax[2].set_xlabel("Довгота (lon)")
-    ax[2].set_ylabel("Широта (lat)")
+    ax[2].set_xlabel("Longitude")
+    ax[2].set_ylabel("Latitude")
     ax[2].grid(alpha=0.25)
 
     plt.tight_layout()
@@ -378,20 +351,19 @@ def draw_comparison_map(
 
 
 def main():
-    ap = argparse.ArgumentParser(description="PreemptFire daily Iberia risk map & multi-model comparison")
-    ap.add_argument("--date", required=True, help="Scored day YYYY-MM-DD (uses weather & FIRMS up to day - 1)")
+    ap = argparse.ArgumentParser(description="PreemptFire daily Iberia risk map and model comparison")
+    ap.add_argument("--date", required=True, help="Scored day YYYY-MM-DD (uses weather and FIRMS up to day - 1)")
     ap.add_argument("--points", default="metadata.csv", help="CSV with lat/latitude and lon/longitude columns")
     ap.add_argument("--oof", default="oof_predictions.csv", help="Out-of-fold predictions CSV for fixed thresholds")
     ap.add_argument("--shares", default="0.60,0.30", help="Low,Medium scene shares on OOF (rest is High)")
     ap.add_argument("--models", default="tab_clim_full,persist,clim", help="Comma-separated models to score (or 'all')")
     ap.add_argument("--compare", default="", help="Optional pair of models to compare side-by-side, e.g. 'tab_clim_full,nn_ts'")
-    ap.add_argument("--collect-2d-limit", type=int, default=0, help="Number of grid points to collect live 2D satellite scenes for (enables tab_ssl_full & tab_full)")
+    ap.add_argument("--collect-2d-limit", type=int, default=0, help="Number of grid points to collect live 2D satellite scenes for")
     ap.add_argument("--out-csv", default=None)
     ap.add_argument("--out-png", default=None)
     args = ap.parse_args()
 
     day = datetime.strptime(args.date, "%Y-%m-%d").date()
-    shares = tuple(float(x) for x in args.shares.split(","))
     out_csv = args.out_csv or f"risk_map_{day}.csv"
     out_png = args.out_png or f"risk_map_{day}.png"
 
@@ -445,9 +417,8 @@ def main():
             print(f"  [skip {m_name}] {e}")
 
     if not model_outputs:
-        raise RuntimeError("No models could be evaluated. Check `models/` directory.")
+        raise RuntimeError("No models could be evaluated. Check the models/ directory.")
 
-    # Primary model columns (backward-compatible with Claude's output format)
     primary_name = next(iter(model_outputs.keys()))
     prim = model_outputs[primary_name]
     out_df["P_fire_50km"] = np.round(prim["p"], 4)
@@ -496,7 +467,7 @@ def main():
         "out_png": out_png,
         "mini_dataset_dir": str(store.root),
     }
-    print(json.dumps(summary, indent=2, ensure_ascii=False))
+    print(json.dumps(summary, indent=2))
 
 
 if __name__ == "__main__":

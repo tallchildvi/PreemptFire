@@ -1,22 +1,17 @@
-"""Unified Model Registry & Inference Engine for PreemptFire (Approach B + v5 Notebook).
+"""Model registry and inference engine for PreemptFire.
 
-Supports all 10 models from `preemptfire-v5_(2).ipynb` and `preemptfire_full_output/models/`:
-1. Non-image models (can score all 3,146 Iberia grid points in <2 seconds):
-   - `tab_clim_full` : CatBoost on TAB_1D (39) + HIST_TAB (21) + CLIM_FEATS (9) = 69 features
-   - `tab_hist`      : CatBoost on TAB_1D (39) + HIST_TAB (21) = 60 features
-   - `tab_1d`        : CatBoost on TAB_1D (39) = 39 features
-   - `nn_ts`         : PyTorch GRU + MLP (`nn_ts_final_model.pt`) on SEQ (30x5) + 47 static features
-   - `coords`        : k-NN spatial baseline (`coords_classifier_knn.pkl`, `coords_regressor_knn.pkl`)
-   - `persist`       : 7-day fire persistence baseline (analytical formula from notebook Cell 17)
-   - `clim`          : Historical DOY fire climatology baseline (analytical formula from notebook Cell 18)
-   - `stack_no_img`  : Ensemble (mean probability / count) of available non-image models
-
-2. 2D Satellite Image models (use 22-channel 256x256 `.npz` scenes from `Scene2DCollector` or cache):
-   - `tab_ssl_full`  : Best overall model (ROC-AUC 0.767)! SimCLR ResNet (`simclr_encoder_weights.pt`, 33ch -> 192d)
-                       + PCA (`simclr_pca_32.pkl`, 192d -> 32d) + CatBoost (`tab_ssl_full_*.cbm`, 101 features)
-   - `tab_full`      : Handcrafted 202-dim 2D image statistics (`FT`) + TAB_1D (39) + HIST_TAB (21) = 262 features
-                       + CatBoost (`tab_full_*.cbm`)
-   - `stack_all`     : Full multi-modal ensemble combining `tab_ssl_full`, `tab_full`, `tab_clim_full`, `nn_ts`
+Supports the following models:
+- tab_clim_full: CatBoost on weather, 30-day history, and climatology (69 features)
+- tab_ssl_full: SimCLR ResNet-based embeddings + CatBoost (101 features)
+- tab_full: handcrafted 2D spatial/spectral stats + CatBoost (262 features)
+- tab_hist: CatBoost on weather and 30-day history (60 features)
+- tab_1d: CatBoost on weather and population (39 features)
+- nn_ts: PyTorch GRU on 30-day sequence + static features
+- coords: k-NN on geographic coordinates
+- persist: 7-day fire persistence baseline
+- clim: historical day-of-year fire climatology baseline
+- stack_no_img: ensemble of non-image models
+- stack_all: ensemble of 2D satellite and 1D models
 """
 from __future__ import annotations
 
@@ -42,76 +37,72 @@ COLORS = ["#fee08b", "#f46d43", "#a50026"]
 
 MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
     "tab_clim_full": {
-        "label": "CatBoost: Погода + 30д Історія + Кліматологія (tab_clim_full, 69 ознак)",
+        "label": "CatBoost: weather, 30d history, climatology (tab_clim_full, 69 features)",
         "requires_2d": False,
         "cbm_prefix": "tab_clim_full",
         "oof_col": "p_tab_clim_full",
         "n_features": 69,
     },
     "tab_ssl_full": {
-        "label": "🔥 CatBoost + SimCLR 2D Супутник (tab_ssl_full, 101 ознака — Найкраща модель)",
+        "label": "CatBoost + SimCLR 2D satellite (tab_ssl_full, 101 features)",
         "requires_2d": True,
         "cbm_prefix": "tab_ssl_full",
         "oof_col": "p_tab_ssl_full",
         "n_features": 101,
     },
     "tab_full": {
-        "label": "🛰️ CatBoost + 2D Статистика Знімків (tab_full, 262 ознаки)",
+        "label": "CatBoost + 2D scene statistics (tab_full, 262 features)",
         "requires_2d": True,
         "cbm_prefix": "tab_full",
         "oof_col": "p_tab_full",
         "n_features": 262,
     },
     "tab_hist": {
-        "label": "CatBoost: Погода + 30д Історія (tab_hist, 60 ознак)",
+        "label": "CatBoost: weather and 30d history (tab_hist, 60 features)",
         "requires_2d": False,
         "cbm_prefix": "tab_hist",
         "oof_col": "p_tab_hist",
         "n_features": 60,
     },
     "tab_1d": {
-        "label": "CatBoost: Тільки Погода + Населення (tab_1d, 39 ознак)",
+        "label": "CatBoost: weather and population only (tab_1d, 39 features)",
         "requires_2d": False,
         "cbm_prefix": "tab_1d",
         "oof_col": "p_tab_1d",
         "n_features": 39,
     },
     "nn_ts": {
-        "label": "PyTorch GRU Часовий Ряд + Статика (nn_ts)",
+        "label": "PyTorch GRU time series + static features (nn_ts)",
         "requires_2d": False,
         "oof_col": "p_nn_ts",
     },
     "coords": {
-        "label": "k-NN Географічні Координати (coords)",
+        "label": "k-NN coordinates baseline (coords)",
         "requires_2d": False,
         "oof_col": "p_coords",
     },
     "persist": {
-        "label": "Базова: Персистентність вогню за 7 днів (persist)",
+        "label": "7-day fire persistence baseline (persist)",
         "requires_2d": False,
         "oof_col": "p_persist",
     },
     "clim": {
-        "label": "Базова: Історична кліматологія DOY (clim)",
+        "label": "Historical day-of-year climatology baseline (clim)",
         "requires_2d": False,
         "oof_col": "p_clim",
     },
     "stack_no_img": {
-        "label": "Ансамбль усіх 1D моделей (stack_no_img)",
+        "label": "Ensemble: non-image models (stack_no_img)",
         "requires_2d": False,
         "oof_col": "p_stack_no_img",
     },
     "stack_all": {
-        "label": "🌟 Повний Ансамбль 1D + 2D Супутник (stack_all)",
+        "label": "Ensemble: multimodal 1D + 2D satellite (stack_all)",
         "requires_2d": True,
         "oof_col": "p_stack_with_img",
     },
 }
 
-
-# ==============================================================================
-# PyTorch architectures from preemptfire-v5_(2).ipynb (Cells 15 & 21)
-# ==============================================================================
 
 def _build_torch_modules():
     import torch
@@ -211,8 +202,6 @@ def _build_torch_modules():
 
 
 class ModelRegistry:
-    """Loads available model files from `model_dir` and runs inference across any selected subset of models."""
-
     def __init__(
         self,
         model_dir: Optional[str | Path] = None,
@@ -224,8 +213,8 @@ class ModelRegistry:
         self.count_metrics_path = self._find_file(count_metrics_path, ["count_metrics.csv", "data/count_metrics.csv", "models/count_metrics.csv"])
 
         self._cb_cache: Dict[str, Tuple[Any, Dict[int, Any]]] = {}
-        self._simclr_cache: Optional[Tuple[Any, Any, Any]] = None
-        self._nn_ts_cache: Optional[Tuple[Any, Any, Dict[str, Any]]] = None
+        self._simclr_cache: Optional[Tuple[Any, Any, Any, Any]] = None
+        self._nn_ts_cache: Optional[Tuple[Any, Any, Dict[str, Any], Any]] = None
         self._coords_cache: Optional[Tuple[Any, Any]] = None
 
         self.oof_df: Optional[pd.DataFrame] = None
@@ -255,11 +244,9 @@ class ModelRegistry:
         return None
 
     def _load_alphas(self) -> Dict[str, Dict[int, float]]:
-        """Loads Negative Binomial dispersion `alpha` per model and radius (5, 10, 25, 50 km)."""
         default_alpha = {5: 8.5, 10: 6.2, 25: 4.1, 50: 3.0}
         alphas: Dict[str, Dict[int, float]] = {m: dict(default_alpha) for m in MODEL_CATALOG}
 
-        # Check meta.json if present
         meta_p = self._resolve_model_file("meta.json")
         if meta_p and meta_p.exists():
             try:
@@ -271,7 +258,6 @@ class ModelRegistry:
             except Exception:
                 pass
 
-        # Compute exact NB alpha from oof_predictions.csv if count columns exist
         if self.oof_df is not None:
             for m in MODEL_CATALOG:
                 for R in RADII:
@@ -285,7 +271,6 @@ class ModelRegistry:
         return alphas
 
     def status_report(self) -> Dict[str, Dict[str, Any]]:
-        """Returns availability status and required files for every model in MODEL_CATALOG."""
         report: Dict[str, Dict[str, Any]] = {}
         for m, info in MODEL_CATALOG.items():
             if m in ("persist", "clim"):
@@ -296,7 +281,6 @@ class ModelRegistry:
                 if m == "tab_ssl_full":
                     req += ["simclr_encoder_weights.pt", "simclr_pca_32.pkl"]
                 missing = [f for f in req if self._resolve_model_file(f) is None]
-                # Backward compatibility with Claude's single-model naming (classifier.cbm)
                 if missing and m == "tab_clim_full" and self._resolve_model_file("classifier.cbm") is not None:
                     missing = []
                 report[m] = {
@@ -312,10 +296,10 @@ class ModelRegistry:
                 missing = [f for f in ["coords_classifier_knn.pkl", "coords_regressor_knn.pkl"] if self._resolve_model_file(f) is None]
                 report[m] = {"available": len(missing) == 0, "requires_2d": False, "missing_files": missing, "label": info["label"]}
             elif m == "stack_no_img":
-                 report[m] = {"available": True, "requires_2d": False, "missing_files": [], "label": info["label"]}
+                report[m] = {"available": True, "requires_2d": False, "missing_files": [], "label": info["label"]}
             elif m == "stack_all":
-                 SSL_ok = report.get("tab_ssl_full", {}).get("available", False) or report.get("tab_full", {}).get("available", False)
-                 report[m] = {"available": SSL_ok, "requires_2d": True, "missing_files": [], "label": info["label"]}
+                ssl_ok = report.get("tab_ssl_full", {}).get("available", False) or report.get("tab_full", {}).get("available", False)
+                report[m] = {"available": ssl_ok, "requires_2d": True, "missing_files": [], "label": info["label"]}
         return report
 
     def available_models(self, include_2d: bool = True) -> List[str]:
@@ -325,9 +309,6 @@ class ModelRegistry:
             if st["available"] and (include_2d or not st["requires_2d"])
         ]
 
-    # ------------------------------------------------------------------
-    # Loaders
-    # ------------------------------------------------------------------
     def _load_catboost(self, prefix: str):
         if prefix in self._cb_cache:
             return self._cb_cache[prefix]
@@ -361,7 +342,7 @@ class ModelRegistry:
         enc_path = self._resolve_model_file("simclr_encoder_weights.pt")
         pca_path = self._resolve_model_file("simclr_pca_32.pkl")
         if enc_path is None or pca_path is None:
-            raise FileNotFoundError("Missing `simclr_encoder_weights.pt` or `simclr_pca_32.pkl` in models directory.")
+            raise FileNotFoundError("Missing `simclr_encoder_weights.pt` or `simclr_pca_32.pkl`.")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         enc = make_encoder(base=24, in_ch=33).to(device)
@@ -383,7 +364,7 @@ class ModelRegistry:
         torch, _, _, Net = _build_torch_modules()
         pt_path = self._resolve_model_file("nn_ts_final_model.pt")
         if pt_path is None:
-            raise FileNotFoundError("Missing `nn_ts_final_model.pt` in models directory.")
+            raise FileNotFoundError("Missing `nn_ts_final_model.pt`.")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(str(pt_path), map_location=device, weights_only=False)
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
@@ -393,7 +374,6 @@ class ModelRegistry:
             state_dict = ckpt
             meta = {}
         else:
-            # Could be a serialized model or custom dict
             state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt.state_dict()
             meta = ckpt if isinstance(ckpt, dict) else {}
 
@@ -419,20 +399,11 @@ class ModelRegistry:
         self._coords_cache = (knn_cls, knn_reg)
         return self._coords_cache
 
-    # ------------------------------------------------------------------
-    # 2D Feature Extraction (FT 202-dim & SimCLR EMB32 32-dim)
-    # ------------------------------------------------------------------
     def compute_2d_embeddings_and_stats(
         self,
         scenes_2d: List[Optional[Dict[str, np.ndarray]]],
         batch_size: int = 16,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Given a list of scene dicts (`{'X_2d': (22,256,256), 'scl': (256,256)}`) or None,
-        computes:
-          - `FT`: `(N, 202)` handcrafted 2D spatial/spectral stats for `tab_full`
-          - `EMB32`: `(N, 32)` SimCLR + PCA embeddings for `tab_ssl_full`
-          - `has_2d_mask`: `(N,)` boolean array indicating which rows had valid 2D data
-        """
         n = len(scenes_2d)
         FT = np.zeros((n, 202), dtype=np.float32)
         EMB32 = np.zeros((n, 32), dtype=np.float32)
@@ -451,11 +422,9 @@ class ModelRegistry:
             tensors_33.append(build_33ch_array(x2d, scl, size=128))
             has_2d[idx] = True
 
-        # Check if SimCLR encoder + PCA are available
         try:
             torch, enc, pca_obj, device = self._load_simclr_and_pca()
-            arr_all = np.stack(tensors_33, axis=0)  # (M, 33, 128, 128)
-            # Channel-wise standardization across batch or self-standardize
+            arr_all = np.stack(tensors_33, axis=0)
             mean = arr_all.mean(axis=(0, 2, 3), keepdims=True)
             std = arr_all.std(axis=(0, 2, 3), keepdims=True) + 1e-6
             arr_norm = np.clip((arr_all - mean) / std, -6.0, 6.0).astype(np.float32)
@@ -469,7 +438,6 @@ class ModelRegistry:
             emb192 = np.vstack(emb192_list)
 
             if isinstance(pca_obj, dict):
-                # In case pickle contains {'scaler': ..., 'pca': ...} or similar
                 if "scaler" in pca_obj and "pca" in pca_obj:
                     emb32_valid = pca_obj["pca"].transform(pca_obj["scaler"].transform(emb192))
                 elif "pca" in pca_obj:
@@ -485,14 +453,11 @@ class ModelRegistry:
 
             for k, idx in enumerate(valid_indices):
                 EMB32[idx] = emb32_valid[k].astype(np.float32)
-        except Exception as e:
-            print(f"[ModelRegistry] SimCLR embedding note: {e}")
+        except Exception:
+            pass
 
         return FT, EMB32, has_2d
 
-    # ------------------------------------------------------------------
-    # Unified Model Scoring
-    # ------------------------------------------------------------------
     def predict_model(
         self,
         model_name: str,
@@ -506,14 +471,6 @@ class ModelRegistry:
         EMB32_2D: Optional[np.ndarray] = None,
         has_2d_mask: Optional[np.ndarray] = None,
     ) -> Dict[str, Any]:
-        """Runs a single model and returns:
-        - `p`: (N,) probability of at least one fire within 50 km
-        - `mu`: dict {5: (N,), 10: (N,), 25: (N,), 50: (N,)} expected fire counts
-        - `upper90`: dict {5: (N,), 10: (N,), 25: (N,), 50: (N,)} 90% NB upper bound
-        - `levels`: (N,) string risk level ('Low', 'Medium', 'High')
-        - `level_idx`: (N,) int risk level (0, 1, 2)
-        - `thresholds`: (t_low_med, t_med_high)
-        """
         n = len(TAB_1D)
         TAB_1D = np.nan_to_num(np.asarray(TAB_1D, dtype=np.float32), nan=0.0)
         HIST_TAB = np.nan_to_num(np.asarray(HIST_TAB, dtype=np.float32), nan=0.0)
@@ -522,14 +479,12 @@ class ModelRegistry:
         mu: Dict[int, np.ndarray] = {R: np.zeros(n, dtype=np.float32) for R in RADII}
 
         if model_name == "persist":
-            # Notebook Cell 17: h7d is window index 2 (HIST_WINDOWS=[1,3,7,14,30]) -> columns 8..11
             h7_50 = HIST_TAB[:, 2 * 4 + 3]
             p = np.clip(h7_50 / (h7_50 + 1.0), 1e-3, 0.999).astype(np.float32)
             for ri, R in enumerate(RADII):
                 mu[R] = np.clip(HIST_TAB[:, 2 * 4 + ri] / 7.0, 1e-3, None).astype(np.float32)
 
         elif model_name == "clim":
-            # Notebook Cell 18: CLIM_FEATS = [log(rate + 1e-3) x 4, pday x 4, log1p(ncov)]
             clim_rate = np.clip(np.exp(CLIM_FEATS[:, :4]) - 1e-3, 0.0, None)
             clim_p = CLIM_FEATS[:, 4:8]
             p = np.clip(clim_p[:, 3] + 1e-4 * clim_rate[:, 3], 1e-4, 0.999).astype(np.float32)
@@ -556,15 +511,10 @@ class ModelRegistry:
                 if R in regs:
                     mu[R] = np.expm1(np.clip(regs[R].predict(X), 0.0, 12.0)).astype(np.float32)
 
-            # If a 2D model is run on points where some scenes lack 2D data, mark or blend if requested
-            if model_name in ("tab_full", "tab_ssl_full") and has_2d_mask is not None and not np.all(has_2d_mask):
-                pass  # Predictions still run cleanly (zero-imputed 2D features for uncollected points, exact for collected points)
-
         elif model_name == "nn_ts":
             torch, net, meta, device = self._load_nn_ts()
             if SEQ is None or STATIC_1D is None:
-                raise ValueError("`nn_ts` requires `SEQ` and `STATIC_1D` arrays.")
-            # Standardize using batch statistics (or saved scaler in meta if present)
+                raise ValueError("nn_ts requires SEQ and STATIC_1D arrays.")
             seq_arr = np.nan_to_num(SEQ, 0.0).astype(np.float32)
             st_arr = np.nan_to_num(STATIC_1D, 0.0).astype(np.float32)
             s_mean = meta.get("seq_mean", seq_arr.mean(axis=(0, 1), keepdims=True))
@@ -587,7 +537,7 @@ class ModelRegistry:
         elif model_name == "coords":
             knn_cls, knn_reg = self._load_coords_knn()
             if pts_lat_lon is None:
-                raise ValueError("`coords` requires `pts_lat_lon` (N, 2).")
+                raise ValueError("coords requires pts_lat_lon.")
             cxy = np.column_stack([pts_lat_lon[:, 0], pts_lat_lon[:, 1] * np.cos(np.radians(40.0))]).astype(np.float32)
             p = knn_cls.predict_proba(cxy)[:, 1].astype(np.float32)
             if isinstance(knn_reg, dict):
@@ -630,7 +580,6 @@ class ModelRegistry:
         else:
             raise ValueError(f"Unknown model `{model_name}`")
 
-        # Compute Negative Binomial 90% upper bounds
         upper90: Dict[int, np.ndarray] = {}
         model_alphas = self.alphas.get(model_name, {5: 8.5, 10: 6.2, 25: 4.1, 50: 3.0})
         for R in RADII:
@@ -661,9 +610,6 @@ class ModelRegistry:
         shares: Tuple[float, float] = (0.60, 0.30),
         fallback_p: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[pd.DataFrame]]:
-        """Computes fixed probability thresholds (Low / Medium / High) from `oof_predictions.csv`
-        for the specific model (`p_<model_name>`), or falls back to `p_tab_clim_full` / empirical quantiles.
-        """
         oof_col = MODEL_CATALOG.get(model_name, {}).get("oof_col", f"p_{model_name}")
         if self.oof_df is not None:
             col = oof_col if oof_col in self.oof_df.columns else (
