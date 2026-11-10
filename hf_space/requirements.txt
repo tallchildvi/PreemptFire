@@ -1,0 +1,15 @@
+gradio>=4.44.0
+numpy>=1.26.0
+pandas>=2.1.0
+scipy>=1.11.0
+scikit-learn>=1.3.0
+catboost>=1.2.5
+torch>=2.2.0
+matplotlib>=3.8.0
+requests>=2.31.0
+planetary-computer>=1.0.0
+pystac-client>=0.7.5
+rasterio>=1.3.9
+pyproj>=3.6.1
+shapely>=2.0.2
+earthengine-api>=0.1.390
