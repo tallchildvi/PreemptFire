@@ -591,7 +591,7 @@ class ModelRegistry:
             from config_and_features import TAB_1D_COL_NAMES
             from fwi_calculator import compute_fwi_for_grid_from_tab1d
 
-            # Recover approximate DOY from doy_sin / doy_cos in TAB_1D
+            # Recover approximate DOY from doy_sin / doy_cos in TAB_1D as fallback only when _CTX['day'] is unset
             s_doy = float(TAB_1D[0, -2]) if len(TAB_1D) else 0.0
             c_doy = float(TAB_1D[0, -1]) if len(TAB_1D) else 1.0
             ang = math.atan2(s_doy, c_doy)
@@ -600,7 +600,7 @@ class ModelRegistry:
             doy = max(1, min(365, int(round(ang * 365.0 / (2.0 * math.pi)))))
             approx_day = _date(2025, 1, 1) + pd.Timedelta(days=doy - 1)
 
-            fwi_res = compute_fwi_for_grid_from_tab1d(TAB_1D, TAB_1D_COL_NAMES, approx_day)
+            fwi_res = compute_fwi_for_grid_from_tab1d(TAB_1D, TAB_1D_COL_NAMES, approx_day, pts_lat_lon=pts_lat_lon)
             p = fwi_res["p_fwi"]
             dsr = fwi_res["dsr"]
             area_scale = {5: 0.01, 10: 0.04, 25: 0.25, 50: 1.0}
@@ -739,13 +739,17 @@ class ModelRegistry:
         fallback_p: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[pd.DataFrame]]:
         if model_name == "fwi":
+            from fwi_calculator import fwi_to_p, tier_cuts, tier_cuts_p
+
+            tc_p = tier_cuts_p()
+            if tc_p is not None:
+                return np.asarray(tc_p, dtype=np.float32), None
             if fallback_p is not None and len(fallback_p) >= 20:
                 t = np.quantile(fallback_p, [shares[0], shares[0] + shares[1]]).astype(np.float32)
                 if float(t[1] - t[0]) < 1e-4:
-                    t = np.array([0.07, 0.22], dtype=np.float32)
+                    t = fwi_to_p(np.asarray(tier_cuts(), dtype=np.float32))[0]
             else:
-                # Calibrated FWI thresholds for single-point evaluation (Low < 0.08 <= Med < 0.22 <= High)
-                t = np.array([0.08, 0.22], dtype=np.float32)
+                t = fwi_to_p(np.asarray(tier_cuts(), dtype=np.float32))[0]
             return t, None
 
         oof_col = MODEL_CATALOG.get(model_name, {}).get("oof_col", f"p_{model_name}")

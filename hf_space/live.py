@@ -136,6 +136,11 @@ def score_single_location(
     else:
         selected_models = [m for m in models if m in MODEL_CATALOG]
 
+    from fwi_calculator import set_scoring_context
+
+    pts_ll_single = np.array([[lat, lon]], dtype=np.float32)
+    set_scoring_context(day, pts_ll_single)
+
     predictions: Dict[str, Any] = {}
     for m in selected_models:
         try:
@@ -146,7 +151,7 @@ def score_single_location(
                 CLIM_FEATS=CLIM_FEATS,
                 SEQ=SEQ,
                 STATIC_1D=STATIC_1D,
-                pts_lat_lon=np.array([[lat, lon]], dtype=np.float32),
+                pts_lat_lon=pts_ll_single,
                 FT_2D=FT_2D,
                 EMB32_2D=EMB32_2D,
                 has_2d_mask=has_2d_mask,

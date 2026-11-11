@@ -1,399 +1,409 @@
-"""Canadian Forest Fire Weather Index (FWI) System (Van Wagner, 1987) & EFFIS baseline.
+"""Canadian Fire Weather Index from the EFFIS WMS (Copernicus EMS / JRC) instead of a home-made reconstruction.
 
-Implements the exact physical meteorology equations of the Canadian FWI System
-used by the European Forest Fire Information System (EFFIS) / Copernicus GWIS:
-  1. Fine Fuel Moisture Code (FFMC) - surface litter moisture (time lag ~16 hours)
-  2. Duff Moisture Code (DMC)       - loosely compacted organic layers (time lag ~12 days)
-  3. Drought Code (DC)              - deep compact organic layers (time lag ~52 days)
-  4. Initial Spread Index (ISI)     - rate of fire spread combining FFMC and wind
-  5. Buildup Index (BUI)            - total fuel available for combustion (DMC + DC)
-  6. Fire Weather Index (FWI)       - frontal fire intensity combining ISI and BUI
-  7. Daily Severity Rating (DSR)    - power-law transformation of FWI (0.0272 * FWI^1.77)
+One GetMap request returns the FWI field for the whole Iberian bounding box on one date, so a map costs 1 request
+(the previous version needed ~300 Open-Meteo requests plus an approximate reconstruction). Rasters are cached on disk.
 
-All calculations run strictly on the daily/hourly Open-Meteo ERA5 weather series
-up to `target_day - 1` (zero data leakage), evolving the moisture codes day-by-day
-across the 30-to-60 day lookback window.
+Environment variables (all optional):
+  EFFIS_WMS_URL    default https://maps.effis.emergency.copernicus.eu/effis
+  EFFIS_FWI_LAYER  default ecmwf007.fwi   (check with `python fwi_calculator.py layers`)
+  EFFIS_CACHE_DIR  default effis_cache
+  EFFIS_WORKERS    default 3
+
+Command line:
+  python fwi_calculator.py selfcheck [YYYY-MM-DD]       fetch one day and print what came back (run this first)
+  python fwi_calculator.py layers [text]                list layers/time extents from GetCapabilities
+  python fwi_calculator.py oof oof_predictions.csv      FWI vs your models on the same scenes (paired block bootstrap)
 """
 from __future__ import annotations
 
-from datetime import date, timedelta
-import math
-from typing import Any, Dict, List, Optional, Sequence, Tuple
-
+import hashlib, io, json, math, os, sys, time, warnings
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
+
+WMS_URL = os.getenv("EFFIS_WMS_URL", "https://maps.effis.emergency.copernicus.eu/gwis")
+FWI_LAYER = os.getenv("EFFIS_FWI_LAYER", "ecmwf.fwi")
+CACHE_DIR = Path(os.getenv("EFFIS_CACHE_DIR", "effis_cache"))
+WORKERS = int(os.getenv("EFFIS_WORKERS", "3"))
+BBOX = (-9.7, 35.7, 3.6, 44.0)          # lon_min, lat_min, lon_max, lat_max (Iberia incl. a margin)
+RES_DEG = 0.05                           # request grid; the source is ~8 km (~0.07 deg), the server resamples
+EFFIS_CLASSES = ((5.2, "Very low"), (11.2, "Low"), (21.3, "Moderate"), (38.0, "High"), (50.0, "Very high"), (1e9, "Extreme"))
+DEFAULT_TIERS = (11.2, 21.3)             # fallback Low / Medium / High cut points on the official EFFIS scale
+CAL_FILE = CACHE_DIR / "fwi_calibration.json"
 
 
-# Standard Northern Hemisphere day-length factors for DMC (Le) and DC (Lf)
-# Van Wagner (1987), Table 1 & Table 2 (valid for Iberian latitudes ~36N-44N)
-_DMC_DAY_LENGTH_FACTORS = (6.5, 7.5, 9.0, 12.8, 13.9, 13.9, 12.4, 10.9, 9.4, 8.0, 7.0, 6.0)
-_DC_DAY_LENGTH_FACTORS = (-1.6, -1.6, -1.6, 0.9, 3.8, 5.8, 6.4, 5.0, 2.4, 0.4, -1.6, -1.6)
-
-# Standard EFFIS / Copernicus GWIS FWI danger class thresholds for Mediterranean Europe:
-# Very Low (<5.2), Low (5.2-11.2), Moderate (11.2-21.3), High (21.3-38.0), Very High (38.0-50.0), Extreme (>=50.0)
-# For 3-tier stratification (Low / Medium / High), Low < 11.2, Medium [11.2, 29.0), High >= 29.0
-# In probability space p = 1 / (1 + exp(-(FWI - 28.0) / 10.0)):
-#   FWI = 11.2 -> p ~ 0.157
-#   FWI = 29.0 -> p ~ 0.525
-EFFIS_FWI_LOW_MED = 11.2
-EFFIS_FWI_MED_HIGH = 29.0
+class EffisError(RuntimeError):
+    pass
 
 
-def ffmc_step(ffmc_prev: float, temp_c: float, rh_pct: float, wind_kmh: float, rain_mm: float) -> float:
-    """Computes single-day Fine Fuel Moisture Code (FFMC) update (Van Wagner 1987)."""
-    t = float(temp_c)
-    h = float(np.clip(rh_pct, 1.0, 100.0))
-    w = float(max(0.0, wind_kmh))
-    ro = float(max(0.0, rain_mm))
-    f0 = float(np.clip(ffmc_prev, 0.0, 101.0))
-
-    mo = 147.2 * (101.0 - f0) / (59.5 + f0)
-
-    if ro > 0.5:
-        rf = ro - 0.5
-        if mo <= 150.0:
-            mr = mo + 42.5 * rf * math.exp(-100.0 / (251.0 - mo)) * (1.0 - math.exp(-6.93 / rf))
-        else:
-            mr = (
-                mo
-                + 42.5 * rf * math.exp(-100.0 / (251.0 - mo)) * (1.0 - math.exp(-6.93 / rf))
-                + 0.0015 * ((mo - 150.0) ** 2) * math.sqrt(rf)
-            )
-        mo = min(mr, 250.0)
-
-    ed = (
-        0.942 * (h ** 0.679)
-        + 11.0 * math.exp((h - 100.0) / 10.0)
-        + 0.18 * (21.1 - t) * (1.0 - math.exp(-0.115 * h))
-    )
-
-    if mo > ed:
-        ko = 0.424 * (1.0 - (h / 100.0) ** 1.7) + 0.0694 * math.sqrt(w) * (1.0 - (h / 100.0) ** 8)
-        kd = ko * 0.581 * math.exp(0.0365 * t)
-        m = ed + (mo - ed) * (10.0 ** (-kd))
-    else:
-        ew = (
-            0.618 * (h ** 0.753)
-            + 10.0 * math.exp((h - 100.0) / 10.0)
-            + 0.18 * (21.1 - t) * (1.0 - math.exp(-0.115 * h))
-        )
-        if mo < ew:
-            kl = 0.424 * (1.0 - ((100.0 - h) / 100.0) ** 1.7) + 0.0694 * math.sqrt(w) * (
-                1.0 - ((100.0 - h) / 100.0) ** 8
-            )
-            kw = kl * 0.581 * math.exp(0.0365 * t)
-            m = ew - (ew - mo) * (10.0 ** (-kw))
-        else:
-            m = mo
-
-    m = max(0.0, min(250.0, m))
-    ffmc = 59.5 * (250.0 - m) / (147.2 + m)
-    return float(np.clip(ffmc, 0.0, 101.0))
+# ------------------------------------------------------------------ HTTP
+_SESSION: Optional[requests.Session] = None
 
 
-def dmc_step(dmc_prev: float, temp_c: float, rh_pct: float, rain_mm: float, month: int) -> float:
-    """Computes single-day Duff Moisture Code (DMC) update (Van Wagner 1987)."""
-    t = max(-1.1, float(temp_c))
-    h = float(np.clip(rh_pct, 1.0, 100.0))
-    ro = float(max(0.0, rain_mm))
-    p0 = max(0.0, float(dmc_prev))
-
-    if ro > 1.5:
-        re = 0.92 * ro - 1.27
-        mo = 20.0 + math.exp(5.6348 - p0 / 43.43)
-        if p0 <= 33.0:
-            b = 100.0 / (0.5 + 0.3 * p0)
-        elif p0 <= 65.0:
-            b = 14.0 - 1.3 * math.log(p0)
-        else:
-            b = 6.2 * math.log(p0) - 17.2
-        mr = mo + 1000.0 * re / (48.77 + b * re)
-        pr = 244.72 - 43.43 * math.log(max(mr - 20.0, 1e-6))
-        p0 = max(0.0, pr)
-
-    le = _DMC_DAY_LENGTH_FACTORS[max(1, min(12, int(month))) - 1]
-    k = 1.894 * (t + 1.1) * (100.0 - h) * le * 1e-6
-    return float(max(0.0, p0 + 100.0 * k))
+def _session() -> requests.Session:
+    global _SESSION
+    if _SESSION is None:
+        s = requests.Session()
+        s.mount("https://", HTTPAdapter(max_retries=Retry(total=5, backoff_factor=1.5, status_forcelist=[429, 500, 502, 503, 504],
+                                                          respect_retry_after_header=True), pool_maxsize=max(4, WORKERS)))
+        s.mount("http://", HTTPAdapter(max_retries=Retry(total=3, backoff_factor=1.0, status_forcelist=[500, 502, 503, 504])))
+        s.headers["User-Agent"] = "PreemptFire-research/1.0"
+        _SESSION = s
+    return _SESSION
 
 
-def dc_step(dc_prev: float, temp_c: float, rain_mm: float, month: int) -> float:
-    """Computes single-day Drought Code (DC) update (Van Wagner 1987)."""
-    t = max(-2.8, float(temp_c))
-    ro = float(max(0.0, rain_mm))
-    d0 = max(0.0, float(dc_prev))
-
-    if ro > 2.8:
-        rd = 0.83 * ro - 1.27
-        qo = 800.0 * math.exp(-d0 / 400.0)
-        qr = qo + 3.937 * rd
-        dr = 400.0 * math.log(800.0 / max(qr, 1e-6))
-        d0 = max(0.0, dr)
-
-    lf = _DC_DAY_LENGTH_FACTORS[max(1, min(12, int(month))) - 1]
-    v = max(0.0, 0.36 * (t + 2.8) + lf)
-    return float(max(0.0, d0 + 0.5 * v))
+def _as_date(d) -> date:
+    return d if isinstance(d, date) and not isinstance(d, datetime) else (d.date() if isinstance(d, datetime) else datetime.strptime(str(d)[:10], "%Y-%m-%d").date())
 
 
-def isi_from_ffmc_wind(ffmc: float, wind_kmh: float) -> float:
-    """Computes Initial Spread Index (ISI) from FFMC and wind speed (km/h)."""
-    f = float(np.clip(ffmc, 0.0, 101.0))
-    w = float(max(0.0, wind_kmh))
-    m = 147.2 * (101.0 - f) / (59.5 + f)
-    f_w = math.exp(0.05039 * w)
-    f_f = 91.9 * math.exp(-0.1386 * m) * (1.0 + (m ** 5.31) / 4.93e7)
-    return float(max(0.0, 0.208 * f_w * f_f))
+def list_layers(text: str = "") -> List[dict]:
+    """Layers from GetCapabilities with their time extent (use it to pick EFFIS_FWI_LAYER)."""
+    import xml.etree.ElementTree as ET
+    out = []
+    seen = set()
+    for url in dict.fromkeys([WMS_URL, "https://maps.effis.emergency.copernicus.eu/gwis", "https://maps.effis.emergency.copernicus.eu/effis"]):
+        try:
+            r = _session().get(url, params={"SERVICE": "WMS", "VERSION": "1.1.1", "REQUEST": "GetCapabilities"}, timeout=60)
+            r.raise_for_status()
+            root = ET.fromstring(r.content)
+            for lay in root.iter("Layer"):
+                name = lay.findtext("Name")
+                if not name or (url, name) in seen:
+                    continue
+                seen.add((url, name))
+                ext = lay.find("Extent")
+                if ext is None:
+                    dim = lay.find("Dimension")
+                    ext_text = (dim.text or "") if dim is not None and (dim.get("name") or "").lower() == "time" else ""
+                else:
+                    ext_text = ext.text or ""
+                out.append({"wms_url": url, "name": name, "title": lay.findtext("Title") or "", "time": ext_text.strip()[:120]})
+        except Exception:
+            continue
+    return [x for x in out if text.lower() in (x["name"] + " " + x["title"]).lower()]
 
 
-def bui_from_dmc_dc(dmc: float, dc: float) -> float:
-    """Computes Buildup Index (BUI) from DMC and DC."""
-    p = max(0.0, float(dmc))
-    d = max(0.0, float(dc))
-    if p <= 0.0 and d <= 0.0:
-        return 0.0
-    if p <= 0.4 * d:
-        u = 0.8 * p * d / max(p + 0.4 * d, 1e-6)
-    else:
-        u = p - (1.0 - 0.8 * d / max(p + 0.4 * d, 1e-6)) * (0.92 + (0.0114 * p) ** 1.7)
-    return float(max(0.0, u))
+# ------------------------------------------------------------------ raster download and decoding
+def _decode(content: bytes) -> np.ndarray:
+    head = content[:200].lstrip()
+    if head.startswith(b"<"):
+        raise EffisError("EFFIS returned an XML error instead of an image: " + content[:400].decode("utf8", "replace"))
+    arr, nodata = None, None
+    try:
+        import rasterio
+        from rasterio.io import MemoryFile
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            with MemoryFile(content) as mf, mf.open() as ds:
+                if ds.count >= 3 or ds.dtypes[0] == "uint8":
+                    raise EffisError("EFFIS returned a colour-rendered image (%d bands, %s), not FWI values. "
+                                     "Another FORMAT/layer is needed (see the self-check)." % (ds.count, ds.dtypes[0]))
+                arr, nodata = ds.read(1).astype("float32"), ds.nodata
+    except EffisError:
+        raise
+    except Exception:
+        arr = None
+    if arr is None:
+        from PIL import Image
+        im = Image.open(io.BytesIO(content))
+        if im.mode in ("RGB", "RGBA", "P", "L"):
+            raise EffisError("EFFIS returned a colour-rendered image (mode %s), not FWI values." % im.mode)
+        arr = np.array(im, dtype="float32")
+    if nodata is not None and np.isfinite(nodata):
+        arr[arr == nodata] = np.nan
+    arr[(arr < -9000) | (arr > 1e5)] = np.nan
+    # MapServer float32 GeoTIFFs encode ocean/background pixels as exact 0.0 without a GDAL nodata tag
+    if nodata is None and np.isfinite(arr).any() and (arr == 0.0).mean() > 0.10 and (arr > 0.0).any():
+        arr[arr == 0.0] = np.nan
+    return arr
 
 
-def fwi_from_isi_bui(isi: float, bui: float) -> float:
-    """Computes Fire Weather Index (FWI) from ISI and BUI."""
-    r = max(0.0, float(isi))
-    u = max(0.0, float(bui))
-    if u <= 80.0:
-        f_d = 0.626 * (u ** 0.809) + 2.0
-    else:
-        f_d = 1000.0 / (25.0 + 108.64 * math.exp(-0.023 * u))
-    b = 0.1 * r * f_d
-    if b > 1.0:
-        s = math.exp(2.72 * ((0.434 * math.log(b)) ** 0.647))
-    else:
-        s = b
-    return float(max(0.0, s))
+def _size(bbox=BBOX, res=RES_DEG) -> Tuple[int, int]:
+    return int(round((bbox[3] - bbox[1]) / res)), int(round((bbox[2] - bbox[0]) / res))    # H, W
 
 
-def dsr_from_fwi(fwi: float) -> float:
-    """Computes Daily Severity Rating (DSR) from FWI."""
-    return float(0.0272 * (max(0.0, float(fwi)) ** 1.77))
+def _candidate_endpoints(wms_url: str, layer: str) -> List[Tuple[str, str]]:
+    """Returns candidate (wms_url, layer) pairs on Copernicus EFFIS/GWIS WMS in case legacy layer names are configured."""
+    suffix = layer.rsplit(".", 1)[-1] if "." in layer else "fwi"
+    cands = [
+        (wms_url, layer),
+        ("https://maps.effis.emergency.copernicus.eu/gwis", f"ecmwf.{suffix}"),
+        ("https://maps.effis.emergency.copernicus.eu/gwis", f"nasa_geos5.{suffix}"),
+        ("https://maps.effis.emergency.copernicus.eu/effis", layer),
+    ]
+    out: List[Tuple[str, str]] = []
+    for pair in cands:
+        if pair not in out:
+            out.append(pair)
+    return out
 
 
-def compute_fwi_series_from_hourly(
-    T: np.ndarray,
-    RH: np.ndarray,
-    W: np.ndarray,
-    PC: np.ndarray,
-    end_day: date,
-    ffmc0: float = 85.0,
-    dmc0: float = 6.0,
-    dc0: float = 15.0,
-) -> Dict[str, float]:
-    """Evolves the Canadian FWI System day-by-day over an hourly Open-Meteo series
-    ending on `end_day` (using noon 12:00-14:00 UTC observations and 24h precipitation).
-    """
-    n_days = len(T) // 24
-    if n_days < 1:
-        return {
-            "fwi_ffmc": ffmc0,
-            "fwi_dmc": dmc0,
-            "fwi_dc": dc0,
-            "fwi_isi": 0.0,
-            "fwi_bui": 0.0,
-            "fwi_value": 0.0,
-            "fwi_dsr": 0.0,
-            "fwi_mean_7d": 0.0,
-            "fwi_max_7d": 0.0,
+def fetch_raster(day, layer: Optional[str] = None, bbox=BBOX, res: float = RES_DEG, use_cache: bool = True) -> np.ndarray:
+    """FWI (or another EFFIS layer) for one date on the request grid; rows go from north to south. One HTTP request, cached."""
+    day, req_layer = _as_date(day), layer or FWI_LAYER
+    H, W = _size(bbox, res)
+
+    last_err: Optional[Exception] = None
+    for cand_url, cand_layer in _candidate_endpoints(WMS_URL, req_layer):
+        key = hashlib.md5(f"{cand_url}|{cand_layer}|{day}|{bbox}|{H}x{W}".encode()).hexdigest()[:16]
+        path = CACHE_DIR / f"{cand_layer.replace('/', '_')}_{day}_{key}.npy"
+        if use_cache and path.exists():
+            try:
+                cached = np.load(path)
+                if cached.shape == (H, W) and not np.isnan(cached).all():
+                    return cached
+            except Exception:
+                pass
+        params = {
+            "SERVICE": "WMS",
+            "VERSION": "1.1.1",
+            "REQUEST": "GetMap",
+            "LAYERS": cand_layer,
+            "STYLES": "",
+            "FORMAT": "image/tiff",
+            "SRS": "EPSG:4326",
+            "BBOX": ",".join(f"{v:.4f}" for v in bbox),
+            "WIDTH": W,
+            "HEIGHT": H,
+            "TIME": day.isoformat(),
         }
+        try:
+            r = _session().get(cand_url, params=params, timeout=90)
+            if r.status_code != 200:
+                raise EffisError(f"EFFIS HTTP {r.status_code} for {cand_layer} {day}: {r.text[:200]}")
+            arr = _decode(r.content)
+            if arr.shape != (H, W):
+                raise EffisError(f"unexpected raster shape {arr.shape}, wanted {(H, W)}")
+            if np.isnan(arr).all():
+                raise EffisError(f"EFFIS returned an empty raster for {cand_layer} {day} (no data for that date?)")
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            np.save(path, arr)
+            return arr
+        except Exception as exc:
+            last_err = exc
+            continue
 
-    start_day = end_day - timedelta(days=n_days - 1)
-    ffmc, dmc, dc = float(ffmc0), float(dmc0), float(dc0)
-    fwi_hist: List[float] = []
-    isi, bui, fwi = 0.0, 0.0, 0.0
-
-    for d_idx in range(n_days):
-        cur_day = start_day + timedelta(days=d_idx)
-        s = d_idx * 24
-        e = s + 24
-        t_day = T[s:e]
-        rh_day = RH[s:e]
-        w_day = W[s:e]
-        pc_day = PC[s:e]
-
-        # Afternoon / noon window (hours 12..15 UTC, standard 12:00 LST in Iberia)
-        t_noon_slice = t_day[12:16]
-        rh_noon_slice = rh_day[12:16]
-        w_noon_slice = w_day[12:16]
-
-        t_val = float(np.nanmean(t_noon_slice)) if np.isfinite(t_noon_slice).any() else float(np.nanmax(t_day))
-        rh_val = float(np.nanmean(rh_noon_slice)) if np.isfinite(rh_noon_slice).any() else float(np.nanmin(rh_day))
-        w_val = float(np.nanmean(w_noon_slice)) if np.isfinite(w_noon_slice).any() else float(np.nanmean(w_day))
-        rain_24h = float(np.nansum(pc_day)) if np.isfinite(pc_day).any() else 0.0
-
-        if not np.isfinite(t_val):
-            t_val = 20.0
-        if not np.isfinite(rh_val):
-            rh_val = 50.0
-        if not np.isfinite(w_val):
-            w_val = 10.0
-
-        ffmc = ffmc_step(ffmc, t_val, rh_val, w_val, rain_24h)
-        dmc = dmc_step(dmc, t_val, rh_val, rain_24h, cur_day.month)
-        dc = dc_step(dc, t_val, rain_24h, cur_day.month)
-        isi = isi_from_ffmc_wind(ffmc, w_val)
-        bui = bui_from_dmc_dc(dmc, dc)
-        fwi = fwi_from_isi_bui(isi, bui)
-        fwi_hist.append(fwi)
-
-    recent_7d = fwi_hist[-7:] if len(fwi_hist) >= 7 else fwi_hist
-    return {
-        "fwi_ffmc": float(ffmc),
-        "fwi_dmc": float(dmc),
-        "fwi_dc": float(dc),
-        "fwi_isi": float(isi),
-        "fwi_bui": float(bui),
-        "fwi_value": float(fwi),
-        "fwi_dsr": dsr_from_fwi(fwi),
-        "fwi_mean_7d": float(np.mean(recent_7d)),
-        "fwi_max_7d": float(np.max(recent_7d)),
-    }
+    raise EffisError(str(last_err) if last_err else f"EFFIS fetch failed for {req_layer} {day}")
 
 
-def compute_fwi_from_weather_dict(w: Dict[str, float], weather_day: date) -> Dict[str, float]:
-    """Reconstructs and computes the Canadian FWI components from aggregated 30d/7d/1d
-    Open-Meteo weather dictionary when loading pre-existing weather caches.
-    """
-    if "fwi_value" in w and np.isfinite(w["fwi_value"]):
-        return {
-            "fwi_ffmc": float(w.get("fwi_ffmc", 85.0)),
-            "fwi_dmc": float(w.get("fwi_dmc", 6.0)),
-            "fwi_dc": float(w.get("fwi_dc", 15.0)),
-            "fwi_isi": float(w.get("fwi_isi", 0.0)),
-            "fwi_bui": float(w.get("fwi_bui", 0.0)),
-            "fwi_value": float(w["fwi_value"]),
-            "fwi_dsr": float(w.get("fwi_dsr", dsr_from_fwi(float(w["fwi_value"])))),
-            "fwi_mean_7d": float(w.get("fwi_mean_7d", w["fwi_value"])),
-            "fwi_max_7d": float(w.get("fwi_max_7d", w["fwi_value"])),
-        }
+def fetch_many(days: Sequence, layer: Optional[str] = None, workers: int = WORKERS) -> Dict[date, Optional[np.ndarray]]:
+    """Rasters for many dates in parallel. A failed date gives None and a printed reason instead of stopping the batch."""
+    days = sorted({_as_date(d) for d in days})
 
-    # Evolve 30-day synthetic trajectory matching the exact 30d, 7d, and 1d Open-Meteo statistics
-    t30 = float(w.get("lookback_30d_temp_max", w.get("target_temperature_max", 22.0)))
-    rh30 = float(w.get("lookback_30d_rh_min", w.get("target_rh_min", 45.0))) * 1.15
-    w30 = float(w.get("lookback_30d_wind_max", w.get("target_wind_speed_max", 12.0))) * 0.65
-    p30_total = float(w.get("lookback_30d_precip_sum", 0.0))
-    # Note: some cached lookback precip values are scaled or summed over hours; normalize if > 500 mm
-    if p30_total > 500.0:
-        p30_total = p30_total / 1000.0
-
-    t7 = float(w.get("lookback_7d_temp_max", w.get("target_temperature_max", 24.0)))
-    rh7 = float(w.get("lookback_7d_rh_min", w.get("target_rh_min", 40.0))) * 1.10
-    w7 = float(w.get("lookback_7d_wind_max", w.get("target_wind_speed_max", 12.0))) * 0.70
-    p7_total = float(w.get("lookback_7d_precip_sum", 0.0))
-    if p7_total > 500.0:
-        p7_total = p7_total / 1000.0
-
-    t1 = float(w.get("target_temperature_max", 25.0))
-    rh1 = float(w.get("target_rh_min", 35.0)) * 1.08
-    w1 = float(w.get("target_wind_speed_max", 12.0)) * 0.75
-    if w1 <= 0.5:
-        w1 = max(float(w.get("lookback_30d_wind_max", 10.0)) * 0.65, 8.0)
-    if w7 <= 0.5:
-        w7 = w1
-    if w30 <= 0.5:
-        w30 = w1
-
-    p1 = float(w.get("target_precipitation_sum", 0.0))
-    days_dry = int(round(float(w.get("days_since_rain", 5.0))))
-
-    ffmc, dmc, dc = 85.0, 6.0, 15.0
-    start_day = weather_day - timedelta(days=29)
-    p_early_daily = max(0.0, p30_total - p7_total) / 23.0
-    p_recent_daily = max(0.0, p7_total - p1) / 6.0
-
-    fwi_hist: List[float] = []
-    isi, bui, fwi = 0.0, 0.0, 0.0
-    for d_idx in range(30):
-        cur_day = start_day + timedelta(days=d_idx)
-        days_before_end = 29 - d_idx
-        if days_before_end == 0:
-            td, rhd, wd, pd_mm = t1, rh1, w1, p1
-        elif days_before_end <= 6:
-            td, rhd, wd = t7, rh7, w7
-            pd_mm = 0.0 if days_before_end < days_dry else p_recent_daily
-        else:
-            td, rhd, wd = t30, rh30, w30
-            pd_mm = 0.0 if days_before_end < days_dry else p_early_daily
-
-        ffmc = ffmc_step(ffmc, td, rhd, wd, pd_mm)
-        dmc = dmc_step(dmc, td, rhd, pd_mm, cur_day.month)
-        dc = dc_step(dc, td, pd_mm, cur_day.month)
-        isi = isi_from_ffmc_wind(ffmc, wd)
-        bui = bui_from_dmc_dc(dmc, dc)
-        fwi = fwi_from_isi_bui(isi, bui)
-        fwi_hist.append(fwi)
-
-    recent_7d = fwi_hist[-7:]
-    return {
-        "fwi_ffmc": float(ffmc),
-        "fwi_dmc": float(dmc),
-        "fwi_dc": float(dc),
-        "fwi_isi": float(isi),
-        "fwi_bui": float(bui),
-        "fwi_value": float(fwi),
-        "fwi_dsr": dsr_from_fwi(fwi),
-        "fwi_mean_7d": float(np.mean(recent_7d)),
-        "fwi_max_7d": float(np.max(recent_7d)),
-    }
+    def one(d):
+        for attempt in range(2):
+            try:
+                return d, fetch_raster(d, layer)
+            except Exception as e:
+                last = e
+                time.sleep(2 + attempt * 3)
+        print(f"  [EFFIS] {d}: {last}")
+        return d, None
+    with ThreadPoolExecutor(max(1, workers)) as ex:
+        return dict(ex.map(one, days))
 
 
-def compute_fwi_for_grid_from_tab1d(
-    TAB_1D: np.ndarray,
-    col_names: Sequence[str],
-    weather_day: date,
-) -> Dict[str, np.ndarray]:
-    """Vectorized/loop wrapper computing FWI components for all N grid points from TAB_1D."""
-    from config_and_features import CONTEXT_1D, LOG_COLS
+# ------------------------------------------------------------------ sampling
+def _fill_nan(a: np.ndarray) -> np.ndarray:
+    m = np.isnan(a)
+    if not m.any():
+        return a
+    from scipy import ndimage
+    idx = ndimage.distance_transform_edt(m, return_distances=False, return_indices=True)
+    return a[tuple(idx)]
 
-    n = len(TAB_1D)
-    col_idx = {c: i for i, c in enumerate(col_names)}
-    log_col_names = {CONTEXT_1D[i] for i in LOG_COLS}
 
-    fwi_val = np.zeros(n, dtype=np.float32)
-    ffmc_val = np.zeros(n, dtype=np.float32)
-    dmc_val = np.zeros(n, dtype=np.float32)
-    dc_val = np.zeros(n, dtype=np.float32)
-    isi_val = np.zeros(n, dtype=np.float32)
-    bui_val = np.zeros(n, dtype=np.float32)
-    dsr_val = np.zeros(n, dtype=np.float32)
+def _neighbourhood(a: np.ndarray, radius_km: float, stat: str, res: float = RES_DEG, lat0: float = 40.0) -> np.ndarray:
+    from scipy import ndimage
+    dy, dx = radius_km / 111.0 / res, radius_km / (111.0 * math.cos(math.radians(lat0))) / res
+    ry, rx = max(0, int(round(dy))), max(0, int(round(dx)))
+    if ry == 0 and rx == 0:
+        return a
+    yy, xx = np.mgrid[-ry:ry + 1, -rx:rx + 1]
+    fp = ((yy / max(dy, 1e-6)) ** 2 + (xx / max(dx, 1e-6)) ** 2) <= 1.0
+    if stat == "max":
+        return ndimage.maximum_filter(a, footprint=fp, mode="nearest")
+    return ndimage.convolve(a, fp / fp.sum(), mode="nearest")
 
-    for i in range(n):
-        row = TAB_1D[i]
-        w_dict: Dict[str, float] = {}
-        for k in CONTEXT_1D:
-            if k in col_idx:
-                v = float(row[col_idx[k]])
-                if k in log_col_names:
-                    v = float(np.expm1(max(0.0, v)))
-                w_dict[k] = v
-        res = compute_fwi_from_weather_dict(w_dict, weather_day)
-        fwi_val[i] = res["fwi_value"]
-        ffmc_val[i] = res["fwi_ffmc"]
-        dmc_val[i] = res["fwi_dmc"]
-        dc_val[i] = res["fwi_dc"]
-        isi_val[i] = res["fwi_isi"]
-        bui_val[i] = res["fwi_bui"]
-        dsr_val[i] = res["fwi_dsr"]
 
-    # Smooth monotonic mapping of raw FWI [0, 100+] to calibrated probability [0, 1]
-    # Calibrated to Iberian summer 50 km base rate (mean P ~ 0.12, 60th pct ~ 0.09, 90th pct ~ 0.23)
-    p_fwi = 1.0 / (1.0 + np.exp(-(fwi_val - 78.0) / 10.5))
-    p_fwi = np.clip(p_fwi, 1e-4, 0.999).astype(np.float32)
+def sample(raster: np.ndarray, lat, lon, bbox=BBOX, radius_km: float = 0.0, stat: str = "mean") -> np.ndarray:
+    a = _fill_nan(raster)
+    if radius_km > 0:
+        a = _neighbourhood(a, radius_km, stat, (bbox[2] - bbox[0]) / raster.shape[1])
+    H, W = a.shape
+    col = np.clip(((np.asarray(lon, float) - bbox[0]) / (bbox[2] - bbox[0]) * W).astype(int), 0, W - 1)
+    row = np.clip(((bbox[3] - np.asarray(lat, float)) / (bbox[3] - bbox[1]) * H).astype(int), 0, H - 1)
+    return a[row, col].astype(np.float32)
 
-    return {
-        "fwi": fwi_val,
-        "ffmc": ffmc_val,
-        "dmc": dmc_val,
-        "dc": dc_val,
-        "isi": isi_val,
-        "bui": bui_val,
-        "dsr": dsr_val,
-        "p_fwi": p_fwi,
-    }
+
+def fwi_for_points(lat, lon, day, layer: Optional[str] = None, radius_km: float = 0.0, stat: str = "mean") -> np.ndarray:
+    return sample(fetch_raster(day, layer), lat, lon, radius_km=radius_km, stat=stat)
+
+
+def effis_class(fwi: float) -> str:
+    return next(name for cut, name in EFFIS_CLASSES if fwi < cut)
+
+
+def dsr_from_fwi(fwi):
+    return 0.0272 * np.maximum(np.asarray(fwi, float), 0.0) ** 1.77
+
+
+# ------------------------------------------------------------------ calibration (FWI -> probability) and tier cut points
+_CAL: Optional[dict] = None
+
+
+def _load_cal() -> Optional[dict]:
+    global _CAL
+    if _CAL is None and CAL_FILE.exists():
+        _CAL = json.load(open(CAL_FILE))
+    return _CAL
+
+
+def fit_calibration(fwi: np.ndarray, y: np.ndarray, shares=(0.6, 0.3)) -> dict:
+    """Isotonic map FWI -> P(fire within 50 km) fitted on labelled scenes, plus tier cut points from the same scenes.
+    Fitted in-sample: use it for map colours, not for reporting skill (skill is the AUC, which needs no calibration)."""
+    from sklearn.isotonic import IsotonicRegression
+    ok = np.isfinite(fwi)
+    iso = IsotonicRegression(out_of_bounds="clip", y_min=1e-3, y_max=0.999).fit(fwi[ok], y[ok])
+    cal = {"x": [float(v) for v in iso.X_thresholds_], "y": [float(v) for v in iso.y_thresholds_],
+           "tiers": [float(v) for v in np.quantile(fwi[ok], [shares[0], shares[0] + shares[1]])], "n": int(ok.sum())}
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    json.dump(cal, open(CAL_FILE, "w"))
+    global _CAL
+    _CAL = cal
+    return cal
+
+
+def fwi_to_p(fwi: np.ndarray) -> Tuple[np.ndarray, bool]:
+    cal = _load_cal()
+    if cal:
+        return np.interp(fwi, cal["x"], cal["y"]).astype(np.float32), True
+    return np.clip(np.asarray(fwi, float) / (np.asarray(fwi, float) + 30.0), 1e-4, 0.999).astype(np.float32), False   # monotone score, NOT a probability
+
+
+def tier_cuts() -> Tuple[float, float]:
+    cal = _load_cal()
+    return tuple(cal["tiers"]) if cal else DEFAULT_TIERS
+
+
+def tier_cuts_p() -> Optional[Tuple[float, float]]:
+    """The same tier cut points expressed on the calibrated probability scale (for get_thresholds in the registry); None if not calibrated."""
+    cal = _load_cal()
+    return tuple(float(v) for v in np.interp(cal["tiers"], cal["x"], cal["y"])) if cal else None
+
+
+# ------------------------------------------------------------------ interface used by the Space
+def compute_fwi_for_grid(lat, lon, day, radius_km: float = 0.0, stat: str = "mean", components: bool = False) -> Dict[str, np.ndarray]:
+    """FWI at every grid point for `day` (one request; one more per extra component). Keys follow the old module."""
+    lat, lon = np.asarray(lat, float), np.asarray(lon, float)
+    fwi = fwi_for_points(lat, lon, day, radius_km=radius_km, stat=stat)
+    out = {"fwi": fwi, "dsr": dsr_from_fwi(fwi).astype(np.float32)}
+    for k in ("ffmc", "dmc", "dc", "isi", "bui"):
+        out[k] = np.full(len(fwi), np.nan, np.float32)
+    if components:
+        prefix = FWI_LAYER.rsplit(".", 1)[0]
+        for k in ("ffmc", "dmc", "dc", "isi", "bui"):
+            try:
+                out[k] = fwi_for_points(lat, lon, day, layer=f"{prefix}.{k}", radius_km=radius_km, stat=stat)
+            except Exception as e:
+                print(f"  [EFFIS] component {k} unavailable: {e}")
+    out["p_fwi"], out["p_is_calibrated"] = fwi_to_p(fwi)
+    return out
+
+
+_CTX: dict = {}
+
+
+def set_scoring_context(day, lat_lon) -> None:
+    """Call once before predicting: the real scoring date and the (n, 2) array of grid lat/lon."""
+    _CTX["day"], _CTX["lat_lon"] = _as_date(day), np.asarray(lat_lon, float)
+
+
+def compute_fwi_for_grid_from_tab1d(TAB_1D, col_names=None, weather_day=None, pts_lat_lon=None, day=None) -> Dict[str, np.ndarray]:
+    """Compatibility wrapper for model_registry. The weather columns are not used any more; the scoring context is."""
+    target_day = _as_date(day) if day is not None else (_CTX.get("day") or (_as_date(weather_day) if weather_day is not None else None))
+    ll = np.asarray(pts_lat_lon, float) if pts_lat_lon is not None else _CTX.get("lat_lon")
+    if target_day is None or ll is None:
+        raise EffisError("call fwi_calculator.set_scoring_context(day, pts_lat_lon) before predicting with the fwi model")
+    if len(ll) != len(TAB_1D):
+        raise EffisError(f"context has {len(ll)} points but TAB_1D has {len(TAB_1D)}")
+    return compute_fwi_for_grid(ll[:, 0], ll[:, 1], target_day)
+
+
+# ------------------------------------------------------------------ evaluation on the scenes of the notebook
+def scene_fwi(df, lag_days: int = 0, radius_km: float = 0.0, stat: str = "mean", layer: Optional[str] = None) -> np.ndarray:
+    """FWI for every row of a frame with lat, lon, date. One request per distinct date (cached)."""
+    d = np.array([_as_date(x) - timedelta(days=lag_days) for x in df["date"]])
+    rasters = fetch_many(set(d), layer)
+    out = np.full(len(df), np.nan, np.float32)
+    for day in set(d):
+        ras = rasters.get(day)
+        if ras is None:
+            continue
+        m = d == day
+        out[m] = sample(ras, df["lat"].values[m], df["lon"].values[m], radius_km=radius_km, stat=stat)
+    return out
+
+
+def _auc(y: np.ndarray, s: np.ndarray) -> float:
+    from scipy.stats import rankdata
+    n1 = int(y.sum()); n0 = len(y) - n1
+    return float((rankdata(s)[y == 1].sum() - n1 * (n1 + 1) / 2) / (n1 * n0)) if n1 and n0 else float("nan")
+
+
+def compare_on_oof(oof_csv: str, models=("tab_clim_full", "persist", "clim"), n_boot: int = 1000, seed: int = 0, radius_km: float = 0.0):
+    import pandas as pd
+    df = pd.read_csv(oof_csv)
+    for lag in (0, 1):
+        df[f"p_fwi_lag{lag}"] = scene_fwi(df, lag, radius_km)
+    if radius_km <= 0:
+        df["p_fwi_max50"] = scene_fwi(df, 0, 50.0, "max")
+    cols = [c for c in df.columns if c.startswith("p_fwi")] + [f"p_{m}" for m in models if f"p_{m}" in df.columns]
+    ok = df[[c for c in cols]].notna().all(axis=1).values
+    d = df[ok].reset_index(drop=True)
+    print(f"scenes with FWI: {len(d)}/{len(df)}")
+    y, g = d["y"].values.astype(int), d["group"].values
+    rng = np.random.default_rng(seed)
+    idx_by = {k: np.where(g == k)[0] for k in np.unique(g)}
+    keys = list(idx_by)
+    draws = [np.concatenate([idx_by[k] for k in rng.choice(keys, len(keys))]) for _ in range(n_boot)]
+    rows = []
+    for c in cols:
+        pt = _auc(y, d[c].values)
+        bs = np.array([_auc(y[i], d[c].values[i]) for i in draws])
+        rows.append({"score": c, "AUC": pt, "lo": np.nanpercentile(bs, 2.5), "hi": np.nanpercentile(bs, 97.5)})
+    res = pd.DataFrame(rows)
+    print(res.round(3).to_string(index=False))
+    base = "p_fwi_lag0"
+    for m in [c for c in cols if not c.startswith("p_fwi")]:
+        diff = np.array([_auc(y[i], d[m].values[i]) - _auc(y[i], d[base].values[i]) for i in draws])
+        print(f"  {m} minus {base}: {_auc(y, d[m].values) - _auc(y, d[base].values):+.3f}  95% CI [{np.nanpercentile(diff, 2.5):+.3f}, {np.nanpercentile(diff, 97.5):+.3f}]")
+    d.to_csv("oof_with_fwi.csv", index=False); res.to_csv("fwi_vs_models.csv", index=False)
+    fit_calibration(d[base].values, y)
+    print("saved oof_with_fwi.csv, fwi_vs_models.csv and the calibration/tier file", CAL_FILE)
+    return res
+
+
+def selfcheck(day: str = "2025-08-12") -> None:
+    ras = fetch_raster(day, use_cache=False)
+    print(f"{FWI_LAYER} {day}: shape={ras.shape} dtype={ras.dtype} min={np.nanmin(ras):.1f} max={np.nanmax(ras):.1f} median={np.nanmedian(ras):.1f} nan={np.isnan(ras).mean():.0%}")
+    for name, la, lo in (("Madrid", 40.42, -3.70), ("Sevilla", 37.39, -5.98), ("Santiago", 42.88, -8.54), ("Pyrenees", 42.6, 0.5)):
+        v = float(sample(ras, [la], [lo])[0])
+        print(f"  {name:9s} FWI={v:6.1f} ({effis_class(v)})")
+    print("Plausible in August: Madrid/Sevilla tens of units, Santiago lower. All zeros, 0-255 integers or one constant value mean the layer/format is wrong.")
+
+
+if __name__ == "__main__":
+    cmd = sys.argv[1] if len(sys.argv) > 1 else "selfcheck"
+    if cmd == "layers":
+        for x in list_layers(sys.argv[2] if len(sys.argv) > 2 else "fwi"):
+            print(x)
+    elif cmd == "oof":
+        compare_on_oof(sys.argv[2])
+    else:
+        selfcheck(sys.argv[2] if len(sys.argv) > 2 else "2025-08-12")

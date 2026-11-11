@@ -189,6 +189,10 @@ def build_grid_features(
     )
     store.save_daily_features(day, feat_df)
 
+    from fwi_calculator import set_scoring_context
+
+    set_scoring_context(day, pts[["lat", "lon"]].values)
+
     return {
         "pts": pts,
         "day": day,

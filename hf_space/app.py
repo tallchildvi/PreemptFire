@@ -197,6 +197,10 @@ def run_iberia_map_and_compare(
         out_df["recent_fires_7d_50km"] = grid_data["HIST_TAB"][:, 2 * 4 + 3].astype(int)
         out_df["recent_fires_30d_50km"] = grid_data["HIST_TAB"][:, 4 * 4 + 3].astype(int)
 
+        from fwi_calculator import set_scoring_context
+
+        set_scoring_context(day, pts[["lat", "lon"]].values)
+
         outputs: Dict[str, Dict[str, Any]] = {}
         summary_rows = []
         for m_name in models_to_run:
@@ -494,12 +498,17 @@ def run_post_hoc_ground_truth(
             grid_data = _GRID_CACHE[cache_key]
 
         progress(0.58, desc="[Step 2/3] Running model predictions before loading ground-truth detections...")
+        from fwi_calculator import set_scoring_context
+
+        set_scoring_context(day, pts[["lat", "lon"]].values)
+
         models_to_eval = [model_name] if model_name else []
         for m in reg.available_models(include_2d=True):
             if m not in models_to_eval:
                 models_to_eval.append(m)
 
         model_preds: Dict[str, Dict[str, Any]] = {}
+        model_errors: Dict[str, str] = {}
         for m in models_to_eval:
             try:
                 model_preds[m] = gpu_predict(
@@ -515,12 +524,15 @@ def run_post_hoc_ground_truth(
                     emb32_2d=grid_data["EMB32_2D"],
                     mask=grid_data["has_2d_mask"],
                 )
-            except Exception:
-                pass
+            except Exception as exc:
+                model_errors[m] = f"{type(exc).__name__}: {exc}"
+                print(f"  [Post-Hoc] Model {m} failed: {model_errors[m]}")
 
         if not model_preds:
-            return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "No models could be evaluated."
+            err_msg = "; ".join(f"{k}: {v}" for k, v in model_errors.items())
+            return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), f"No models could be evaluated ({err_msg})."
 
+        requested_model = model_name
         if model_name not in model_preds:
             model_name = next(iter(model_preds.keys()))
 
@@ -658,6 +670,8 @@ def run_post_hoc_ground_truth(
 
         diag = firms_gt.get("status_info", {})
         firms_diag_lines: List[str] = [f""]
+        if requested_model and requested_model != model_name and requested_model in model_errors:
+            firms_diag_lines.append(f"⚠️ Model `{requested_model}` failed ({model_errors[requested_model]}); displaying `{model_name}` instead.")
         if diag.get("last_error"):
             firms_diag_lines.append(f"⚠️ NASA FIRMS API Warning: {diag['last_error']}")
         if len(fire_1d_df) == 0 and len(fire_7d_df) == 0:
@@ -720,6 +734,8 @@ def run_batch_post_hoc_evaluation(
         pts, meta_df = load_points(pts_path)
         avail_models = reg.available_models(include_2d=False)
 
+        from fwi_calculator import set_scoring_context
+
         per_date_rows = []
         for idx, day in enumerate(days):
             frac_base = idx / len(days)
@@ -742,8 +758,10 @@ def run_batch_post_hoc_evaluation(
             else:
                 grid_data = _GRID_CACHE[cache_key]
 
+            set_scoring_context(day, pts[["lat", "lon"]].values)
+
             progress(frac_base + 0.55 * span, desc=f"[Batch {idx + 1}/{len(days)}] Fetching ground-truth FIRMS for {day} (1d & 7d)...")
-            firms_gt = fetch_post_hoc_firms(day, firms_keys=firms_keys_str, progress_cb=None)
+            firms_gt = fetch_post_hoc_firms(day, progress_cb=None)
             c1 = compute_actual_counts_per_point(pts, firms_gt["fire_1d_df"], radii=(r_km,))[r_km]
             c7 = compute_actual_counts_per_point(pts, firms_gt["fire_7d_df"], radii=(r_km,))[r_km]
 
@@ -771,8 +789,8 @@ def run_batch_post_hoc_evaluation(
                     r7 = evaluate_levels_against_actual(out["levels"], out["p"], c7, m, "7d", r_km)
                     r7["Date"] = str(day)
                     day_rows_7d.append(r7)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    print(f"  [Batch Post-Hoc] Model {m} on {day} failed: {exc}")
 
             if day_rows_1d:
                 df_d1 = evaluate_vs_fwi_benchmark(pd.DataFrame(day_rows_1d))
