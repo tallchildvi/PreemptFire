@@ -262,6 +262,16 @@ def _interpolate_weather_idw(
     return out_list
 
 
+def _norm_cell_key(lat_v: float, lon_v: float, cell: float) -> str:
+    la = round(round(float(lat_v) / cell) * cell, 3)
+    lo = round(round(float(lon_v) / cell) * cell, 3)
+    if la == 0.0:
+        la = 0.0
+    if lo == 0.0:
+        lo = 0.0
+    return f"{la}_{lo}"
+
+
 def fetch_weather_cells(
     pts: pd.DataFrame,
     day: date,
@@ -276,11 +286,7 @@ def fetch_weather_cells(
     """
     wd = day - timedelta(days=1)
     t0 = wd - timedelta(days=gap)
-    key = (
-        (np.round(pts["lat"] / cell) * cell).round(3).astype(str)
-        + "_"
-        + (np.round(pts["lon"] / cell) * cell).round(3).astype(str)
-    )
+    key = [_norm_cell_key(la, lo, cell) for la, lo in zip(pts["lat"].values, pts["lon"].values)]
     unique_keys = list(dict.fromkeys(key))
     cells = {k: (float(k.split("_")[0]), float(k.split("_")[1])) for k in unique_keys}
 
@@ -301,13 +307,26 @@ def fetch_weather_cells(
                     if cf.exists():
                         try:
                             cached = json.loads(cf.read_text(encoding="utf-8"))
+                            norm_cached: Dict[str, Dict[str, float]] = {}
+                            for ck, cv in cached.items():
+                                if cv is not None:
+                                    parts = ck.split("_")
+                                    nk = _norm_cell_key(float(parts[0]), float(parts[1]), cand_cell)
+                                    norm_cached[nk] = cv
                             if cand_cell == cell:
                                 for k in unique_keys:
-                                    if k in cached and cached[k] is not None:
-                                        res[k] = cached[k]
-                            elif len(cached) >= 50:
-                                c_coords = [(float(ck.split("_")[0]), float(ck.split("_")[1])) for ck, cv in cached.items() if cv is not None]
-                                c_dicts = [cv for cv in cached.values() if cv is not None]
+                                    if k in norm_cached:
+                                        res[k] = norm_cached[k]
+                                # If >= 95% of synoptic cells are already cached, use IDW interpolation immediately
+                                if len(res) >= max(50, int(0.95 * len(unique_keys))):
+                                    c_coords = [cells[k] for k in res.keys()]
+                                    c_dicts = [res[k] for k in res.keys()]  # type: ignore[misc]
+                                    if progress_cb:
+                                        progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(c_dicts)} cells).")
+                                    return _interpolate_weather_idw(pts, c_coords, c_dicts), len(c_dicts)
+                            elif len(norm_cached) >= 50:
+                                c_coords = [(float(ck.split("_")[0]), float(ck.split("_")[1])) for ck in norm_cached.keys()]
+                                c_dicts = list(norm_cached.values())
                                 if progress_cb:
                                     progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(c_dicts)} cells).")
                                 return _interpolate_weather_idw(pts, c_coords, c_dicts), len(c_dicts)
@@ -349,7 +368,7 @@ def fetch_weather_cells(
                         r = sess.get(url, params=params, timeout=30)
                         if r.status_code == 429:
                             throttled_urls.add(url)
-                            time.sleep(1.2)
+                            time.sleep(0.4)
                             continue
                         r.raise_for_status()
                         payload = r.json()
@@ -366,7 +385,7 @@ def fetch_weather_cells(
 
                 # If candidate endpoints hit 429 on this batch, wait briefly and reset throttled list
                 if len(throttled_urls) >= len(candidate_urls):
-                    time.sleep(2.0)
+                    time.sleep(1.0)
                     throttled_urls.clear()
 
                 done_batches = b_idx + 1
