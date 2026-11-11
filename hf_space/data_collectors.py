@@ -180,6 +180,12 @@ def _parse_open_meteo_payload(
     out["days_since_t0_pass"] = float(gap)
     out.update(_agg_slice(T[-168:], RH[-168:], W[-168:], PC[-168:], "lookback_7d"))
     out.update(_agg_slice(T[-720:], RH[-720:], W[-720:], PC[-720:], "lookback_30d"))
+    try:
+        from fwi_calculator import compute_fwi_series_from_hourly
+
+        out.update(compute_fwi_series_from_hourly(T, RH, W, PC, end_day=weather_day))
+    except Exception:
+        pass
     return out
 
 

@@ -30,6 +30,7 @@ from post_hoc_evaluation import (
     evaluate_levels_against_actual,
     evaluate_local_radius_around_point,
     evaluate_tier_reliability_table,
+    evaluate_vs_fwi_benchmark,
     fetch_post_hoc_firms,
 )
 
@@ -579,7 +580,7 @@ def run_post_hoc_ground_truth(
                     radius_km=r_km,
                 )
             )
-        df_models_gt = pd.DataFrame(model_rows)
+        df_models_gt = evaluate_vs_fwi_benchmark(pd.DataFrame(model_rows))
 
         radii_rows = []
         for R in RADII:
@@ -629,6 +630,32 @@ def run_post_hoc_ground_truth(
             prim_out["levels"], prim_out["p"], counts_7d[r_km], model_name, f"7d ({day}..{end_7d})", r_km
         )
 
+        fwi_cmp_lines: List[str] = []
+        if "fwi" in model_preds:
+            fwi_out = model_preds["fwi"]
+            f1 = evaluate_levels_against_actual(
+                fwi_out["levels"], fwi_out["p"], counts_1d[r_km], "fwi", f"1d ({day})", r_km
+            )
+            f7 = evaluate_levels_against_actual(
+                fwi_out["levels"], fwi_out["p"], counts_7d[r_km], "fwi", f"7d ({day}..{end_7d})", r_km
+            )
+            d_auc1 = (
+                round(float(s1["ROC-AUC"]) - float(f1["ROC-AUC"]), 4)
+                if np.isfinite(s1["ROC-AUC"]) and np.isfinite(f1["ROC-AUC"])
+                else np.nan
+            )
+            d_auc7 = (
+                round(float(s7["ROC-AUC"]) - float(f7["ROC-AUC"]), 4)
+                if np.isfinite(s7["ROC-AUC"]) and np.isfinite(f7["ROC-AUC"])
+                else np.nan
+            )
+            fwi_cmp_lines = [
+                f"",
+                f"[Head-to-Head vs Canadian FWI (EFFIS Physical Baseline) at R = {r_km} km]:",
+                f"  - 1d ({day}): {model_name} ROC-AUC = {s1['ROC-AUC']} vs FWI ROC-AUC = {f1['ROC-AUC']} (Delta = {d_auc1:+.4f}) | {model_name} High/Low = {s1['High/Low Rate Ratio (x)']}x vs FWI High/Low = {f1['High/Low Rate Ratio (x)']}x",
+                f"  - 7d ({day}..{end_7d}): {model_name} ROC-AUC = {s7['ROC-AUC']} vs FWI ROC-AUC = {f7['ROC-AUC']} (Delta = {d_auc7:+.4f}) | {model_name} High/Low = {s7['High/Low Rate Ratio (x)']}x vs FWI High/Low = {f7['High/Low Rate Ratio (x)']}x",
+            ]
+
         status_lines = [
             f"Stochastic & Probabilistic Verification for {day} (strictly isolated from pre-fire features up to {day} - 1 day):",
             f"Raw VIIRS fire detections in Iberia: {len(fire_1d_df)} on {day} (1d) | {len(fire_7d_df)} across {day}..{end_7d} (7d).",
@@ -644,7 +671,7 @@ def run_post_hoc_ground_truth(
             f"  - Risk Stratification: High/Low Ratio = {s7['High/Low Rate Ratio (x)']}x | Monotonic = {s7['Monotonic (Low<=Med<=High)']} | Lift(High) = {s7['Lift High (x)']}x | Lift(Med+High) = {s7['Lift Med+High (x)']}x",
             f"  - Threshold-Free Metrics: ROC-AUC = {s7['ROC-AUC']} | PR-AUC = {s7['PR-AUC']} | Brier Score = {s7['Brier Score']}",
             f"  - Low-Tier Safety: {s7['Low Safe Rate (%)']}% fire-free | Recall(Med+High) = {s7['Recall Med+High (%)']}% (Missed in Low = {s7['Missed in Low (%)']}%)",
-        ]
+        ] + fwi_cmp_lines
 
         progress(1.0, desc="Done")
         return str(gt_map_path), df_reliability_gt, df_models_gt, df_radii_gt, df_local_gt, "\n".join(status_lines)
@@ -705,6 +732,8 @@ def run_batch_post_hoc_evaluation(
             c1 = compute_actual_counts_per_point(pts, firms_gt["fire_1d_df"], radii=(r_km,))[r_km]
             c7 = compute_actual_counts_per_point(pts, firms_gt["fire_7d_df"], radii=(r_km,))[r_km]
 
+            day_rows_1d = []
+            day_rows_7d = []
             for m in avail_models:
                 try:
                     out = gpu_predict(
@@ -722,13 +751,20 @@ def run_batch_post_hoc_evaluation(
                     )
                     r1 = evaluate_levels_against_actual(out["levels"], out["p"], c1, m, "1d", r_km)
                     r1["Date"] = str(day)
-                    per_date_rows.append(r1)
+                    day_rows_1d.append(r1)
 
                     r7 = evaluate_levels_against_actual(out["levels"], out["p"], c7, m, "7d", r_km)
                     r7["Date"] = str(day)
-                    per_date_rows.append(r7)
+                    day_rows_7d.append(r7)
                 except Exception:
                     pass
+
+            if day_rows_1d:
+                df_d1 = evaluate_vs_fwi_benchmark(pd.DataFrame(day_rows_1d))
+                per_date_rows.extend(df_d1.to_dict("records"))
+            if day_rows_7d:
+                df_d7 = evaluate_vs_fwi_benchmark(pd.DataFrame(day_rows_7d))
+                per_date_rows.extend(df_d7.to_dict("records"))
 
         if not per_date_rows:
             return pd.DataFrame(), pd.DataFrame(), "No models/dates could be evaluated."
@@ -747,7 +783,10 @@ def run_batch_post_hoc_evaluation(
             "Missed in Low (%)",
             "Low Safe Rate (%)",
             "ROC-AUC",
+            "Delta ROC-AUC vs FWI",
+            "Skill Gain vs FWI (%)",
             "PR-AUC",
+            "Delta PR-AUC vs FWI",
             "Brier Score",
         ]
         agg_rows = []

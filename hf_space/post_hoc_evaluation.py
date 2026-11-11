@@ -282,6 +282,57 @@ def evaluate_levels_against_actual(
     }
 
 
+def evaluate_vs_fwi_benchmark(df_models: pd.DataFrame) -> pd.DataFrame:
+    """Computes direct head-to-head comparison of every evaluated model against the
+    Canadian Fire Weather Index (`fwi` / EFFIS standard) across each window (1d and 7d).
+    """
+    if df_models is None or len(df_models) == 0 or "Model" not in df_models.columns:
+        return pd.DataFrame()
+
+    df = df_models.copy()
+    fwi_rows = df[df["Model"] == "fwi"]
+    if len(fwi_rows) == 0:
+        return df
+
+    out_rows = []
+    for win, grp in df.groupby("Window", sort=False):
+        fwi_sub = grp[grp["Model"] == "fwi"]
+        if len(fwi_sub) == 0:
+            continue
+        f_row = fwi_sub.iloc[0]
+        f_auc = float(f_row.get("ROC-AUC", np.nan))
+        f_pr = float(f_row.get("PR-AUC", np.nan))
+        f_ratio = float(f_row.get("High/Low Rate Ratio (x)", np.nan))
+        f_lift = float(f_row.get("Lift High (x)", np.nan))
+
+        for _, r in grp.iterrows():
+            m_auc = float(r.get("ROC-AUC", np.nan))
+            m_pr = float(r.get("PR-AUC", np.nan))
+            m_ratio = float(r.get("High/Low Rate Ratio (x)", np.nan))
+            m_lift = float(r.get("Lift High (x)", np.nan))
+
+            d_auc = round(m_auc - f_auc, 4) if (np.isfinite(m_auc) and np.isfinite(f_auc)) else np.nan
+            d_pr = round(m_pr - f_pr, 4) if (np.isfinite(m_pr) and np.isfinite(f_pr)) else np.nan
+            d_ratio = round(m_ratio - f_ratio, 2) if (np.isfinite(m_ratio) and np.isfinite(f_ratio)) else np.nan
+            d_lift = round(m_lift - f_lift, 2) if (np.isfinite(m_lift) and np.isfinite(f_lift)) else np.nan
+
+            # Relative skill over random (AUC - 0.5) compared to FWI (FWI_AUC - 0.5)
+            if np.isfinite(m_auc) and np.isfinite(f_auc) and (f_auc - 0.5) > 1e-4:
+                skill_gain_pct = round(100.0 * ((m_auc - 0.5) - (f_auc - 0.5)) / (f_auc - 0.5), 1)
+            else:
+                skill_gain_pct = np.nan
+
+            row_dict = dict(r)
+            row_dict["Delta ROC-AUC vs FWI"] = d_auc
+            row_dict["Skill Gain vs FWI (%)"] = skill_gain_pct
+            row_dict["Delta PR-AUC vs FWI"] = d_pr
+            row_dict["Delta High/Low Ratio vs FWI"] = d_ratio
+            row_dict["Delta Lift High vs FWI"] = d_lift
+            out_rows.append(row_dict)
+
+    return pd.DataFrame(out_rows)
+
+
 def evaluate_local_radius_around_point(
     pts: pd.DataFrame,
     center_lat: float,

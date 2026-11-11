@@ -16,6 +16,7 @@ Supports the following models:
 from __future__ import annotations
 
 import json
+import math
 import pickle
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -90,6 +91,11 @@ MODEL_CATALOG: Dict[str, Dict[str, Any]] = {
         "label": "Historical day-of-year climatology baseline (clim)",
         "requires_2d": False,
         "oof_col": "p_clim",
+    },
+    "fwi": {
+        "label": "Canadian Fire Weather Index / EFFIS physical baseline (fwi)",
+        "requires_2d": False,
+        "oof_col": "p_fwi",
     },
     "stack_no_img": {
         "label": "Ensemble: non-image models (stack_no_img)",
@@ -346,7 +352,7 @@ class ModelRegistry:
     def status_report(self) -> Dict[str, Dict[str, Any]]:
         report: Dict[str, Dict[str, Any]] = {}
         for m, info in MODEL_CATALOG.items():
-            if m in ("persist", "clim"):
+            if m in ("persist", "clim", "fwi"):
                 report[m] = {"available": True, "requires_2d": False, "missing_files": [], "label": info["label"]}
             elif "cbm_prefix" in info:
                 pref = info["cbm_prefix"]
@@ -580,6 +586,27 @@ class ModelRegistry:
             for ri, R in enumerate(RADII):
                 mu[R] = np.clip(clim_rate[:, ri], 1e-3, None).astype(np.float32)
 
+        elif model_name == "fwi":
+            from datetime import date as _date
+            from config_and_features import TAB_1D_COL_NAMES
+            from fwi_calculator import compute_fwi_for_grid_from_tab1d
+
+            # Recover approximate DOY from doy_sin / doy_cos in TAB_1D
+            s_doy = float(TAB_1D[0, -2]) if len(TAB_1D) else 0.0
+            c_doy = float(TAB_1D[0, -1]) if len(TAB_1D) else 1.0
+            ang = math.atan2(s_doy, c_doy)
+            if ang < 0:
+                ang += 2.0 * math.pi
+            doy = max(1, min(365, int(round(ang * 365.0 / (2.0 * math.pi)))))
+            approx_day = _date(2025, 1, 1) + pd.Timedelta(days=doy - 1)
+
+            fwi_res = compute_fwi_for_grid_from_tab1d(TAB_1D, TAB_1D_COL_NAMES, approx_day)
+            p = fwi_res["p_fwi"]
+            dsr = fwi_res["dsr"]
+            area_scale = {5: 0.01, 10: 0.04, 25: 0.25, 50: 1.0}
+            for R in RADII:
+                mu[R] = np.clip(0.35 * dsr * area_scale[R], 1e-3, 500.0).astype(np.float32)
+
         elif model_name in ("tab_1d", "tab_hist", "tab_clim_full", "tab_full", "tab_ssl_full"):
             if model_name == "tab_1d":
                 X = TAB_1D
@@ -711,6 +738,16 @@ class ModelRegistry:
         shares: Tuple[float, float] = (0.60, 0.30),
         fallback_p: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, Optional[pd.DataFrame]]:
+        if model_name == "fwi":
+            if fallback_p is not None and len(fallback_p) >= 20:
+                t = np.quantile(fallback_p, [shares[0], shares[0] + shares[1]]).astype(np.float32)
+                if float(t[1] - t[0]) < 1e-4:
+                    t = np.array([0.07, 0.22], dtype=np.float32)
+            else:
+                # Calibrated FWI thresholds for single-point evaluation (Low < 0.08 <= Med < 0.22 <= High)
+                t = np.array([0.08, 0.22], dtype=np.float32)
+            return t, None
+
         oof_col = MODEL_CATALOG.get(model_name, {}).get("oof_col", f"p_{model_name}")
         if self.oof_df is not None:
             col = oof_col if oof_col in self.oof_df.columns else (
