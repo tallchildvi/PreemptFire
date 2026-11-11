@@ -11,7 +11,7 @@ pinned: false
 
 # PreemptFire: Iberia Wildfire Risk and Model Comparison
 
-Gradio application for Hugging Face Spaces. Runs data collection following the approach_b branch and evaluates models trained in preemptfire-v5_(2).ipynb.
+Gradio application for Hugging Face Spaces. Runs data collection following the `approach_b` branch and evaluates models trained on the **[PreemptFire-100m Kaggle Benchmark Dataset](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)**.
 
 ## Repository structure
 

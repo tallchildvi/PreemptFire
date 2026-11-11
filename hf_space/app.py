@@ -914,8 +914,10 @@ def build_app() -> gr.Blocks:
 
     with gr.Blocks(title="PreemptFire Iberia Wildfire Risk") as demo:
         gr.Markdown(
-            "# PreemptFire: Wildfire Risk Assessment and Model Comparison (Iberia)\n"
-            "Interactive interface for running multi-model wildfire predictions (1D, GRU sequence models, and 2D satellite models) "
+            "# PreemptFire: Wildfire Risk Assessment and Model Comparison (Iberia)\n\n"
+            "**Benchmark Dataset (Kaggle):** [Wildfire Iberia 100m](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m) | "
+            "**Source Code:** [GitHub Repository](https://github.com/tallchildvi/PreemptFire)\n\n"
+            "Interactive interface for running multi-model wildfire predictions (1D meteorological, GRU sequence models, and 2D satellite models) "
             "with dataset persistence and isolated post-hoc ground-truth verification."
         )
 
