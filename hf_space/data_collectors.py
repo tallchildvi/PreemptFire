@@ -189,11 +189,11 @@ def fetch_weather_cells(
     day: date,
     gap: int = 3,
     cell: float = 0.25,
-    batch_size: int = 40,
+    batch_size: int = 25,
     use_cache: bool = True,
+    progress_cb=None,
 ) -> Tuple[List[Dict[str, float]], int]:
-    """Batched Open-Meteo weather fetcher over 0.25-deg cells with disk caching.
-    Uses multi-coordinate queries so ~280 cells take ~6 HTTP calls (~4s) instead of 280 calls."""
+    """Batched Open-Meteo weather fetcher over 0.25-deg cells with disk caching and live step progress."""
     wd = day - timedelta(days=1)
     t0 = wd - timedelta(days=gap)
     key = (
@@ -223,10 +223,12 @@ def fetch_weather_cells(
         start = wd - timedelta(days=60)
         recent = (date.today() - wd).days < 5
         url = "https://api.open-meteo.com/v1/forecast" if recent else "https://archive-api.open-meteo.com/v1/archive"
-        sess = _make_session()
+        batches = [missing_keys[s : s + batch_size] for s in range(0, len(missing_keys), batch_size)]
+        n_batches = len(batches)
 
-        for s in range(0, len(missing_keys), batch_size):
-            b_keys = missing_keys[s : s + batch_size]
+        def _fetch_batch(b_idx_and_keys):
+            b_idx, b_keys = b_idx_and_keys
+            sess = _make_session()
             lats = ",".join(str(round(cells[k][0], 4)) for k in b_keys)
             lons = ",".join(str(round(cells[k][1], 4)) for k in b_keys)
             params = {
@@ -238,12 +240,12 @@ def fetch_weather_cells(
                 "daily": "precipitation_sum",
                 "timezone": "UTC",
             }
-            batch_ok = False
+            out_chunk: Dict[str, Optional[Dict[str, float]]] = {}
             for attempt in range(3):
                 try:
-                    r = sess.get(url, params=params, timeout=60)
+                    r = sess.get(url, params=params, timeout=45)
                     if r.status_code == 429:
-                        time.sleep(3 + 3 * attempt)
+                        time.sleep(2 + 2 * attempt)
                         continue
                     r.raise_for_status()
                     payload = r.json()
@@ -251,22 +253,44 @@ def fetch_weather_cells(
                     if len(items) == len(b_keys):
                         for k, item in zip(b_keys, items):
                             try:
-                                res[k] = _parse_open_meteo_payload(item, wd, t0)
+                                out_chunk[k] = _parse_open_meteo_payload(item, wd, t0)
                             except Exception:
-                                res[k] = None
-                        batch_ok = True
-                        break
-                except Exception as e:
-                    time.sleep(1.5 + 2 * attempt)
+                                out_chunk[k] = None
+                        return b_idx, out_chunk
+                except Exception:
+                    time.sleep(1 + attempt)
 
-            if not batch_ok:
-                # Individual fallback for this chunk
-                for k in b_keys:
-                    la, lo = cells[k]
-                    try:
-                        res[k] = fetch_weather(la, lo, wd, t0)
-                    except Exception:
-                        res[k] = None
+            for k in b_keys:
+                la, lo = cells[k]
+                try:
+                    out_chunk[k] = fetch_weather(la, lo, wd, t0)
+                except Exception:
+                    out_chunk[k] = None
+            return b_idx, out_chunk
+
+        done_batches = 0
+        done_cells = len(unique_keys) - len(missing_keys)
+        if progress_cb:
+            progress_cb(
+                0.05,
+                f"[Step 1/5] Open-Meteo ERA5 weather: starting {n_batches} batches ({len(missing_keys)} cells to fetch)...",
+            )
+
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            futures = [pool.submit(_fetch_batch, (i, b)) for i, b in enumerate(batches)]
+            for fut in as_completed(futures):
+                b_idx, chunk_res = fut.result()
+                res.update(chunk_res)
+                done_batches += 1
+                done_cells += len(chunk_res)
+                frac = 0.05 + 0.30 * (done_batches / max(n_batches, 1))
+                msg = (
+                    f"[Step 1/5] Open-Meteo ERA5 weather: batch {done_batches}/{n_batches} complete "
+                    f"({done_cells}/{len(unique_keys)} cells fetched)"
+                )
+                print(f"  {msg}")
+                if progress_cb:
+                    progress_cb(frac, msg)
 
         if use_cache:
             try:
@@ -275,6 +299,9 @@ def fetch_weather_cells(
                     cache_file.write_text(json.dumps(valid_to_save), encoding="utf-8")
             except Exception:
                 pass
+    else:
+        if progress_cb:
+            progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(unique_keys)} cells).")
 
     bad = [k for k in unique_keys if res.get(k) is None]
     ok = [k for k in unique_keys if res.get(k) is not None]
@@ -341,7 +368,7 @@ def _init_gee() -> bool:
         return False
 
 
-def fetch_population_single(lat: float, lon: float, year: int = 2020, cache_path: Optional[str] = None) -> Dict[str, float]:
+def fetch_population_single(lat: float, lon: float, year: int = 2020, cache_path: Optional[str] = None) -> Tuple[float, float]:
     """Fetches 10km and 50km log1p population for one point (checks cache first, then GEE, then KDTree fallback)."""
     cpath = Path(cache_path or CONFIG["POPULATION_CACHE"])
     if cpath.exists():
@@ -350,11 +377,11 @@ def fetch_population_single(lat: float, lon: float, year: int = 2020, cache_path
             if {"lat", "lon", "population_10km_log1p", "population_50km_log1p"} <= set(cdf.columns) and len(cdf):
                 d2 = (cdf["lat"].values - lat) ** 2 + (cdf["lon"].values - lon) ** 2
                 idx = int(np.argmin(d2))
-                if d2[idx] < 1e-4:  # Within ~1 km of cached point
-                    return {
-                        "population_10km_log1p": float(cdf["population_10km_log1p"].iloc[idx]),
-                        "population_50km_log1p": float(cdf["population_50km_log1p"].iloc[idx]),
-                    }
+                if d2[idx] < 1e-4:
+                    return (
+                        float(cdf["population_10km_log1p"].iloc[idx]),
+                        float(cdf["population_50km_log1p"].iloc[idx]),
+                    )
         except Exception:
             pass
 
@@ -384,32 +411,38 @@ def fetch_population_single(lat: float, lon: float, year: int = 2020, cache_path
             fc = ee.FeatureCollection([ee.Feature(pt.buffer(10000), {"id": "l"}), ee.Feature(pt.buffer(50000), {"id": "r"})])
             res = img.unmask(0).reduceRegions(collection=fc, reducer=ee.Reducer.sum(), scale=100).getInfo()
             p = {f["properties"]["id"]: max(0.0, float(f["properties"].get("sum", 0.0))) for f in res["features"]}
-            return {
-                "population_10km_log1p": float(np.log1p(p.get("l", 0.0))),
-                "population_50km_log1p": float(np.log1p(p.get("r", 0.0))),
-            }
+            return (
+                float(np.log1p(p.get("l", 0.0))),
+                float(np.log1p(p.get("r", 0.0))),
+            )
         except Exception as e:
             print(f"  [Population GEE] single fetch failed ({e})")
 
-    # Fallback: interpolate from population_cache.csv if available, else median Iberia rural population
     if cpath.exists():
         try:
             cdf = pd.read_csv(cpath).dropna(subset=["population_10km_log1p", "population_50km_log1p"])
             if len(cdf):
                 d2 = (cdf["lat"].values - lat) ** 2 + ((cdf["lon"].values - lon) * np.cos(np.radians(lat))) ** 2
                 idx = int(np.argmin(d2))
-                return {
-                    "population_10km_log1p": float(cdf["population_10km_log1p"].iloc[idx]),
-                    "population_50km_log1p": float(cdf["population_50km_log1p"].iloc[idx]),
-                }
+                return (
+                    float(cdf["population_10km_log1p"].iloc[idx]),
+                    float(cdf["population_50km_log1p"].iloc[idx]),
+                )
         except Exception:
             pass
 
-    return {"population_10km_log1p": 8.85, "population_50km_log1p": 12.15}
+    return 8.85, 12.15
 
 
-def fetch_population_points(pts: pd.DataFrame, cache: Optional[str] = None) -> pd.DataFrame:
+def fetch_population_points(
+    pts: pd.DataFrame,
+    cache: Optional[str] = None,
+    metadata_df: Optional[pd.DataFrame] = None,
+    progress_cb=None,
+) -> pd.DataFrame:
     """Returns DataFrame with columns [population_10km_log1p, population_50km_log1p] for all grid points."""
+    if progress_cb:
+        progress_cb(0.36, f"[Step 2/5] Population density (10km / 50km): checking cache for {len(pts)} locations...")
     cpath = Path(cache or CONFIG["POPULATION_CACHE"])
     if cpath.exists():
         try:
@@ -428,8 +461,9 @@ def fetch_population_points(pts: pd.DataFrame, cache: Optional[str] = None) -> p
                 how="left",
             )
             if not m["population_10km_log1p"].isna().any():
+                if progress_cb:
+                    progress_cb(0.42, f"[Step 2/5] Population loaded from cache ({len(pts)} locations).")
                 return m[["population_10km_log1p", "population_50km_log1p"]].reset_index(drop=True)
-            # Fill any missing points by nearest neighbor in cache
             valid_c = c.dropna(subset=["population_10km_log1p", "population_50km_log1p"]).reset_index(drop=True)
             if len(valid_c) > 0:
                 tree = cKDTree(to_xyz(valid_c["lat"].values, valid_c["lon"].values))
@@ -437,9 +471,23 @@ def fetch_population_points(pts: pd.DataFrame, cache: Optional[str] = None) -> p
                 _, idx = tree.query(to_xyz(pts["lat"].values[miss], pts["lon"].values[miss]), k=1)
                 m.loc[miss, "population_10km_log1p"] = valid_c["population_10km_log1p"].values[idx]
                 m.loc[miss, "population_50km_log1p"] = valid_c["population_50km_log1p"].values[idx]
+                if progress_cb:
+                    progress_cb(0.42, f"[Step 2/5] Population loaded and interpolated from cache ({len(pts)} locations).")
                 return m[["population_10km_log1p", "population_50km_log1p"]].reset_index(drop=True)
         except Exception as e:
             print(f"  [Population Cache] warning reading {cpath}: {e}")
+
+    if metadata_df is not None and {"population_10km_log1p", "population_50km_log1p"} <= set(metadata_df.columns):
+        la_c = next(col for col in ("lat", "latitude") if col in metadata_df.columns)
+        lo_c = next(col for col in ("lon", "longitude") if col in metadata_df.columns)
+        m_sub = metadata_df[[la_c, lo_c, "population_10km_log1p", "population_50km_log1p"]].copy()
+        m_sub.columns = ["lat", "lon", "population_10km_log1p", "population_50km_log1p"]
+        m_sub["lat"] = m_sub["lat"].round(5)
+        m_sub["lon"] = m_sub["lon"].round(5)
+        m_sub = m_sub.drop_duplicates(subset=["lat", "lon"])
+        merged = pts.merge(m_sub, on=["lat", "lon"], how="left")
+        if not merged["population_10km_log1p"].isna().any():
+            return merged[["population_10km_log1p", "population_50km_log1p"]].reset_index(drop=True)
 
     if _init_gee():
         try:
@@ -464,7 +512,10 @@ def fetch_population_points(pts: pd.DataFrame, cache: Optional[str] = None) -> p
                     (f_["properties"]["i"], f_["properties"]["R"], float(f_["properties"].get("sum", 0.0)))
                     for f_ in out
                 ]
-                print(f"  [Population GEE] {min(s + 200, len(pts))}/{len(pts)}")
+                msg = f"[Step 2/5] Population GEE WorldPop: {min(s + 200, len(pts))}/{len(pts)} points fetched"
+                print(f"  {msg}")
+                if progress_cb:
+                    progress_cb(0.36 + 0.08 * (min(s + 200, len(pts)) / max(len(pts), 1)), msg)
             d = pd.DataFrame(rows, columns=["i", "R", "v"]).pivot(index="i", columns="R", values="v").clip(lower=0)
             res = pd.DataFrame(
                 {
@@ -478,7 +529,8 @@ def fetch_population_points(pts: pd.DataFrame, cache: Optional[str] = None) -> p
         except Exception as e:
             print(f"  [Population GEE] batch fetch failed ({e}), using fallback.")
 
-    print("  [Population] WARNING: neither population_cache.csv nor GEE available; using default priors.")
+    if progress_cb:
+        progress_cb(0.44, "[Step 2/5] Population: using regional baseline priors (no GEE/cache found).")
     return pd.DataFrame(
         {
             "population_10km_log1p": np.full(len(pts), 8.85, dtype=np.float32),
@@ -488,24 +540,35 @@ def fetch_population_points(pts: pd.DataFrame, cache: Optional[str] = None) -> p
     )
 
 
-# 4. FIRMS FIRE DETECTIONS COLLECTOR (With Local Archive + 5-Day Disk Cache)
-
 def fetch_firms_days(
-    lat: float,
-    lon: float,
-    first: date,
-    last: date,
+    first: date | float,
+    last: date | float,
+    third: Optional[date] = None,
+    fourth: Optional[date] = None,
     radius_deg_lat: float = 0.6,
     bbox: Optional[str] = None,
+    progress_cb=None,
 ) -> Tuple[pd.DataFrame, set]:
-    """Fetches daily FIRMS detections in [first, last].
-    1) Checks local historical archive (`firms_points_2017_2025.csv.gz`) first for historical dates!
-    2) For dates not in local archive, queries NASA FIRMS API with 5-day disk caching in `mini_dataset/firms_cache/`.
+    """Fetches daily FIRMS detections in [first_date, last_date].
+    Accepts either `fetch_firms_days(first_date, last_date, bbox=...)` or `fetch_firms_days(lat, lon, first_date, last_date)`.
     """
+    if isinstance(first, (int, float)) and isinstance(last, (int, float)) and isinstance(third, date) and isinstance(fourth, date):
+        lat, lon = float(first), float(last)
+        first_dt, last_dt = third, fourth
+    else:
+        lat, lon = 0.0, 0.0
+        first_dt, last_dt = first, last  # type: ignore[assignment]
+        if bbox is None:
+            bbox = IBERIA_BBOX
+
+    first = first_dt
+    last = last_dt
     frames = []
     covered: set = set()
 
-    # Step 1: Check if any dates in [first, last] are already covered in local FIRMS archive
+    if progress_cb:
+        progress_cb(0.46, f"[Step 3/5] NASA FIRMS fire history: checking local archive ({first} to {last})...")
+
     hist_path = Path(CONFIG["FIRMS_HISTORY"])
     cov_path = Path(CONFIG["FIRMS_COVERED"])
     if not hist_path.exists():
@@ -549,14 +612,14 @@ def fetch_firms_days(
         except Exception as e:
             print(f"  [FIRMS Archive] warning reading local archive: {e}")
 
-    # Check if all requested days are already covered by the local archive
     all_req_days = {first + timedelta(days=i) for i in range((last - first).days + 1)}
     missing_days = sorted(all_req_days - covered)
     if not missing_days:
         pts = pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame(columns=["latitude", "longitude", "acq_date"])
+        if progress_cb:
+            progress_cb(0.58, f"[Step 3/5] NASA FIRMS: loaded {len(pts)} detections across {len(covered)} days from archive.")
         return pts, covered
 
-    # Step 2: Query NASA FIRMS API for missing days (with 5-day block disk cache)
     key = CONFIG["FIRMS_MAP_KEY"]
     if not key:
         print("  [FIRMS API] WARNING: FIRMS_MAP_KEY is not set; returning local archive coverage only.")
@@ -574,12 +637,20 @@ def fetch_firms_days(
 
     d = missing_days[0]
     last_miss = missing_days[-1]
+    total_span = max(1, (last_miss - d).days + 1)
     sess = _make_session()
 
     while d <= last_miss:
         n = min(5, (last_miss - d).days + 1)
         src = "VIIRS_SNPP_SP" if (date.today() - d).days > 60 else "VIIRS_SNPP_NRT"
         cache_file = firms_cache_dir / f"firms_{src}_{bbox_tag}_{d.isoformat()}_{n}d.csv"
+
+        done_span = (d - missing_days[0]).days
+        if progress_cb:
+            progress_cb(
+                0.46 + 0.12 * (done_span / total_span),
+                f"[Step 3/5] NASA FIRMS API ({src}): fetching {d.isoformat()} (+{n} days)...",
+            )
 
         df = None
         if cache_file.exists():
@@ -1241,29 +1312,47 @@ class Scene2DCollector:
 
         return np.full(shape, default_moisture, dtype=np.float32)
 
-    def collect_full_scene(self, lat: float, lon: float, target_day: date) -> Dict[str, Any]:
+    def collect_full_scene(
+        self,
+        lat: float,
+        lon: float,
+        target_day: date,
+        weather_dict: Optional[Dict[str, float]] = None,
+        pop_10_50: Optional[Tuple[float, float]] = None,
+        progress_cb=None,
+    ) -> Dict[str, Any]:
         """Collects the complete 22-channel 128x128 2D raster + SCL + 35-dim 1D context vector for (lat, lon, target_day)."""
         t0_wall = time.perf_counter()
         grid_info = self.get_master_grid_info(lat, lon)
         wd = target_day - timedelta(days=1)
         pre_fire_str = wd.isoformat()
 
-        # Run Sentinel (S2+S1) and Static (DEM+OSM) + Soil Moisture in parallel
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            f_sent = pool.submit(self.fetch_s2_and_sar, grid_info, pre_fire_str, 30)
-            f_stat = pool.submit(self.fetch_static_terrain_and_osm, grid_info, 4000.0)
-            f_soil = pool.submit(self.fetch_soil_moisture, grid_info, pre_fire_str)
+        if progress_cb:
+            progress_cb(0.20, "[2D Step 1/4] Querying Planetary Computer STAC for Sentinel-2 L2A & Sentinel-1 SAR...")
+        sent_res = self.fetch_s2_and_sar(grid_info, pre_fire_str, 30)
 
-            sent_res = f_sent.result()
-            stat_res = f_stat.result()
-            soil_arr = f_soil.result()
+        if progress_cb:
+            progress_cb(0.50, "[2D Step 2/4] Fetching Copernicus DEM GLO-30 & OpenStreetMap roads (Dijkstra travel time)...")
+        stat_res = self.fetch_static_terrain_and_osm(grid_info, 4000.0)
+
+        if progress_cb:
+            progress_cb(0.75, "[2D Step 3/4] Fetching ERA5-Land volumetric soil moisture (0-7 cm)...")
+        soil_arr = self.fetch_soil_moisture(grid_info, pre_fire_str)
 
         t0_date_str = sent_res["t0_date"]
         t0_dt = datetime.strptime(t0_date_str, "%Y-%m-%d").date()
 
-        weather_dict = fetch_weather(lat, lon, wd, t0_dt)
-        pop_dict = fetch_population_single(lat, lon, target_day.year)
-        ctx_dict = {**weather_dict, **pop_dict}
+        if weather_dict is None:
+            weather_dict = fetch_weather(lat, lon, wd, t0_dt)
+        if pop_10_50 is not None:
+            p10, p50 = pop_10_50
+        else:
+            p10, p50 = fetch_population_single(lat, lon, target_day.year)
+        ctx_dict = {
+            **weather_dict,
+            "population_10km_log1p": float(p10),
+            "population_50km_log1p": float(p50),
+        }
 
         rasters_2d = {
             **{k: v for k, v in sent_res["bands_t0"].items() if k != "SCL"},
@@ -1292,14 +1381,20 @@ class Scene2DCollector:
         )
         scene_id = f"SCENE_{lat:.4f}_{lon:.4f}_{target_day.strftime('%Y%m%d')}"
         patch_id = f"{scene_id}_p000"
+        valid_s2_frac = float(1.0 - (sent_res["loss_mask"] > 0.5).mean())
 
         return {
             "scene_id": scene_id,
             "patch_id": patch_id,
             "lat": float(lat),
             "lon": float(lon),
+            "latitude": float(lat),
+            "longitude": float(lon),
+            "date": target_day.isoformat(),
             "target_date": target_day.isoformat(),
             "t0_date": t0_date_str,
+            "s2_Source_Date": t0_date_str,
+            "valid_s2_frac": valid_s2_frac,
             "crs": str(grid_info["crs"]),
             "invalid_ratio": float((sent_res["loss_mask"] > 0.5).mean()),
             "sar_coverage_ratio": float(has_sar),
@@ -1311,3 +1406,6 @@ class Scene2DCollector:
             "context_dict": ctx_dict,
             "elapsed_sec": time.perf_counter() - t0_wall,
         }
+
+    collect_scene = collect_full_scene
+

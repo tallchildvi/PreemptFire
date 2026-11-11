@@ -71,15 +71,15 @@ def build_grid_features(
     H = int(CONFIG["HISTORY_DAYS"])
 
     if progress_cb:
-        progress_cb(0.10, f"Fetching Open-Meteo weather for {wd} across {len(pts)} points...")
+        progress_cb(0.02, f"[Step 1/5] Fetching Open-Meteo ERA5 weather for {wd} across {len(pts)} points...")
     print(f"[1/5] Fetching weather for {wd} across {len(pts)} points...")
-    w_list, n_cells = fetch_weather_cells(pts, day, gap)
+    w_list, n_cells = fetch_weather_cells(pts, day, gap, progress_cb=progress_cb)
     print(f"      Fetched {n_cells} unique 0.25 deg cells.")
 
     if progress_cb:
-        progress_cb(0.30, "Loading population features (10 km and 50 km)...")
+        progress_cb(0.36, "[Step 2/5] Loading population features (10 km and 50 km)...")
     print("[2/5] Loading population features...")
-    pop = fetch_population_points(pts, cache=CONFIG["POPULATION_CACHE_CSV"], metadata_df=meta_df)
+    pop = fetch_population_points(pts, cache=CONFIG["POPULATION_CACHE_CSV"], metadata_df=meta_df, progress_cb=progress_cb)
 
     scenes_2d: List[Optional[Dict[str, Any]]] = [None] * len(pts)
     s2_dates: List[Optional[str]] = [None] * len(pts)
@@ -107,15 +107,17 @@ def build_grid_features(
     TAB_1D = np.vstack(tab_1d_list).astype(np.float32)
 
     if progress_cb:
-        progress_cb(0.50, f"Fetching {H}-day FIRMS history ({day - timedelta(days=H)} to {wd})...")
+        progress_cb(0.46, f"[Step 3/5] Fetching {H}-day FIRMS history ({day - timedelta(days=H)} to {wd})...")
     print(f"[3/5] Fetching {H}-day FIRMS history ({day - timedelta(days=H)} to {wd})...")
-    fire_df, covered = fetch_firms_days(day - timedelta(days=H), wd, bbox=IBERIA_BBOX)
+    fire_df, covered = fetch_firms_days(day - timedelta(days=H), wd, bbox=IBERIA_BBOX, progress_cb=progress_cb)
+    if progress_cb:
+        progress_cb(0.60, f"[Step 3/5] Aggregating spatial fire history across 4 radii (5, 10, 25, 50 km) for {len(pts)} points...")
     pts_xyz = to_xyz(pts.lat.values, pts.lon.values)
     HIST_TAB, HC = history_many(pts_xyz, fire_df, covered, day, RADII, H=H)
     print(f"      {len(fire_df)} VIIRS detections across {len(covered)}/{H} covered days.")
 
     if progress_cb:
-        progress_cb(0.65, "Computing historical day-of-year climatology...")
+        progress_cb(0.66, "[Step 4/5] Computing multi-year historical day-of-year climatology (KDTree)...")
     print("[4/5] Computing historical day-of-year climatology...")
     CLIM_FEATS = climatology_many(
         pts_xyz,

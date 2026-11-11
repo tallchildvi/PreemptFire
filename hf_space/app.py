@@ -323,7 +323,7 @@ def run_single_point_analysis(
     collect_2d: bool,
     progress=gr.Progress(track_tqdm=False),
 ):
-    progress(0.15, desc="Fetching data...")
+    progress(0.05, desc="[Step 1/6] Starting single-location pipeline...")
     res = score_single_location(
         lat=float(lat),
         lon=float(lon),
@@ -331,6 +331,7 @@ def run_single_point_analysis(
         models=["all"],
         collect_2d=bool(collect_2d),
         save_to_mini_dataset=True,
+        progress_cb=lambda frac, desc: progress(frac, desc=desc),
     )
     _, store = _get_registry_and_store()
     preds = res["predictions"]

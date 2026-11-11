@@ -56,6 +56,7 @@ def score_single_location(
     collect_2d: bool = False,
     save_to_mini_dataset: bool = True,
     model_dir: Optional[str] = None,
+    progress_cb=None,
 ) -> Dict[str, Any]:
     """Collects live data for `(lat, lon, target_day_str)`, optionally collects/loads the 22-channel
     2D satellite patch, saves to `mini_dataset/`, and scores all requested models.
@@ -68,14 +69,19 @@ def score_single_location(
     store = MiniDatasetStore(CONFIG.get("MINI_DATASET_DIR", "mini_dataset"))
     reg = ModelRegistry(model_dir=model_dir or CONFIG.get("MODEL_DIR", "models"))
 
-    # 1. Weather (Open-Meteo ERA5) & Population
+    if progress_cb:
+        progress_cb(0.08, f"[Step 1/6] Fetching 60-day Open-Meteo ERA5 weather for ({lat:.4f}, {lon:.4f}) up to {wd}...")
     w = fetch_weather(lat, lon, wd, t0)
+
+    if progress_cb:
+        progress_cb(0.16, f"[Step 2/6] Fetching population density (10km / 50km) for ({lat:.4f}, {lon:.4f})...")
     p10, p50 = fetch_population_single(lat, lon)
 
-    # 2. Check or collect 2D scene if requested (or if already cached in mini_dataset)
     scene_2d: Optional[Dict[str, Any]] = None
     cached_npz = store.has_scene_npz(lat, lon, day)
     if cached_npz is not None:
+        if progress_cb:
+            progress_cb(0.45, f"[Step 3/6] Loaded cached 22-channel 2D satellite patch from {cached_npz.name}...")
         scene_2d = store.load_scene_npz(cached_npz)
     elif collect_2d:
         collector = Scene2DCollector()
@@ -85,20 +91,22 @@ def score_single_location(
             target_day=day,
             weather_dict=w,
             pop_10_50=(p10, p50),
+            progress_cb=progress_cb,
         )
 
-    # Extract actual S2 observation date if 2D scene is present
     s2_date = scene_2d.get("s2_Source_Date") if scene_2d else None
     raw_1d, tab_1d = one_d_features(w, p10, p50, wd, s2_date=s2_date)
     TAB_1D = tab_1d[None, :]  # (1, 39)
 
-    # 3. 30-day FIRMS history
     H = int(CONFIG["HISTORY_DAYS"])
-    fire_df, covered = fetch_firms_days(day - timedelta(days=H), wd)
+    if progress_cb:
+        progress_cb(0.65, f"[Step 4/6] Fetching {H}-day NASA FIRMS fire detections ({day - timedelta(days=H)} to {wd})...")
+    fire_df, covered = fetch_firms_days(lat, lon, day - timedelta(days=H), wd)
     pts_xyz = to_xyz([lat], [lon])
     HIST_TAB, HC = history_many(pts_xyz, fire_df, covered, day, RADII, H=H)
 
-    # 4. Historical DOY Climatology
+    if progress_cb:
+        progress_cb(0.75, "[Step 5/6] Computing historical DOY fire climatology...")
     CLIM_FEATS = climatology_many(
         pts_xyz,
         day,
@@ -108,10 +116,10 @@ def score_single_location(
         CONFIG["HISTORICAL_COVERED_CSV"],
     )
 
-    # 5. Sequence & Static features for nn_ts
     SEQ, STATIC_1D = build_seq_and_static(HC, TAB_1D, CLIM_FEATS, H=H)
 
-    # 6. 2D features (FT 202-dim & SimCLR EMB32 32-dim) if scene_2d is available
+    if progress_cb:
+        progress_cb(0.85, "[Step 6/6] Extracting 2D embeddings (SimCLR + FT) and running model inference...")
     FT_2D, EMB32_2D, has_2d_mask = reg.compute_2d_embeddings_and_stats([scene_2d])
 
     # Determine which models to run
