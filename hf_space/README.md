@@ -1,6 +1,6 @@
 ---
 title: PreemptFire Iberia Wildfire Risk and Model Comparison
-emoji: globe
+emoji: "🌍"
 colorFrom: red
 colorTo: yellow
 sdk: gradio
