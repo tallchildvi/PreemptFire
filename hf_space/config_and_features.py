@@ -5,7 +5,7 @@ import math
 import os
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,7 +16,8 @@ from scipy.stats import nbinom
 BASE_DIR = Path(__file__).resolve().parent
 
 CONFIG: Dict[str, Any] = {
-    "FIRMS_MAP_KEY": os.getenv("FIRMS_MAP_KEY", ""),
+    "FIRMS_MAP_KEY": os.getenv("FIRMS_MAP_KEY", os.getenv("FIRMS_MAP_KEYS", "")),
+    "FIRMS_MAP_KEYS": os.getenv("FIRMS_MAP_KEYS", os.getenv("FIRMS_MAP_KEY", "")),
     "GEE_PROJECT": os.getenv("GEE_PROJECT", ""),
     "GEE_SERVICE_ACCOUNT": os.getenv("GEE_SERVICE_ACCOUNT", ""),
     "GEE_KEY_FILE": os.getenv("GEE_KEY_FILE", ""),
@@ -32,6 +33,15 @@ CONFIG: Dict[str, Any] = {
     "MODEL_DIR": os.getenv("PF_MODEL_DIR", str(BASE_DIR / "models")),
     "MINI_DATASET_DIR": os.getenv("PF_MINI_DATASET_DIR", str(BASE_DIR / "mini_dataset")),
 }
+
+
+def get_firms_keys(explicit: Optional[str | Sequence[str]] = None) -> List[str]:
+    """Parses a pool of NASA FIRMS API keys from comma, space, newline or semicolon separated string."""
+    raw = explicit or CONFIG.get("FIRMS_MAP_KEYS") or CONFIG.get("FIRMS_MAP_KEY") or ""
+    if isinstance(raw, (list, tuple)):
+        return [str(k).strip() for k in raw if str(k).strip()]
+    parts = [p.strip() for p in str(raw).replace(";", ",").replace("\n", ",").replace(" ", ",").split(",") if p.strip()]
+    return parts
 
 IBERIA_BBOX = "-9.5,35.9,3.4,43.9"  # lon_min,lat_min,lon_max,lat_max
 R_EARTH = 6371.0088

@@ -292,3 +292,4 @@ ehthumbs_vista.db
 
 # End of https://www.toptal.com/developers/gitignore/api/python,visualstudiocode,venv,jupyternotebooks,gis,linux,windows,macos
 
+hf_space/mini_dataset/

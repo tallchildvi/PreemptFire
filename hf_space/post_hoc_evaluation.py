@@ -81,6 +81,7 @@ def _brier_score_np(y_true: np.ndarray, y_prob: np.ndarray) -> float:
 def fetch_post_hoc_firms(
     target_day: date,
     bbox: str = IBERIA_BBOX,
+    firms_keys: Optional[str | Sequence[str]] = None,
     progress_cb=None,
 ) -> Dict[str, Any]:
     """Independently fetches actual FIRMS detections for target_day (1d) and [target_day, target_day + 6d] (7d)."""
@@ -95,6 +96,7 @@ def fetch_post_hoc_firms(
         target_day,
         end_7d,
         bbox=bbox,
+        firms_keys=firms_keys,
         progress_cb=None,
     )
 
@@ -108,6 +110,11 @@ def fetch_post_hoc_firms(
 
     covered_1d = {target_day} if target_day in covered_7d else set()
 
+    from data_collectors import _LAST_FIRMS_DIAGNOSTICS
+    diag = dict(_LAST_FIRMS_DIAGNOSTICS)
+    diag["covered_1d_ok"] = bool(len(covered_1d) > 0)
+    diag["covered_7d_count"] = len(covered_7d)
+
     return {
         "target_day": target_day,
         "end_7d": end_7d,
@@ -115,6 +122,7 @@ def fetch_post_hoc_firms(
         "fire_7d_df": fire_7d_df,
         "covered_1d": covered_1d,
         "covered_7d": covered_7d,
+        "status_info": diag,
     }
 
 

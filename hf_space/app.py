@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from config_and_features import CI, CONFIG, RADII, build_2d_np
+from config_and_features import CI, CONFIG, RADII, build_2d_np, get_firms_keys
 from live import score_single_location
 from make_map import (
     build_grid_features,
@@ -466,9 +466,14 @@ def run_post_hoc_ground_truth(
     focal_lat: float,
     focal_lon: float,
     local_radius_km: float,
+    firms_keys_str: str = "",
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
+        if firms_keys_str and firms_keys_str.strip():
+            CONFIG["FIRMS_MAP_KEY"] = firms_keys_str.strip()
+            CONFIG["FIRMS_MAP_KEYS"] = firms_keys_str.strip()
+
         day = _parse_day(date_str)
         r_km = int(radius_km)
         reg, store = _get_registry_and_store()
@@ -525,7 +530,7 @@ def run_post_hoc_ground_truth(
             model_name = next(iter(model_preds.keys()))
 
         progress(0.72, desc=f"[Step 3/3] Post-hoc fetching actual FIRMS detections on {day} and 7-day window...")
-        firms_gt = fetch_post_hoc_firms(day, progress_cb=None)
+        firms_gt = fetch_post_hoc_firms(day, firms_keys=firms_keys_str, progress_cb=None)
         fire_1d_df = firms_gt["fire_1d_df"]
         fire_7d_df = firms_gt["fire_7d_df"]
         end_7d = firms_gt["end_7d"]
@@ -656,6 +661,21 @@ def run_post_hoc_ground_truth(
                 f"  - 7d ({day}..{end_7d}): {model_name} ROC-AUC = {s7['ROC-AUC']} vs FWI ROC-AUC = {f7['ROC-AUC']} (Delta = {d_auc7:+.4f}) | {model_name} High/Low = {s7['High/Low Rate Ratio (x)']}x vs FWI High/Low = {f7['High/Low Rate Ratio (x)']}x",
             ]
 
+        diag = firms_gt.get("status_info", {})
+        firms_diag_lines: List[str] = [f""]
+        if diag.get("last_error"):
+            firms_diag_lines.append(f"⚠️ NASA FIRMS API Warning: {diag['last_error']}")
+        if len(fire_1d_df) == 0 and len(fire_7d_df) == 0:
+            if diag.get("last_error") or not diag.get("keys_configured"):
+                firms_diag_lines.append("⚠️ Notice: 0 ground-truth detections loaded because FIRMS API keys were exhausted, invalid, or missing. Check the FIRMS API key pool.")
+            else:
+                firms_diag_lines.append("ℹ️ Notice: NASA FIRMS reported 0 active fire detections across Iberia during this window.")
+        else:
+            k_pref = diag.get("active_key_prefix", "none")
+            s_used = diag.get("last_src", "archive/cache")
+            n_keys = diag.get("keys_configured", 0)
+            firms_diag_lines.append(f"ℹ️ FIRMS Status: Active key {k_pref} | Source {s_used} | Key pool size: {n_keys}")
+
         status_lines = [
             f"Stochastic & Probabilistic Verification for {day} (strictly isolated from pre-fire features up to {day} - 1 day):",
             f"Raw VIIRS fire detections in Iberia: {len(fire_1d_df)} on {day} (1d) | {len(fire_7d_df)} across {day}..{end_7d} (7d).",
@@ -671,7 +691,7 @@ def run_post_hoc_ground_truth(
             f"  - Risk Stratification: High/Low Ratio = {s7['High/Low Rate Ratio (x)']}x | Monotonic = {s7['Monotonic (Low<=Med<=High)']} | Lift(High) = {s7['Lift High (x)']}x | Lift(Med+High) = {s7['Lift Med+High (x)']}x",
             f"  - Threshold-Free Metrics: ROC-AUC = {s7['ROC-AUC']} | PR-AUC = {s7['PR-AUC']} | Brier Score = {s7['Brier Score']}",
             f"  - Low-Tier Safety: {s7['Low Safe Rate (%)']}% fire-free | Recall(Med+High) = {s7['Recall Med+High (%)']}% (Missed in Low = {s7['Missed in Low (%)']}%)",
-        ] + fwi_cmp_lines
+        ] + fwi_cmp_lines + firms_diag_lines
 
         progress(1.0, desc="Done")
         return str(gt_map_path), df_reliability_gt, df_models_gt, df_radii_gt, df_local_gt, "\n".join(status_lines)
@@ -684,9 +704,14 @@ def run_post_hoc_ground_truth(
 def run_batch_post_hoc_evaluation(
     dates_csv_str: str,
     radius_km: int,
+    firms_keys_str: str = "",
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
+        if firms_keys_str and firms_keys_str.strip():
+            CONFIG["FIRMS_MAP_KEY"] = firms_keys_str.strip()
+            CONFIG["FIRMS_MAP_KEYS"] = firms_keys_str.strip()
+
         raw_parts = [p.strip()[:10] for p in str(dates_csv_str or "").replace("\n", ",").split(",") if p.strip()]
         days: List[Any] = []
         for p in raw_parts:
@@ -728,7 +753,7 @@ def run_batch_post_hoc_evaluation(
                 grid_data = _GRID_CACHE[cache_key]
 
             progress(frac_base + 0.55 * span, desc=f"[Batch {idx + 1}/{len(days)}] Fetching ground-truth FIRMS for {day} (1d & 7d)...")
-            firms_gt = fetch_post_hoc_firms(day, progress_cb=None)
+            firms_gt = fetch_post_hoc_firms(day, firms_keys=firms_keys_str, progress_cb=None)
             c1 = compute_actual_counts_per_point(pts, firms_gt["fire_1d_df"], radii=(r_km,))[r_km]
             c7 = compute_actual_counts_per_point(pts, firms_gt["fire_7d_df"], radii=(r_km,))[r_km]
 
@@ -858,13 +883,15 @@ def get_system_status_markdown() -> Tuple[str, pd.DataFrame]:
         )
     df_models = pd.DataFrame(rows)
 
+    k_pool = get_firms_keys()
+    k_label = f"FIRMS_MAP_KEY ({len(k_pool)} active keys configured in pool)" if k_pool else "FIRMS_MAP_KEY secret"
     data_checks = [
         ("metadata.csv", Path(_find_points_csv()).exists()),
         ("firms_covered_days.csv", Path(CONFIG["HISTORICAL_COVERED_CSV"]).exists() or Path("data/firms_covered_days.csv").exists()),
         ("firms_points_2017_2025.csv.gz", Path(CONFIG["HISTORICAL_FIRMS_CSV"]).exists() or Path("data/firms_points_2017_2025.csv.gz").exists()),
         ("oof_predictions.csv", reg.oof_path is not None and reg.oof_path.exists()),
         ("population_cache.csv", Path(CONFIG["POPULATION_CACHE_CSV"]).exists()),
-        ("FIRMS_MAP_KEY secret", bool(CONFIG.get("FIRMS_MAP_KEY"))),
+        (k_label, bool(k_pool)),
     ]
     lines = ["System file and configuration checks:"]
     for label, ok in data_checks:
@@ -994,6 +1021,14 @@ def build_app() -> gr.Blocks:
                     gt_lon_in = gr.Number(value=-4.65, label="Local Check Longitude")
                     gt_loc_rad_in = gr.Slider(minimum=5, maximum=150, step=5, value=50, label="Local Coordinate Check Radius (km)")
 
+                with gr.Row():
+                    gt_firms_keys_in = gr.Textbox(
+                        value=CONFIG.get("FIRMS_MAP_KEY", ""),
+                        label="NASA FIRMS API Key Pool (Enter 1, 2, or 3 keys separated by comma; auto-failover/rotation on quota/limit)",
+                        placeholder="e.g. key1, key2, key3",
+                        scale=3,
+                    )
+
                 run_gt_btn = gr.Button("Fetch Actual Detections (1d & 7d) and Compute Reliability & Lift", variant="primary")
                 gt_status_out = gr.Textbox(label="Probabilistic Calibration & Risk Stratification Summary", lines=13, interactive=False)
 
@@ -1031,12 +1066,12 @@ def build_app() -> gr.Blocks:
 
                 run_gt_btn.click(
                     fn=run_post_hoc_ground_truth,
-                    inputs=[gt_date_in, gt_model_in, gt_radius_in, gt_lat_in, gt_lon_in, gt_loc_rad_in],
+                    inputs=[gt_date_in, gt_model_in, gt_radius_in, gt_lat_in, gt_lon_in, gt_loc_rad_in, gt_firms_keys_in],
                     outputs=[gt_map_out, gt_rel_table_out, gt_models_table_out, gt_radii_table_out, gt_local_table_out, gt_status_out],
                 )
                 run_batch_gt_btn.click(
                     fn=run_batch_post_hoc_evaluation,
-                    inputs=[batch_dates_in, batch_rad_in],
+                    inputs=[batch_dates_in, batch_rad_in, gt_firms_keys_in],
                     outputs=[batch_agg_table_out, batch_daily_table_out, batch_gt_status_out],
                 )
 

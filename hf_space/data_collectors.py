@@ -33,6 +33,7 @@ from config_and_features import (
     CONFIG,
     IBERIA_BBOX,
     R_EARTH,
+    get_firms_keys,
     raw_context_vector,
     to_xyz,
 )
@@ -42,6 +43,15 @@ PIXEL_SCALE_METERS = 100.0
 HALF_SCENE_METERS = (GRID_SIZE_PX // 2) * PIXEL_SCALE_METERS  # 6400.0 m
 MAX_INVALID_RATIO = 0.20
 MIN_DEM_VALID_RATIO = 0.98
+
+_LAST_FIRMS_DIAGNOSTICS: Dict[str, Any] = {
+    "keys_configured": 0,
+    "active_key_prefix": "none",
+    "last_src": None,
+    "last_error": None,
+    "last_status_code": None,
+    "total_detections": 0,
+}
 
 
 import threading
@@ -345,6 +355,7 @@ def fetch_weather_cells(
                         r = sess.get(url, params=params, timeout=30)
                         if r.status_code == 429:
                             throttled_urls.add(url)
+                            time.sleep(1.2)
                             continue
                         r.raise_for_status()
                         payload = r.json()
@@ -358,6 +369,11 @@ def fetch_weather_cells(
                             break
                     except Exception:
                         continue
+
+                # If candidate endpoints hit 429 on this batch, wait briefly and reset throttled list
+                if len(throttled_urls) >= len(candidate_urls):
+                    time.sleep(2.0)
+                    throttled_urls.clear()
 
                 done_batches = b_idx + 1
                 done_cells += len(b_keys)
@@ -622,10 +638,11 @@ def fetch_firms_days(
     fourth: Optional[date] = None,
     radius_deg_lat: float = 0.6,
     bbox: Optional[str] = None,
+    firms_keys: Optional[str | Sequence[str]] = None,
     progress_cb=None,
 ) -> Tuple[pd.DataFrame, set]:
-    """Fetches daily FIRMS detections in [first_date, last_date].
-    Accepts either `fetch_firms_days(first_date, last_date, bbox=...)` or `fetch_firms_days(lat, lon, first_date, last_date)`.
+    """Fetches daily NASA FIRMS detections in [first_date, last_date] with multi-key pool
+    auto-failover, multi-source fallback (VIIRS_SNPP_NRT, NOAA20, NOAA21, SP), and disk caching.
     """
     if isinstance(first, (int, float)) and isinstance(last, (int, float)) and isinstance(third, date) and isinstance(fourth, date):
         lat, lon = float(first), float(last)
@@ -691,13 +708,17 @@ def fetch_firms_days(
     missing_days = sorted(all_req_days - covered)
     if not missing_days:
         pts = pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame(columns=["latitude", "longitude", "acq_date"])
+        _LAST_FIRMS_DIAGNOSTICS["total_detections"] = len(pts)
         if progress_cb:
             progress_cb(0.58, f"[Step 3/5] NASA FIRMS: loaded {len(pts)} detections across {len(covered)} days from archive.")
         return pts, covered
 
-    key = CONFIG["FIRMS_MAP_KEY"]
-    if not key:
-        print("  [FIRMS API] WARNING: FIRMS_MAP_KEY is not set; returning local archive coverage only.")
+    keys = get_firms_keys(firms_keys)
+    _LAST_FIRMS_DIAGNOSTICS["keys_configured"] = len(keys)
+    if not keys:
+        msg = "WARNING: No FIRMS_MAP_KEY configured. Please provide one or more NASA FIRMS MAP_KEYs in UI or environment."
+        _LAST_FIRMS_DIAGNOSTICS["last_error"] = msg
+        print(f"  [FIRMS API] {msg}")
         pts = pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame(columns=["latitude", "longitude", "acq_date"])
         return pts, covered
 
@@ -717,36 +738,88 @@ def fetch_firms_days(
 
     while d <= last_miss:
         n = min(5, (last_miss - d).days + 1)
-        src = "VIIRS_SNPP_SP" if (date.today() - d).days > 60 else "VIIRS_SNPP_NRT"
-        cache_file = firms_cache_dir / f"firms_{src}_{bbox_tag}_{d.isoformat()}_{n}d.csv"
+        days_ago = (date.today() - d).days
+        if days_ago > 90:
+            candidate_sources = ["VIIRS_SNPP_NRT", "VIIRS_SNPP_SP", "VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT", "MODIS_NRT"]
+        else:
+            candidate_sources = ["VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT", "VIIRS_NOAA21_NRT", "VIIRS_SNPP_SP", "MODIS_NRT"]
 
         done_span = (d - missing_days[0]).days
         if progress_cb:
             progress_cb(
                 0.46 + 0.12 * (done_span / total_span),
-                f"[Step 3/5] NASA FIRMS API ({src}): fetching {d.isoformat()} (+{n} days)...",
+                f"[Step 3/5] NASA FIRMS API: fetching {d.isoformat()} (+{n} days)...",
             )
 
         df = None
-        if cache_file.exists():
-            try:
-                df = pd.read_csv(cache_file)
-                covered.update(d + timedelta(days=i) for i in range(n))
-            except Exception:
-                df = None
-
-        if df is None:
-            url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{src}/{use_bbox}/{n}/{d.isoformat()}"
-            try:
-                r = sess.get(url, timeout=60)
-                if r.status_code == 200 and r.text.lstrip().startswith("latitude"):
-                    df = pd.read_csv(StringIO(r.text))
-                    df.to_csv(cache_file, index=False)
+        # 1. Check local cache across candidate sources
+        for cand_src in candidate_sources:
+            cache_file = firms_cache_dir / f"firms_{cand_src}_{bbox_tag}_{d.isoformat()}_{n}d.csv"
+            if cache_file.exists():
+                try:
+                    cand_df = pd.read_csv(cache_file)
+                    df = cand_df
                     covered.update(d + timedelta(days=i) for i in range(n))
-                else:
-                    print(f"  [FIRMS API] {src} {d} ({n}d) failed: HTTP {r.status_code} ({r.text[:120]})")
-            except Exception as e:
-                print(f"  [FIRMS API] {src} {d} ({n}d) error: {e}")
+                    break
+                except Exception:
+                    pass
+
+        # 2. Live fetch with automatic multi-key rotation and multi-source fallback
+        if df is None:
+            fetch_success = False
+            last_err_detail = None
+
+            for key_idx, key in enumerate(keys):
+                key_masked = f"{key[:5]}...{key[-3:]}" if len(key) > 8 else "***"
+                _LAST_FIRMS_DIAGNOSTICS["active_key_prefix"] = key_masked
+                key_has_auth_error = False
+
+                for src in candidate_sources:
+                    cache_file = firms_cache_dir / f"firms_{src}_{bbox_tag}_{d.isoformat()}_{n}d.csv"
+                    url = f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/{key}/{src}/{use_bbox}/{n}/{d.isoformat()}"
+                    try:
+                        r = sess.get(url, timeout=45)
+                        resp_text = r.text.strip()
+                        _LAST_FIRMS_DIAGNOSTICS["last_status_code"] = r.status_code
+
+                        # Valid CSV returned (either with fire records or header-only for 0 fires)
+                        if r.status_code == 200 and resp_text.startswith("latitude"):
+                            df = pd.read_csv(StringIO(r.text))
+                            df.to_csv(cache_file, index=False)
+                            covered.update(d + timedelta(days=i) for i in range(n))
+                            fetch_success = True
+                            _LAST_FIRMS_DIAGNOSTICS["last_src"] = src
+                            _LAST_FIRMS_DIAGNOSTICS["last_error"] = None
+                            print(f"  [FIRMS API] Successfully fetched {len(df)} {src} detections for {d} (+{n}d) using Key #{key_idx + 1} ({key_masked})")
+                            break
+
+                        # Check for key exhaustion, transaction limit, or auth errors
+                        is_key_err = (
+                            r.status_code in (401, 403, 429)
+                            or "limit reached" in resp_text.lower()
+                            or "invalid map_key" in resp_text.lower()
+                            or "unauthorized" in resp_text.lower()
+                            or "exceeded" in resp_text.lower()
+                        )
+                        if is_key_err:
+                            last_err_detail = f"Key #{key_idx + 1} ({key_masked}) error: HTTP {r.status_code} ({resp_text[:120]})"
+                            print(f"  [FIRMS API] {last_err_detail}. Switching to next key...")
+                            key_has_auth_error = True
+                            break
+
+                        # Otherwise source not available for this date/range, try next source
+                        last_err_detail = f"{src} on {d} failed: HTTP {r.status_code} ({resp_text[:120]})"
+                    except Exception as exc:
+                        last_err_detail = f"{src} on {d} error: {exc}"
+                        continue
+
+                if fetch_success or not key_has_auth_error:
+                    if fetch_success:
+                        break
+
+            if not fetch_success:
+                _LAST_FIRMS_DIAGNOSTICS["last_error"] = last_err_detail or "All FIRMS keys and sources failed."
+                print(f"  [FIRMS API] WARNING: Failed to fetch {d} (+{n}d) across {len(keys)} keys: {_LAST_FIRMS_DIAGNOSTICS['last_error']}")
 
         if df is not None and len(df) and "latitude" in df.columns:
             df["acq_date"] = df["acq_date"].astype(str).str[:10]
@@ -763,6 +836,7 @@ def fetch_firms_days(
         if frames
         else pd.DataFrame(columns=["latitude", "longitude", "acq_date"])
     )
+    _LAST_FIRMS_DIAGNOSTICS["total_detections"] = len(pts)
     return pts, covered
 
 
