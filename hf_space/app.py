@@ -29,6 +29,7 @@ from post_hoc_evaluation import (
     draw_ground_truth_comparison_map,
     evaluate_levels_against_actual,
     evaluate_local_radius_around_point,
+    evaluate_tier_reliability_table,
     fetch_post_hoc_firms,
 )
 
@@ -517,7 +518,7 @@ def run_post_hoc_ground_truth(
                 pass
 
         if not model_preds:
-            return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "No models could be evaluated."
+            return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "No models could be evaluated."
 
         if model_name not in model_preds:
             model_name = next(iter(model_preds.keys()))
@@ -548,6 +549,14 @@ def run_post_hoc_ground_truth(
             out_path=gt_map_path,
         )
 
+        df_rel_1d = evaluate_tier_reliability_table(
+            prim_out["levels"], prim_out["p"], counts_1d[r_km], model_name, f"1d ({day})", r_km
+        )
+        df_rel_7d = evaluate_tier_reliability_table(
+            prim_out["levels"], prim_out["p"], counts_7d[r_km], model_name, f"7d ({day}..{end_7d})", r_km
+        )
+        df_reliability_gt = pd.concat([df_rel_1d, df_rel_7d], ignore_index=True)
+
         model_rows = []
         for m, out in model_preds.items():
             model_rows.append(
@@ -566,7 +575,7 @@ def run_post_hoc_ground_truth(
                     probs=out["p"],
                     actual_counts=counts_7d[r_km],
                     model_name=m,
-                    window_label=f"7d ({day} to {end_7d})",
+                    window_label=f"7d ({day}..{end_7d})",
                     radius_km=r_km,
                 )
             )
@@ -590,7 +599,7 @@ def run_post_hoc_ground_truth(
                     probs=prim_out["p"],
                     actual_counts=counts_7d[int(R)],
                     model_name=model_name,
-                    window_label=f"7d ({day} to {end_7d})",
+                    window_label=f"7d ({day}..{end_7d})",
                     radius_km=int(R),
                 )
             )
@@ -617,41 +626,160 @@ def run_post_hoc_ground_truth(
             prim_out["levels"], prim_out["p"], counts_1d[r_km], model_name, f"1d ({day})", r_km
         )
         s7 = evaluate_levels_against_actual(
-            prim_out["levels"], prim_out["p"], counts_7d[r_km], model_name, f"7d ({day} to {end_7d})", r_km
-        )
-        loc_prim = evaluate_local_radius_around_point(
-            pts, float(focal_lat), float(focal_lon), float(local_radius_km),
-            prim_out["levels"], prim_out["p"], counts_1d[r_km], counts_7d[r_km], model_name
+            prim_out["levels"], prim_out["p"], counts_7d[r_km], model_name, f"7d ({day}..{end_7d})", r_km
         )
 
         status_lines = [
-            f"Post-hoc ground-truth verification for {day} (strictly isolated from pre-fire features up to {day} - 1 day):",
-            f"Raw VIIRS fire detections in Iberia: {len(fire_1d_df)} on {day} (1d) | {len(fire_7d_df)} across {day}..{end_7d} (7d, {len(firms_gt['covered_7d'])}/7 covered days).",
+            f"Stochastic & Probabilistic Verification for {day} (strictly isolated from pre-fire features up to {day} - 1 day):",
+            f"Raw VIIRS fire detections in Iberia: {len(fire_1d_df)} on {day} (1d) | {len(fire_7d_df)} across {day}..{end_7d} (7d).",
             f"",
             f"[{model_name} | Radius R = {r_km} km | Target Day ({day})]:",
-            f"  - Active fire grid scenes: {s1['Active Fire Scenes']}",
-            f"  - Marked High (separately): {s1['Marked High (count)']}/{s1['Active Fire Scenes']} ({s1['Marked High (%)']}%) -> All High? {s1['All in Radius High?']}",
-            f"  - Marked Medium (separately): {s1['Marked Medium (count)']}/{s1['Active Fire Scenes']} ({s1['Marked Medium (%)']}%) -> All Medium? {s1['All in Radius Medium?']}",
-            f"  - Marked Medium+High (combined): {s1['Marked Med+High (count)']}/{s1['Active Fire Scenes']} ({s1['Marked Med+High (%)']}%) -> All Med+High? {s1['All in Radius Med+High?']}",
-            f"  - Missed (Low): {s1['Missed / Low (count)']}/{s1['Active Fire Scenes']} ({s1['Missed / Low (%)']}%)",
+            f"  - Empirical Fire Rate by Tier: Low = {s1['P(fire | Low) (%)']}% -> Medium = {s1['P(fire | Med) (%)']}% -> High = {s1['P(fire | High) (%)']}% (Base Rate = {s1['Base Fire Rate (%)']}%)",
+            f"  - Risk Stratification: High/Low Ratio = {s1['High/Low Rate Ratio (x)']}x | Monotonic = {s1['Monotonic (Low<=Med<=High)']} | Lift(High) = {s1['Lift High (x)']}x | Lift(Med+High) = {s1['Lift Med+High (x)']}x",
+            f"  - Threshold-Free Metrics: ROC-AUC = {s1['ROC-AUC']} | PR-AUC = {s1['PR-AUC']} | Brier Score = {s1['Brier Score']}",
+            f"  - Low-Tier Safety: {s1['Low Safe Rate (%)']}% fire-free | Recall(Med+High) = {s1['Recall Med+High (%)']}% (Missed in Low = {s1['Missed in Low (%)']}%)",
             f"",
             f"[{model_name} | Radius R = {r_km} km | 7-Day Window ({day} to {end_7d})]:",
-            f"  - Active fire grid scenes: {s7['Active Fire Scenes']}",
-            f"  - Marked High (separately): {s7['Marked High (count)']}/{s7['Active Fire Scenes']} ({s7['Marked High (%)']}%) -> All High? {s7['All in Radius High?']}",
-            f"  - Marked Medium (separately): {s7['Marked Medium (count)']}/{s7['Active Fire Scenes']} ({s7['Marked Medium (%)']}%) -> All Medium? {s7['All in Radius Medium?']}",
-            f"  - Marked Medium+High (combined): {s7['Marked Med+High (count)']}/{s7['Active Fire Scenes']} ({s7['Marked Med+High (%)']}%) -> All Med+High? {s7['All in Radius Med+High?']}",
-            f"  - Missed (Low): {s7['Missed / Low (count)']}/{s7['Active Fire Scenes']} ({s7['Missed / Low (%)']}%)",
-            f"",
-            f"[Local Coordinate Check around ({float(focal_lat):.4f}, {float(focal_lon):.4f}) within {float(local_radius_km):.0f} km | {model_name}]:",
-            f"  - Grid scenes inside radius: {loc_prim['Scenes in Radius']} (All High? {loc_prim['All High?']} [{loc_prim['High (count)']}/{loc_prim['Scenes in Radius']}], All Medium? {loc_prim['All Medium?']} [{loc_prim['Medium (count)']}/{loc_prim['Scenes in Radius']}], All Med+High? {loc_prim['All Med+High?']} [{loc_prim['Med+High (count)']}/{loc_prim['Scenes in Radius']}])",
+            f"  - Empirical Fire Rate by Tier: Low = {s7['P(fire | Low) (%)']}% -> Medium = {s7['P(fire | Med) (%)']}% -> High = {s7['P(fire | High) (%)']}% (Base Rate = {s7['Base Fire Rate (%)']}%)",
+            f"  - Risk Stratification: High/Low Ratio = {s7['High/Low Rate Ratio (x)']}x | Monotonic = {s7['Monotonic (Low<=Med<=High)']} | Lift(High) = {s7['Lift High (x)']}x | Lift(Med+High) = {s7['Lift Med+High (x)']}x",
+            f"  - Threshold-Free Metrics: ROC-AUC = {s7['ROC-AUC']} | PR-AUC = {s7['PR-AUC']} | Brier Score = {s7['Brier Score']}",
+            f"  - Low-Tier Safety: {s7['Low Safe Rate (%)']}% fire-free | Recall(Med+High) = {s7['Recall Med+High (%)']}% (Missed in Low = {s7['Missed in Low (%)']}%)",
         ]
 
         progress(1.0, desc="Done")
-        return str(gt_map_path), df_models_gt, df_radii_gt, df_local_gt, "\n".join(status_lines)
+        return str(gt_map_path), df_reliability_gt, df_models_gt, df_radii_gt, df_local_gt, "\n".join(status_lines)
     except Exception as exc:
         import traceback
         traceback.print_exc()
-        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), f"Error in post-hoc evaluation: {type(exc).__name__}: {exc}"
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), f"Error in post-hoc evaluation: {type(exc).__name__}: {exc}"
+
+
+def run_batch_post_hoc_evaluation(
+    dates_csv_str: str,
+    radius_km: int,
+    progress=gr.Progress(track_tqdm=False),
+):
+    try:
+        raw_parts = [p.strip()[:10] for p in str(dates_csv_str or "").replace("\n", ",").split(",") if p.strip()]
+        days: List[Any] = []
+        for p in raw_parts:
+            try:
+                d = datetime.strptime(p, "%Y-%m-%d").date()
+                if d not in days:
+                    days.append(d)
+            except Exception:
+                pass
+        if not days:
+            return pd.DataFrame(), pd.DataFrame(), "No valid YYYY-MM-DD dates provided."
+
+        r_km = int(radius_km)
+        reg, store = _get_registry_and_store()
+        pts_path = _find_points_csv()
+        pts, meta_df = load_points(pts_path)
+        avail_models = reg.available_models(include_2d=False)
+
+        per_date_rows = []
+        for idx, day in enumerate(days):
+            frac_base = idx / len(days)
+            span = 1.0 / len(days)
+            progress(frac_base + 0.05 * span, desc=f"[Batch {idx + 1}/{len(days)}] Features for {day} (strictly up to {day} - 1d)...")
+
+            cache_key = f"{day}_{len(pts)}"
+            if cache_key not in _GRID_CACHE:
+                grid_data = build_grid_features(
+                    pts=pts,
+                    day=day,
+                    meta_df=meta_df,
+                    collect_2d_limit=0,
+                    collect_2d_strategy="top_risk",
+                    store=store,
+                    reg=reg,
+                    progress_cb=None,
+                )
+                _GRID_CACHE[cache_key] = grid_data
+            else:
+                grid_data = _GRID_CACHE[cache_key]
+
+            progress(frac_base + 0.55 * span, desc=f"[Batch {idx + 1}/{len(days)}] Fetching ground-truth FIRMS for {day} (1d & 7d)...")
+            firms_gt = fetch_post_hoc_firms(day, progress_cb=None)
+            c1 = compute_actual_counts_per_point(pts, firms_gt["fire_1d_df"], radii=(r_km,))[r_km]
+            c7 = compute_actual_counts_per_point(pts, firms_gt["fire_7d_df"], radii=(r_km,))[r_km]
+
+            for m in avail_models:
+                try:
+                    out = gpu_predict(
+                        reg=reg,
+                        model_name=m,
+                        tab_1d=grid_data["TAB_1D"],
+                        hist_tab=grid_data["HIST_TAB"],
+                        clim_feats=grid_data["CLIM_FEATS"],
+                        seq=grid_data["SEQ"],
+                        static_1d=grid_data["STATIC_1D"],
+                        pts_ll=pts[["lat", "lon"]].values,
+                        ft_2d=grid_data["FT_2D"],
+                        emb32_2d=grid_data["EMB32_2D"],
+                        mask=grid_data["has_2d_mask"],
+                    )
+                    r1 = evaluate_levels_against_actual(out["levels"], out["p"], c1, m, "1d", r_km)
+                    r1["Date"] = str(day)
+                    per_date_rows.append(r1)
+
+                    r7 = evaluate_levels_against_actual(out["levels"], out["p"], c7, m, "7d", r_km)
+                    r7["Date"] = str(day)
+                    per_date_rows.append(r7)
+                except Exception:
+                    pass
+
+        if not per_date_rows:
+            return pd.DataFrame(), pd.DataFrame(), "No models/dates could be evaluated."
+
+        df_per_date = pd.DataFrame(per_date_rows)
+        num_cols = [
+            "Base Fire Rate (%)",
+            "P(fire | Low) (%)",
+            "P(fire | Med) (%)",
+            "P(fire | High) (%)",
+            "High/Low Rate Ratio (x)",
+            "Lift High (x)",
+            "Lift Med+High (x)",
+            "Recall Med+High (%)",
+            "Recall High (%)",
+            "Missed in Low (%)",
+            "Low Safe Rate (%)",
+            "ROC-AUC",
+            "PR-AUC",
+            "Brier Score",
+        ]
+        agg_rows = []
+        for (m, win), grp in df_per_date.groupby(["Model", "Window"], sort=False):
+            row: Dict[str, Any] = {
+                "Model": m,
+                "Window": win,
+                "Dates Evaluated": len(grp),
+                "Radius (km)": r_km,
+            }
+            for col in num_cols:
+                if col in grp.columns:
+                    val = grp[col].dropna()
+                    row[f"Mean {col}"] = round(float(val.mean()), 4 if "AUC" in col or "Brier" in col else 2) if len(val) else np.nan
+            mono_rate = 100.0 * float((grp["Monotonic (Low<=Med<=High)"] == "Yes").mean())
+            row["Monotonic Dates (%)"] = round(mono_rate, 1)
+            agg_rows.append(row)
+
+        df_agg = pd.DataFrame(agg_rows).sort_values(by=["Window", "Mean ROC-AUC"], ascending=[True, False]).reset_index(drop=True)
+        cols_order = ["Date"] + [c for c in df_per_date.columns if c != "Date"]
+        df_per_date = df_per_date[cols_order]
+
+        progress(1.0, desc="Batch evaluation complete")
+        summary_msg = (
+            f"Completed multi-date stochastic evaluation across {len(days)} dates ({', '.join(str(d) for d in days)}) at R = {r_km} km.\n"
+            f"Evaluated {len(avail_models)} models ({len(df_per_date)} model-date-window runs)."
+        )
+        return df_agg, df_per_date, summary_msg
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return pd.DataFrame(), pd.DataFrame(), f"Error in batch evaluation: {type(exc).__name__}: {exc}"
 
 
 def refresh_mini_dataset_view():
@@ -813,13 +941,13 @@ def build_app() -> gr.Blocks:
                 gr.Markdown(
                     "Independent post-hoc evaluation module (`post_hoc_evaluation.py`). "
                     "Predictions are computed strictly using data up to `Target Date - 1 day` (zero data leakage). "
-                    "After predictions are locked in, actual NASA FIRMS VIIRS detections are fetched for the **Target Day (1d)** "
-                    "and the **7-Day Forward Window (Target Day to +6d)** to verify whether all fire-affected scenes within radius R "
-                    "are marked as **Medium** and **High** (separately and combined)."
+                    "Because wildfire ignition is a stochastic process, verification measures **empirical fire frequency by risk tier** "
+                    "(`P(fire | Low) < P(fire | Medium) < P(fire | High)`), **Lift vs Baseline**, **ROC-AUC**, **PR-AUC**, **Brier Score**, "
+                    "and **Low-tier safety rate** across the Target Day (1d) and 7-Day Forward Window (7d)."
                 )
                 with gr.Row():
                     gt_date_in = gr.Textbox(value="2025-08-12", label="Target Date (YYYY-MM-DD)", scale=1)
-                    gt_model_in = gr.Dropdown(choices=choices, value=default_a, label="Primary Model for Map & Multi-Radius Breakdown", scale=2)
+                    gt_model_in = gr.Dropdown(choices=choices, value=default_a, label="Primary Model for Map & Tier Reliability", scale=2)
                     gt_radius_in = gr.Radio(choices=[5, 10, 25, 50], value=50, label="Fire Verification Radius R (km)", scale=1)
 
                 with gr.Row():
@@ -827,25 +955,50 @@ def build_app() -> gr.Blocks:
                     gt_lon_in = gr.Number(value=-4.65, label="Local Check Longitude")
                     gt_loc_rad_in = gr.Slider(minimum=5, maximum=150, step=5, value=50, label="Local Coordinate Check Radius (km)")
 
-                run_gt_btn = gr.Button("Fetch Actual Detections (1d & 7d) and Verify Predictions", variant="primary")
-                gt_status_out = gr.Textbox(label="Ground-Truth Verification Summary (Medium & High Coverage)", lines=14, interactive=False)
+                run_gt_btn = gr.Button("Fetch Actual Detections (1d & 7d) and Compute Reliability & Lift", variant="primary")
+                gt_status_out = gr.Textbox(label="Probabilistic Calibration & Risk Stratification Summary", lines=13, interactive=False)
 
-                gr.Markdown("### Predicted Risk vs Actual Fire Detections (Target Day & 7-Day Window)")
-                gt_map_out = gr.Image(label="Ground-Truth Comparison Map (Predicted vs 1d Actual vs 7d Actual)", type="filepath")
+                gr.Markdown("### Predicted Risk Field vs Actual Fire Detections (Target Day & 7-Day Window)")
+                gt_map_out = gr.Image(label="Ground-Truth Comparison Map (Predicted Field vs 1d & 7d Empirical Rates)", type="filepath")
 
-                gr.Markdown("### Coverage of Active Fire Scenes by Risk Level (Medium and High Separately) Across All Models")
-                gt_models_table_out = gr.Dataframe(label="All Models: Ground-Truth Coverage on Target Day (1d) and 7-Day Window (7d)")
+                gr.Markdown("### Tier Reliability & Lift Table for Selected Primary Model (Low / Medium / High / Med+High)")
+                gt_rel_table_out = gr.Dataframe(label="Empirical Fire Frequency P(fire | Tier), Lift vs Baseline, and Share of Total Fires")
+
+                gr.Markdown("### All Models: Calibration, Monotonicity, Lift, ROC-AUC, PR-AUC, and Brier Score")
+                gt_models_table_out = gr.Dataframe(label="All Models Probabilistic Verification (1d and 7d)")
 
                 gr.Markdown("### Multi-Radius Breakdown (5 km, 10 km, 25 km, 50 km) for Selected Primary Model")
                 gt_radii_table_out = gr.Dataframe(label="Primary Model Breakdown Across All Radii")
 
-                gr.Markdown("### Local Radius Check Around Selected Coordinate (Are All Scenes in Radius Marked Medium / High?)")
+                gr.Markdown("### Local Radius Risk Distribution & Actual Fire Rate Around Selected Coordinate")
                 gt_local_table_out = gr.Dataframe(label="Local Coordinate Radius Check Across Models")
+
+                with gr.Accordion("Multi-Date Batch Evaluation (Average Reliability, Lift, ROC-AUC, PR-AUC, Brier Across Dates)", open=False):
+                    gr.Markdown(
+                        "Evaluate all 1D/sequence models across multiple dates (e.g. different seasons or fire episodes) "
+                        "and compute mean empirical fire rates per tier, mean Lift, ROC-AUC, PR-AUC, and Brier Score."
+                    )
+                    with gr.Row():
+                        batch_dates_in = gr.Textbox(
+                            value="2025-07-15, 2025-08-05, 2025-08-12, 2025-08-20",
+                            label="Comma-separated Target Dates (YYYY-MM-DD)",
+                            scale=3,
+                        )
+                        batch_rad_in = gr.Radio(choices=[5, 10, 25, 50], value=50, label="Batch Verification Radius R (km)", scale=1)
+                    run_batch_gt_btn = gr.Button("Run Multi-Date Batch Evaluation", variant="secondary")
+                    batch_gt_status_out = gr.Textbox(label="Batch Evaluation Status", interactive=False)
+                    batch_agg_table_out = gr.Dataframe(label="Multi-Date Mean Metrics per Model (Sorted by Mean ROC-AUC)")
+                    batch_daily_table_out = gr.Dataframe(label="Per-Date Detailed Breakdown")
 
                 run_gt_btn.click(
                     fn=run_post_hoc_ground_truth,
                     inputs=[gt_date_in, gt_model_in, gt_radius_in, gt_lat_in, gt_lon_in, gt_loc_rad_in],
-                    outputs=[gt_map_out, gt_models_table_out, gt_radii_table_out, gt_local_table_out, gt_status_out],
+                    outputs=[gt_map_out, gt_rel_table_out, gt_models_table_out, gt_radii_table_out, gt_local_table_out, gt_status_out],
+                )
+                run_batch_gt_btn.click(
+                    fn=run_batch_post_hoc_evaluation,
+                    inputs=[batch_dates_in, batch_rad_in],
+                    outputs=[batch_agg_table_out, batch_daily_table_out, batch_gt_status_out],
                 )
 
             with gr.TabItem("4. Mini-Dataset and Export"):

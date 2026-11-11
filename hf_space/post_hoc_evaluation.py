@@ -5,11 +5,14 @@ live data collection for inference (`live.py`, `make_map.py`), and model predict
 (`model_registry.py`). It is only invoked AFTER predictions have been generated
 using strictly past data (up to target_day - 1), preventing any data leakage.
 
-It fetches actual NASA FIRMS VIIRS fire detections for:
-  1. The exact target day: [target_day, target_day] (1 day)
-  2. The 7-day forward window: [target_day, target_day + 6 days] (7 days)
-and evaluates how well the predicted risk levels (Medium and High separately,
-as well as combined Medium+High) cover all grid locations within radius R of actual fires.
+Because wildfire ignition is a stochastic process, evaluation focuses on probabilistic
+calibration and risk stratification:
+  - Empirical fire rate per predicted risk tier: P(fire | Low), P(fire | Medium), P(fire | High)
+  - Monotonicity and Risk Ratio: P(fire | High) / P(fire | Low)
+  - Lift over baseline prevalence: P(fire | tier) / P(fire overall)
+  - Threshold-independent probabilistic metrics: Brier Score, ROC-AUC, PR-AUC
+  - Low-tier safety rate: 1 - P(fire | Low) and share of fires missed in Low
+  - Multi-date batch evaluation for seasonal/aggregate reliability
 """
 from __future__ import annotations
 
@@ -23,6 +26,56 @@ from scipy.spatial import cKDTree
 
 from config_and_features import IBERIA_BBOX, RADII, R_EARTH, dist_km, to_xyz
 from data_collectors import fetch_firms_days
+
+
+def _roc_auc_np(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Computes exact ROC-AUC via rank statistics (Mann-Whitney U) in pure NumPy."""
+    y = np.asarray(y_true, dtype=bool)
+    s = np.asarray(y_score, dtype=np.float64)
+    n_pos = int(y.sum())
+    n_neg = int((~y).sum())
+    if n_pos == 0 or n_neg == 0:
+        return np.nan
+    order = np.argsort(s, kind="mergesort")
+    s_sorted = s[order]
+    ranks = np.empty(len(s), dtype=np.float64)
+    i = 0
+    n = len(s)
+    while i < n:
+        j = i
+        while j + 1 < n and s_sorted[j + 1] == s_sorted[i]:
+            j += 1
+        avg_rank = 0.5 * (i + j) + 1.0
+        ranks[order[i : j + 1]] = avg_rank
+        i = j + 1
+    sum_pos_ranks = float(ranks[y].sum())
+    auc = (sum_pos_ranks - n_pos * (n_pos + 1) / 2.0) / (n_pos * n_neg)
+    return float(np.clip(auc, 0.0, 1.0))
+
+
+def _pr_auc_np(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """Computes Average Precision (PR-AUC) in pure NumPy."""
+    y = np.asarray(y_true, dtype=bool)
+    s = np.asarray(y_score, dtype=np.float64)
+    n_pos = int(y.sum())
+    if n_pos == 0:
+        return np.nan
+    order = np.argsort(-s, kind="mergesort")
+    y_sorted = y[order]
+    tp = np.cumsum(y_sorted).astype(np.float64)
+    k = np.arange(1, len(y) + 1, dtype=np.float64)
+    precision_at_k = tp / k
+    ap = float(precision_at_k[y_sorted].sum() / n_pos)
+    return float(np.clip(ap, 0.0, 1.0))
+
+
+def _brier_score_np(y_true: np.ndarray, y_prob: np.ndarray) -> float:
+    """Computes Brier Score mean((p - y)^2)."""
+    y = np.asarray(y_true, dtype=np.float64)
+    p = np.clip(np.asarray(y_prob, dtype=np.float64), 0.0, 1.0)
+    if len(y) == 0:
+        return np.nan
+    return float(np.mean((p - y) ** 2))
 
 
 def fetch_post_hoc_firms(
@@ -93,6 +146,63 @@ def compute_actual_counts_per_point(
     return counts
 
 
+def evaluate_tier_reliability_table(
+    levels: np.ndarray,
+    probs: np.ndarray,
+    actual_counts: np.ndarray,
+    model_name: str,
+    window_label: str,
+    radius_km: int,
+) -> pd.DataFrame:
+    """Builds a tier-by-tier reliability & lift table for a single model and time window:
+    Rows: Low, Medium, High, Medium+High (Combined), Total (Base Rate).
+    """
+    levels_arr = np.asarray(levels, dtype=str)
+    probs_arr = np.asarray(probs, dtype=np.float64)
+    has_fire = np.asarray(actual_counts, dtype=np.int32) > 0
+
+    n_total = len(has_fire)
+    n_fire_total = int(has_fire.sum())
+    base_rate = (n_fire_total / n_total) if n_total > 0 else 0.0
+
+    tiers = [
+        ("Low", levels_arr == "Low"),
+        ("Medium", levels_arr == "Medium"),
+        ("High", levels_arr == "High"),
+        ("Medium + High", (levels_arr == "Medium") | (levels_arr == "High")),
+        ("All Grid (Baseline)", np.ones(n_total, dtype=bool)),
+    ]
+
+    rows = []
+    for tier_name, mask in tiers:
+        n_scenes = int(mask.sum())
+        area_share_pct = round(100.0 * n_scenes / max(n_total, 1), 1)
+        n_f = int((has_fire & mask).sum())
+        fire_rate = (n_f / n_scenes) if n_scenes > 0 else np.nan
+        fire_rate_pct = round(100.0 * fire_rate, 1) if np.isfinite(fire_rate) else np.nan
+        mean_pred_p = round(100.0 * float(probs_arr[mask].mean()), 1) if n_scenes > 0 else np.nan
+        capture_recall_pct = round(100.0 * n_f / n_fire_total, 1) if n_fire_total > 0 else np.nan
+        lift = round(fire_rate / base_rate, 2) if (np.isfinite(fire_rate) and base_rate > 1e-9) else np.nan
+
+        rows.append(
+            {
+                "Model": model_name,
+                "Window": window_label,
+                "Radius (km)": int(radius_km),
+                "Risk Tier": tier_name,
+                "Grid Scenes": n_scenes,
+                "Map Share (%)": area_share_pct,
+                "Scenes with Fire": n_f,
+                "Actual Fire Rate P(fire|Tier) (%)": fire_rate_pct,
+                "Mean Predicted P (%)": mean_pred_p,
+                "Lift vs Baseline (x)": lift,
+                "Share of Total Fires Captured (%)": capture_recall_pct,
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
 def evaluate_levels_against_actual(
     levels: np.ndarray,
     probs: np.ndarray,
@@ -101,7 +211,7 @@ def evaluate_levels_against_actual(
     window_label: str,
     radius_km: int,
 ) -> Dict[str, Any]:
-    """Evaluates how grid points with actual fires (actual_counts > 0) are classified into High, Medium, and Low."""
+    """Computes probabilistic calibration, reliability by tier, lift, Brier score, ROC-AUC, and PR-AUC."""
     levels_arr = np.asarray(levels, dtype=str)
     probs_arr = np.asarray(probs, dtype=np.float64)
     act_arr = np.asarray(actual_counts, dtype=np.int32)
@@ -109,61 +219,66 @@ def evaluate_levels_against_actual(
     has_fire = act_arr > 0
     n_total = len(act_arr)
     n_fire = int(has_fire.sum())
+    base_rate = (n_fire / n_total) if n_total > 0 else 0.0
 
     is_high = levels_arr == "High"
     is_med = levels_arr == "Medium"
     is_low = levels_arr == "Low"
+    is_mh = is_high | is_med
+
+    n_high = int(is_high.sum())
+    n_med = int(is_med.sum())
+    n_low = int(is_low.sum())
+    n_mh = int(is_mh.sum())
 
     fire_high = int((has_fire & is_high).sum())
     fire_med = int((has_fire & is_med).sum())
     fire_low = int((has_fire & is_low).sum())
-    fire_med_or_high = fire_high + fire_med
+    fire_mh = fire_high + fire_med
 
-    if n_fire > 0:
-        pct_high = round(100.0 * fire_high / n_fire, 1)
-        pct_med = round(100.0 * fire_med / n_fire, 1)
-        pct_med_high = round(100.0 * fire_med_or_high / n_fire, 1)
-        pct_low_missed = round(100.0 * fire_low / n_fire, 1)
-        all_high = bool(fire_high == n_fire)
-        all_med = bool(fire_med == n_fire)
-        all_med_or_high = bool(fire_med_or_high == n_fire)
-    else:
-        pct_high = np.nan
-        pct_med = np.nan
-        pct_med_high = np.nan
-        pct_low_missed = np.nan
-        all_high = False
-        all_med = False
-        all_med_or_high = False
+    rate_low = (fire_low / n_low) if n_low > 0 else np.nan
+    rate_med = (fire_med / n_med) if n_med > 0 else np.nan
+    rate_high = (fire_high / n_high) if n_high > 0 else np.nan
+    rate_mh = (fire_mh / n_mh) if n_mh > 0 else np.nan
 
-    n_pred_high = int(is_high.sum())
-    n_pred_med = int(is_med.sum())
-    prec_high = round(100.0 * fire_high / n_pred_high, 1) if n_pred_high > 0 else np.nan
-    prec_med = round(100.0 * fire_med / n_pred_med, 1) if n_pred_med > 0 else np.nan
+    lift_high = round(rate_high / base_rate, 2) if (np.isfinite(rate_high) and base_rate > 1e-9) else np.nan
+    lift_mh = round(rate_mh / base_rate, 2) if (np.isfinite(rate_mh) and base_rate > 1e-9) else np.nan
+    ratio_high_vs_low = round(rate_high / max(rate_low, 1e-4), 1) if (np.isfinite(rate_high) and np.isfinite(rate_low) and rate_low > 0) else np.nan
 
-    mean_p_fire = round(float(probs_arr[has_fire].mean()), 4) if n_fire > 0 else np.nan
-    mean_p_nofire = round(float(probs_arr[~has_fire].mean()), 4) if (n_total - n_fire) > 0 else np.nan
+    monotonic = bool(
+        (not np.isfinite(rate_low) or not np.isfinite(rate_med) or rate_low <= rate_med + 1e-6)
+        and (not np.isfinite(rate_med) or not np.isfinite(rate_high) or rate_med <= rate_high + 1e-6)
+    )
+
+    recall_high = round(100.0 * fire_high / n_fire, 1) if n_fire > 0 else np.nan
+    recall_med = round(100.0 * fire_med / n_fire, 1) if n_fire > 0 else np.nan
+    recall_mh = round(100.0 * fire_mh / n_fire, 1) if n_fire > 0 else np.nan
+    missed_low_share = round(100.0 * fire_low / n_fire, 1) if n_fire > 0 else np.nan
+
+    brier = _brier_score_np(has_fire, probs_arr)
+    roc_auc = _roc_auc_np(has_fire, probs_arr)
+    pr_auc = _pr_auc_np(has_fire, probs_arr)
 
     return {
         "Model": model_name,
         "Window": window_label,
         "Radius (km)": int(radius_km),
-        "Active Fire Scenes": n_fire,
-        "Marked High (count)": fire_high,
-        "Marked High (%)": pct_high,
-        "All in Radius High?": "Yes" if all_high else ("No fires" if n_fire == 0 else "No"),
-        "Marked Medium (count)": fire_med,
-        "Marked Medium (%)": pct_med,
-        "All in Radius Medium?": "Yes" if all_med else ("No fires" if n_fire == 0 else "No"),
-        "Marked Med+High (count)": fire_med_or_high,
-        "Marked Med+High (%)": pct_med_high,
-        "All in Radius Med+High?": "Yes" if all_med_or_high else ("No fires" if n_fire == 0 else "No"),
-        "Missed / Low (count)": fire_low,
-        "Missed / Low (%)": pct_low_missed,
-        "Precision High (%)": prec_high,
-        "Precision Medium (%)": prec_med,
-        "Mean P (Fire Scenes)": mean_p_fire,
-        "Mean P (No-Fire Scenes)": mean_p_nofire,
+        "Base Fire Rate (%)": round(100.0 * base_rate, 1),
+        "P(fire | Low) (%)": round(100.0 * rate_low, 1) if np.isfinite(rate_low) else np.nan,
+        "P(fire | Med) (%)": round(100.0 * rate_med, 1) if np.isfinite(rate_med) else np.nan,
+        "P(fire | High) (%)": round(100.0 * rate_high, 1) if np.isfinite(rate_high) else np.nan,
+        "High/Low Rate Ratio (x)": ratio_high_vs_low,
+        "Monotonic (Low<=Med<=High)": "Yes" if monotonic else "No",
+        "Lift High (x)": lift_high,
+        "Lift Med+High (x)": lift_mh,
+        "Recall Med+High (%)": recall_mh,
+        "Recall High (%)": recall_high,
+        "Recall Med (%)": recall_med,
+        "Missed in Low (%)": missed_low_share,
+        "Low Safe Rate (%)": round(100.0 * (1.0 - rate_low), 1) if np.isfinite(rate_low) else np.nan,
+        "ROC-AUC": round(roc_auc, 4) if np.isfinite(roc_auc) else np.nan,
+        "PR-AUC": round(pr_auc, 4) if np.isfinite(pr_auc) else np.nan,
+        "Brier Score": round(brier, 4) if np.isfinite(brier) else np.nan,
     }
 
 
@@ -178,9 +293,7 @@ def evaluate_local_radius_around_point(
     actual_7d: np.ndarray,
     model_name: str,
 ) -> Dict[str, Any]:
-    """Checks all grid scenes located within `search_radius_km` of `(center_lat, center_lon)`
-    and reports whether all of them are marked Medium and High (separately), plus their actual fire status.
-    """
+    """Summarizes predicted risk distribution and empirical fire rates within `search_radius_km` of `(center_lat, center_lon)`."""
     pts_xyz = to_xyz(pts["lat"].values, pts["lon"].values)
     c_xyz = to_xyz([center_lat], [center_lon])[0]
     dk = dist_km(pts_xyz, c_xyz)
@@ -192,21 +305,22 @@ def evaluate_local_radius_around_point(
             "Model": model_name,
             "Radius (km)": search_radius_km,
             "Scenes in Radius": 0,
-            "High (count)": 0,
-            "High (%)": np.nan,
-            "All High?": "No scenes",
-            "Medium (count)": 0,
-            "Medium (%)": np.nan,
-            "All Medium?": "No scenes",
-            "Med+High (count)": 0,
-            "Med+High (%)": np.nan,
-            "All Med+High?": "No scenes",
-            "Low (count)": 0,
+            "Mean P (%)": np.nan,
+            "Low Scenes": 0,
+            "Med Scenes": 0,
+            "High Scenes": 0,
+            "Med+High Share (%)": np.nan,
             "Actual Fire 1d Scenes": 0,
+            "Actual Fire 1d Rate (%)": np.nan,
             "Actual Fire 7d Scenes": 0,
+            "Actual Fire 7d Rate (%)": np.nan,
         }
 
     lev_sub = np.asarray(levels, dtype=str)[in_rad]
+    p_sub = np.asarray(probs, dtype=np.float64)[in_rad]
+    f1_sub = np.asarray(actual_1d, dtype=np.int32)[in_rad] > 0
+    f7_sub = np.asarray(actual_7d, dtype=np.int32)[in_rad] > 0
+
     n_high = int((lev_sub == "High").sum())
     n_med = int((lev_sub == "Medium").sum())
     n_low = int((lev_sub == "Low").sum())
@@ -216,18 +330,15 @@ def evaluate_local_radius_around_point(
         "Model": model_name,
         "Radius (km)": search_radius_km,
         "Scenes in Radius": n_in,
-        "High (count)": n_high,
-        "High (%)": round(100.0 * n_high / n_in, 1),
-        "All High?": "Yes" if n_high == n_in else "No",
-        "Medium (count)": n_med,
-        "Medium (%)": round(100.0 * n_med / n_in, 1),
-        "All Medium?": "Yes" if n_med == n_in else "No",
-        "Med+High (count)": n_mh,
-        "Med+High (%)": round(100.0 * n_mh / n_in, 1),
-        "All Med+High?": "Yes" if n_mh == n_in else "No",
-        "Low (count)": n_low,
-        "Actual Fire 1d Scenes": int((actual_1d[in_rad] > 0).sum()),
-        "Actual Fire 7d Scenes": int((actual_7d[in_rad] > 0).sum()),
+        "Mean P (%)": round(100.0 * float(p_sub.mean()), 1),
+        "Low Scenes": n_low,
+        "Med Scenes": n_med,
+        "High Scenes": n_high,
+        "Med+High Share (%)": round(100.0 * n_mh / n_in, 1),
+        "Actual Fire 1d Scenes": int(f1_sub.sum()),
+        "Actual Fire 1d Rate (%)": round(100.0 * float(f1_sub.mean()), 1),
+        "Actual Fire 7d Scenes": int(f7_sub.sum()),
+        "Actual Fire 7d Rate (%)": round(100.0 * float(f7_sub.mean()), 1),
     }
 
 
@@ -245,17 +356,18 @@ def draw_ground_truth_comparison_map(
     radius_km: int,
     out_path: str | Path,
 ) -> Path:
-    """Renders a 3-panel post-hoc comparison map:
+    """Renders a 3-panel post-hoc comparison map + reliability subtitle:
       Panel 1: Predicted Risk Map (Low / Medium / High) + raw VIIRS detections on Target Day
-      Panel 2: Target Day (1d) Ground-Truth Verification (High hit, Medium hit, Low missed, No fire)
-      Panel 3: 7-Day Forward Window (7d) Ground-Truth Verification (High hit, Medium hit, Low missed, No fire)
+      Panel 2: Target Day (1d) Ground-Truth Verification with empirical fire rate per tier
+      Panel 3: 7-Day Forward Window (7d) Ground-Truth Verification with empirical fire rate per tier
     """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
     levels_arr = np.asarray(levels, dtype=str)
-    fig, ax = plt.subplots(1, 3, figsize=(21, 6.5), dpi=150)
+    probs_arr = np.asarray(probs, dtype=np.float64)
+    fig, ax = plt.subplots(1, 3, figsize=(21, 6.6), dpi=150)
 
     level_colors = {"Low": "#fee08b", "Medium": "#f46d43", "High": "#a50026"}
     for lv_name in ("Low", "Medium", "High"):
@@ -281,8 +393,8 @@ def draw_ground_truth_comparison_map(
             zorder=5,
         )
     ax[0].set_title(
-        f"[{model_name}] Predicted Risk on {target_day}\n"
-        f"Thresholds: {thresholds[0]:.2f} / {thresholds[1]:.2f} | Mean P={np.mean(probs):.3f}"
+        f"[{model_name}] Predicted Risk Field on {target_day}\n"
+        f"Thresholds: {thresholds[0]:.2f} / {thresholds[1]:.2f} | Mean P={probs_arr.mean():.3f}"
     )
     ax[0].set_xlabel("Longitude")
     ax[0].set_ylabel("Latitude")
@@ -307,10 +419,20 @@ def draw_ground_truth_comparison_map(
     for panel_idx, title_tag, act_cnt, f_df in windows:
         has_f = act_cnt > 0
         no_f = ~has_f
-        hit_high = has_f & (levels_arr == "High")
-        hit_med = has_f & (levels_arr == "Medium")
-        miss_low = has_f & (levels_arr == "Low")
+        is_h = levels_arr == "High"
+        is_m = levels_arr == "Medium"
+        is_l = levels_arr == "Low"
+
+        hit_high = has_f & is_h
+        hit_med = has_f & is_m
+        miss_low = has_f & is_l
         n_f = int(has_f.sum())
+
+        r_l = 100.0 * int(miss_low.sum()) / max(int(is_l.sum()), 1)
+        r_m = 100.0 * int(hit_med.sum()) / max(int(is_m.sum()), 1)
+        r_h = 100.0 * int(hit_high.sum()) / max(int(is_h.sum()), 1)
+        auc_val = _roc_auc_np(has_f, probs_arr)
+        auc_str = f"{auc_val:.3f}" if np.isfinite(auc_val) else "N/A"
 
         ax[panel_idx].scatter(
             pts["lon"][no_f],
@@ -322,50 +444,47 @@ def draw_ground_truth_comparison_map(
             alpha=0.7,
         )
         if hit_med.any():
-            pct_m = 100.0 * int(hit_med.sum()) / max(n_f, 1)
             ax[panel_idx].scatter(
                 pts["lon"][hit_med],
                 pts["lat"][hit_med],
                 c="#f46d43",
                 s=28,
-                label=f"Fire + Medium: {int(hit_med.sum())}/{n_f} ({pct_m:.1f}%)",
+                label=f"Fire in Medium: {int(hit_med.sum())}/{int(is_m.sum())} (P(fire|Med)={r_m:.1f}%)",
                 edgecolors="#222222",
                 linewidths=0.4,
                 zorder=3,
             )
         else:
-            ax[panel_idx].scatter([], [], c="#f46d43", s=28, label=f"Fire + Medium: 0/{n_f} (0.0%)")
+            ax[panel_idx].scatter([], [], c="#f46d43", s=28, label=f"Fire in Medium: 0/{int(is_m.sum())} (0.0%)")
 
         if hit_high.any():
-            pct_h = 100.0 * int(hit_high.sum()) / max(n_f, 1)
             ax[panel_idx].scatter(
                 pts["lon"][hit_high],
                 pts["lat"][hit_high],
                 c="#a50026",
                 s=32,
-                label=f"Fire + High: {int(hit_high.sum())}/{n_f} ({pct_h:.1f}%)",
+                label=f"Fire in High: {int(hit_high.sum())}/{int(is_h.sum())} (P(fire|High)={r_h:.1f}%)",
                 edgecolors="#111111",
                 linewidths=0.5,
                 zorder=4,
             )
         else:
-            ax[panel_idx].scatter([], [], c="#a50026", s=32, label=f"Fire + High: 0/{n_f} (0.0%)")
+            ax[panel_idx].scatter([], [], c="#a50026", s=32, label=f"Fire in High: 0/{int(is_h.sum())} (0.0%)")
 
         if miss_low.any():
-            pct_l = 100.0 * int(miss_low.sum()) / max(n_f, 1)
             ax[panel_idx].scatter(
                 pts["lon"][miss_low],
                 pts["lat"][miss_low],
                 c="#2b83ba",
                 marker="^",
                 s=38,
-                label=f"MISSED (Fire + Low): {int(miss_low.sum())}/{n_f} ({pct_l:.1f}%)",
+                label=f"Fire in Low: {int(miss_low.sum())}/{int(is_l.sum())} (P(fire|Low)={r_l:.1f}%)",
                 edgecolors="black",
                 linewidths=0.6,
                 zorder=5,
             )
         else:
-            ax[panel_idx].scatter([], [], c="#2b83ba", marker="^", s=38, label=f"MISSED (Fire + Low): 0/{n_f} (0.0%)")
+            ax[panel_idx].scatter([], [], c="#2b83ba", marker="^", s=38, label=f"Fire in Low: 0/{int(is_l.sum())} (0.0%)")
 
         if len(f_df) > 0:
             ax[panel_idx].scatter(
@@ -382,8 +501,8 @@ def draw_ground_truth_comparison_map(
 
         pct_mh = 100.0 * int((hit_high | hit_med).sum()) / max(n_f, 1) if n_f > 0 else 0.0
         ax[panel_idx].set_title(
-            f"Ground Truth: {title_tag} (R={radius_km}km)\n"
-            f"Active scenes: {n_f} | Captured by Med+High: {pct_mh:.1f}% (High: {int(hit_high.sum())}, Med: {int(hit_med.sum())})"
+            f"{title_tag} (R={radius_km}km) | ROC-AUC={auc_str} | Recall(Med+High)={pct_mh:.1f}%\n"
+            f"Fire Rate by Tier: Low {r_l:.1f}% -> Med {r_m:.1f}% -> High {r_h:.1f}%"
         )
         ax[panel_idx].set_xlabel("Longitude")
         ax[panel_idx].set_ylabel("Latitude")
