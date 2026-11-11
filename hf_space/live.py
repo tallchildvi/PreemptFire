@@ -78,21 +78,28 @@ def score_single_location(
     p10, p50 = fetch_population_single(lat, lon)
 
     scene_2d: Optional[Dict[str, Any]] = None
+    scene_2d_error: Optional[str] = None
     cached_npz = store.has_scene_npz(lat, lon, day)
     if cached_npz is not None:
         if progress_cb:
             progress_cb(0.45, f"[Step 3/6] Loaded cached 22-channel 2D satellite patch from {cached_npz.name}...")
         scene_2d = store.load_scene_npz(cached_npz)
     elif collect_2d:
-        collector = Scene2DCollector()
-        scene_2d = collector.collect_scene(
-            lat=lat,
-            lon=lon,
-            target_day=day,
-            weather_dict=w,
-            pop_10_50=(p10, p50),
-            progress_cb=progress_cb,
-        )
+        try:
+            collector = Scene2DCollector()
+            scene_2d = collector.collect_scene(
+                lat=lat,
+                lon=lon,
+                target_day=day,
+                weather_dict=w,
+                pop_10_50=(p10, p50),
+                progress_cb=progress_cb,
+            )
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            scene_2d_error = f"{type(e).__name__}: {e}"
+            print(f"  [2D Collector] Failed to collect 2D patch: {scene_2d_error}")
 
     s2_date = scene_2d.get("s2_Source_Date") if scene_2d else None
     raw_1d, tab_1d = one_d_features(w, p10, p50, wd, s2_date=s2_date)
@@ -100,13 +107,13 @@ def score_single_location(
 
     H = int(CONFIG["HISTORY_DAYS"])
     if progress_cb:
-        progress_cb(0.65, f"[Step 4/6] Fetching {H}-day NASA FIRMS fire detections ({day - timedelta(days=H)} to {wd})...")
+        progress_cb(0.68, f"[Step 4/6] Fetching {H}-day NASA FIRMS fire detections ({day - timedelta(days=H)} to {wd})...")
     fire_df, covered = fetch_firms_days(lat, lon, day - timedelta(days=H), wd)
     pts_xyz = to_xyz([lat], [lon])
     HIST_TAB, HC = history_many(pts_xyz, fire_df, covered, day, RADII, H=H)
 
     if progress_cb:
-        progress_cb(0.75, "[Step 5/6] Computing historical DOY fire climatology...")
+        progress_cb(0.78, "[Step 5/6] Computing historical DOY fire climatology...")
     CLIM_FEATS = climatology_many(
         pts_xyz,
         day,
@@ -119,7 +126,7 @@ def score_single_location(
     SEQ, STATIC_1D = build_seq_and_static(HC, TAB_1D, CLIM_FEATS, H=H)
 
     if progress_cb:
-        progress_cb(0.85, "[Step 6/6] Extracting 2D embeddings (SimCLR + FT) and running model inference...")
+        progress_cb(0.88, "[Step 6/6] Extracting 2D embeddings (SimCLR + FT) and running model inference...")
     FT_2D, EMB32_2D, has_2d_mask = reg.compute_2d_embeddings_and_stats([scene_2d])
 
     # Determine which models to run
@@ -177,6 +184,7 @@ def score_single_location(
         "lon": lon,
         "date": str(day),
         "has_2d_scene": bool(has_2d_mask[0]),
+        "scene_2d_error": scene_2d_error,
         "s2_source_date": s2_date,
         "saved_npz_path": saved_npz_path,
         "recent_fires_7d_50km": int(HIST_TAB[0, 2 * 4 + 3]),

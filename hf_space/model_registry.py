@@ -131,6 +131,21 @@ def _build_torch_modules():
         def forward(self, x):
             return self.act(self.conv(x) + self.skip(x))
 
+    class ConvBlock(nn.Module):
+        def __init__(self, c_in: int, c_out: int):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Conv2d(c_in, c_out, 3, padding=1, bias=False),
+                nn.BatchNorm2d(c_out),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(c_out, c_out, 3, padding=1, bias=False),
+                nn.BatchNorm2d(c_out),
+                nn.ReLU(inplace=True),
+            )
+
+        def forward(self, x):
+            return self.net(x)
+
     def make_encoder(base: int = 24, in_ch: int = 33) -> nn.Module:
         return nn.Sequential(
             nn.Conv2d(in_ch, base, 3, 2, 1, bias=False),
@@ -143,7 +158,24 @@ def _build_torch_modules():
             nn.Flatten(),
         )
 
+    def make_encoder_v5(base: int = 24, in_ch: int = 33) -> nn.Module:
+        return nn.Sequential(
+            ConvBlock(in_ch, base),
+            nn.MaxPool2d(2),
+            ConvBlock(base, base * 2),
+            nn.MaxPool2d(2),
+            ConvBlock(base * 2, base * 4),
+            nn.MaxPool2d(2),
+            ConvBlock(base * 4, base * 8),
+            nn.MaxPool2d(2),
+            ConvBlock(base * 8, base * 8),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+        )
+
     class Net(nn.Module):
+        is_v5 = False
+
         def __init__(
             self,
             img: bool = True,
@@ -198,7 +230,48 @@ def _build_torch_modules():
             cnt = self.cnt_head(z) if self.n_cnt else None
             return logit, cnt
 
-    return torch, nn, make_encoder, Net
+    class NetV5(nn.Module):
+        is_v5 = True
+
+        def __init__(
+            self,
+            img: bool = False,
+            seq: bool = True,
+            n_cnt: int = 4,
+            d1: int = 47,
+            t_feat: int = 5,
+            base: int = 24,
+            in_ch: int = 33,
+        ):
+            super().__init__()
+            self.img, self.seq, self.n_cnt = img, seq, n_cnt
+            if img:
+                self.enc = make_encoder_v5(base, in_ch)
+            if seq:
+                self.gru = nn.GRU(t_feat, 48, batch_first=True)
+                self.seq_ln = nn.LayerNorm(48)
+            self.mlp = nn.Sequential(
+                nn.Linear(d1, 64),
+                nn.GELU(),
+                nn.Dropout(0.3),
+                nn.Linear(64, 64),
+                nn.GELU(),
+            )
+            n = 64 + (base * 8 if img else 0) + (48 if seq else 0)
+            self.head = nn.Sequential(nn.Dropout(0.4), nn.Linear(n, 1 + n_cnt))
+            self.log_alpha = nn.Parameter(torch.zeros(n_cnt))
+
+        def forward(self, x2, xseq, xst):
+            z = [self.mlp(xst)]
+            if self.img:
+                z.append(self.enc(x2))
+            if self.seq:
+                _, h = self.gru(xseq)
+                z.append(self.seq_ln(h[-1]))
+            out = self.head(torch.cat(z, 1))
+            return out[:, 0], out[:, 1:]
+
+    return torch, nn, make_encoder, make_encoder_v5, Net, NetV5
 
 
 class ModelRegistry:
@@ -338,17 +411,25 @@ class ModelRegistry:
     def _load_simclr_and_pca(self):
         if self._simclr_cache is not None:
             return self._simclr_cache
-        torch, _, make_encoder, _ = _build_torch_modules()
+        torch, _, make_encoder, make_encoder_v5, _, _ = _build_torch_modules()
         enc_path = self._resolve_model_file("simclr_encoder_weights.pt")
         pca_path = self._resolve_model_file("simclr_pca_32.pkl")
         if enc_path is None or pca_path is None:
             raise FileNotFoundError("Missing `simclr_encoder_weights.pt` or `simclr_pca_32.pkl`.")
 
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        enc = make_encoder(base=24, in_ch=33).to(device)
         state = torch.load(str(enc_path), map_location=device, weights_only=False)
         if isinstance(state, dict) and "state_dict" in state:
             state = state["state_dict"]
+        elif isinstance(state, dict) and "model" in state and isinstance(state["model"], dict):
+            state = {
+                (k[4:] if k.startswith("enc.") else k): v
+                for k, v in state["model"].items()
+                if k.startswith("enc.") or not k.startswith("proj.")
+            }
+
+        is_v5 = isinstance(state, dict) and any(".net." in k for k in state.keys())
+        enc = (make_encoder_v5(base=24, in_ch=33) if is_v5 else make_encoder(base=24, in_ch=33)).to(device)
         enc.load_state_dict(state, strict=False)
         enc.eval()
 
@@ -361,7 +442,7 @@ class ModelRegistry:
     def _load_nn_ts(self):
         if self._nn_ts_cache is not None:
             return self._nn_ts_cache
-        torch, _, _, Net = _build_torch_modules()
+        torch, _, _, _, Net, NetV5 = _build_torch_modules()
         pt_path = self._resolve_model_file("nn_ts_final_model.pt")
         if pt_path is None:
             raise FileNotFoundError("Missing `nn_ts_final_model.pt`.")
@@ -370,16 +451,24 @@ class ModelRegistry:
         if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
             state_dict = ckpt["model_state_dict"]
             meta = ckpt
-        elif isinstance(ckpt, dict) and any(k.startswith("gru.") or k.startswith("cls_head.") for k in ckpt.keys()):
+        elif isinstance(ckpt, dict) and any(
+            k.startswith("gru.") or k.startswith("cls_head.") or k.startswith("mlp.") or k.startswith("head.")
+            for k in ckpt.keys()
+        ):
             state_dict = ckpt
             meta = {}
         else:
             state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, dict) else ckpt.state_dict()
             meta = ckpt if isinstance(ckpt, dict) else {}
 
-        d1 = int(state_dict["tab.0.weight"].shape[1]) if "tab.0.weight" in state_dict else 47
-        t_feat = int(state_dict["gru.weight_ih_l0"].shape[1]) if "gru.weight_ih_l0" in state_dict else 5
-        net = Net(img=False, seq=True, n_cnt=4, d1=d1, t_feat=t_feat).to(device)
+        if "mlp.0.weight" in state_dict:
+            d1 = int(state_dict["mlp.0.weight"].shape[1])
+            t_feat = int(state_dict["gru.weight_ih_l0"].shape[1]) if "gru.weight_ih_l0" in state_dict else 5
+            net = NetV5(img=False, seq=True, n_cnt=4, d1=d1, t_feat=t_feat).to(device)
+        else:
+            d1 = int(state_dict["tab.0.weight"].shape[1]) if "tab.0.weight" in state_dict else 47
+            t_feat = int(state_dict["gru.weight_ih_l0"].shape[1]) if "gru.weight_ih_l0" in state_dict else 5
+            net = Net(img=False, seq=True, n_cnt=4, d1=d1, t_feat=t_feat).to(device)
         net.load_state_dict(state_dict, strict=False)
         net.eval()
         self._nn_ts_cache = (torch, net, meta, device)
@@ -453,8 +542,8 @@ class ModelRegistry:
 
             for k, idx in enumerate(valid_indices):
                 EMB32[idx] = emb32_valid[k].astype(np.float32)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[ModelRegistry] SimCLR embedding note: {e}")
 
         return FT, EMB32, has_2d
 
@@ -509,7 +598,16 @@ class ModelRegistry:
             p = clf.predict_proba(X)[:, 1].astype(np.float32)
             for R in RADII:
                 if R in regs:
-                    mu[R] = np.expm1(np.clip(regs[R].predict(X), 0.0, 12.0)).astype(np.float32)
+                    raw_pred = regs[R].predict(X)
+                    loss_fn = ""
+                    try:
+                        loss_fn = str(regs[R].get_params().get("loss_function", "")).lower()
+                    except Exception:
+                        pass
+                    if "poisson" in loss_fn:
+                        mu[R] = np.clip(raw_pred, 1e-4, 500.0).astype(np.float32)
+                    else:
+                        mu[R] = np.expm1(np.clip(raw_pred, 0.0, 12.0)).astype(np.float32)
 
         elif model_name == "nn_ts":
             torch, net, meta, device = self._load_nn_ts()
@@ -530,7 +628,10 @@ class ModelRegistry:
                 xst_t = torch.from_numpy(st_n).to(device)
                 logit, cnt = net(None, xseq_t, xst_t)
                 p = torch.sigmoid(logit).cpu().numpy().astype(np.float32)
-                cnt_np = np.expm1(np.clip(cnt.cpu().numpy(), 0.0, 12.0)).astype(np.float32)
+                if getattr(net, "is_v5", False):
+                    cnt_np = np.exp(np.clip(cnt.cpu().numpy(), -8.0, 8.0)).astype(np.float32)
+                else:
+                    cnt_np = np.expm1(np.clip(cnt.cpu().numpy(), 0.0, 12.0)).astype(np.float32)
                 for ri, R in enumerate(RADII):
                     mu[R] = cnt_np[:, ri]
 
@@ -544,12 +645,12 @@ class ModelRegistry:
                 for R in RADII:
                     rk = R if R in knn_reg else f"{R}km"
                     if rk in knn_reg:
-                        mu[R] = np.expm1(np.clip(knn_reg[rk].predict(cxy), 0.0, 12.0)).astype(np.float32)
+                        mu[R] = np.clip(knn_reg[rk].predict(cxy), 1e-3, 500.0).astype(np.float32)
             elif isinstance(knn_reg, list):
                 for ri, R in enumerate(RADII):
-                    mu[R] = np.expm1(np.clip(knn_reg[ri].predict(cxy), 0.0, 12.0)).astype(np.float32)
+                    mu[R] = np.clip(knn_reg[ri].predict(cxy), 1e-3, 500.0).astype(np.float32)
             elif hasattr(knn_reg, "predict"):
-                pred_r = np.expm1(np.clip(knn_reg.predict(cxy), 0.0, 12.0)).astype(np.float32)
+                pred_r = np.clip(knn_reg.predict(cxy), 1e-3, 500.0).astype(np.float32)
                 if pred_r.ndim == 2 and pred_r.shape[1] == 4:
                     for ri, R in enumerate(RADII):
                         mu[R] = pred_r[:, ri]

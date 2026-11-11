@@ -958,7 +958,7 @@ class Scene2DCollector:
                 continue
         return band_name, canvas
 
-    def fetch_s2_and_sar(self, grid_info: dict, pre_fire_date: str, lookback_days: int = 30) -> dict:
+    def fetch_s2_and_sar(self, grid_info: dict, pre_fire_date: str, lookback_days: int = 30, progress_cb=None) -> dict:
         target_dt = datetime.strptime(pre_fire_date, "%Y-%m-%d")
         start_dt = target_dt - timedelta(days=lookback_days)
         date_range = f"{start_dt.strftime('%Y-%m-%d')}/{target_dt.strftime('%Y-%m-%d')}"
@@ -974,18 +974,31 @@ class Scene2DCollector:
             ).items()
         )
         if not s2_items:
+            ext_start = target_dt - timedelta(days=60)
+            ext_range = f"{ext_start.strftime('%Y-%m-%d')}/{target_dt.strftime('%Y-%m-%d')}"
+            s2_items = list(
+                stac.search(
+                    collections=["sentinel-2-l2a"],
+                    bbox=grid_info["bbox_wgs84"],
+                    datetime=ext_range,
+                ).items()
+            )
+        if not s2_items:
             raise RuntimeError(f"No Sentinel-2 scenes found in {date_range} for {grid_info['center_lat_lon']}")
 
         by_date: Dict[str, List[Any]] = defaultdict(list)
         for it in s2_items:
             by_date[it.datetime.strftime("%Y-%m-%d")].append(it)
 
-        chosen_bands = None
-        chosen_loss = None
-        chosen_t0 = ""
-        best_fallback = None
+        best_candidate = None  # (inv_ratio, cand_date, d_items, scl, loss_mask)
+        cand_dates = sorted(by_date.keys(), reverse=True)[:6]
 
-        for cand_date in sorted(by_date.keys(), reverse=True):
+        for idx_d, cand_date in enumerate(cand_dates):
+            if progress_cb:
+                progress_cb(
+                    0.22 + 0.06 * (idx_d / max(1, len(cand_dates))),
+                    f"[2D Step 1/4] Checking Sentinel-2 cloud mask (SCL) for {cand_date}...",
+                )
             d_items = by_date[cand_date]
             _, scl = self._fetch_mosaicked_band("SCL", d_items, grid_info)
             if scl is None:
@@ -995,35 +1008,29 @@ class Scene2DCollector:
                 np.float32
             )
             inv_ratio = float(loss_mask.mean())
-            if inv_ratio > MAX_INVALID_RATIO and best_fallback is not None:
-                continue
-
-            bands: Dict[str, np.ndarray] = {"SCL": scl}
-            rem = [b for b in self.OPTICAL_BANDS if b != "SCL"]
-            with ThreadPoolExecutor(max_workers=6) as ex:
-                futs = [ex.submit(self._fetch_mosaicked_band, b, d_items, grid_info) for b in rem]
-                for f in as_completed(futs):
-                    bn, barr = f.result()
-                    bands[bn] = barr
-
-            # Check validity
-            ok = all(
-                b in bands and np.isfinite(bands[b]).mean() >= (1.0 - MAX_INVALID_RATIO)
-                for b in self.REQUIRED_SPECTRAL_BANDS
-            )
-            if ok and inv_ratio <= MAX_INVALID_RATIO:
-                chosen_bands, chosen_loss, chosen_t0 = bands, loss_mask, cand_date
+            if best_candidate is None or inv_ratio < best_candidate[0]:
+                best_candidate = (inv_ratio, cand_date, d_items, scl, loss_mask)
+            if inv_ratio <= MAX_INVALID_RATIO:
                 break
-            elif best_fallback is None and any(np.isfinite(bands.get(b, np.nan)).any() for b in self.REQUIRED_SPECTRAL_BANDS):
-                best_fallback = (bands, loss_mask, cand_date)
 
-        if chosen_bands is None:
-            if best_fallback is not None:
-                chosen_bands, chosen_loss, chosen_t0 = best_fallback
-            else:
-                raise RuntimeError("No valid cloud-free Sentinel-2 scene passed quality gate.")
+        if best_candidate is None:
+            raise RuntimeError("No valid Sentinel-2 scene passed SCL check.")
+
+        _, chosen_t0, chosen_items, chosen_scl, chosen_loss = best_candidate
+        if progress_cb:
+            progress_cb(0.30, f"[2D Step 1/4] Downloading 10 Sentinel-2 spectral bands for {chosen_t0}...")
+
+        chosen_bands: Dict[str, np.ndarray] = {"SCL": chosen_scl}
+        rem = [b for b in self.OPTICAL_BANDS if b != "SCL"]
+        with ThreadPoolExecutor(max_workers=6) as ex:
+            futs = [ex.submit(self._fetch_mosaicked_band, b, chosen_items, grid_info) for b in rem]
+            for f in as_completed(futs):
+                bn, barr = f.result()
+                chosen_bands[bn] = barr
 
         # 2. Sentinel-1 RTC SAR
+        if progress_cb:
+            progress_cb(0.40, "[2D Step 1/4] Querying Sentinel-1 RTC SAR backscatter (VV, VH)...")
         sar_bands: Dict[str, np.ndarray] = {}
         try:
             s1_items = list(
@@ -1036,7 +1043,7 @@ class Scene2DCollector:
             s1_by_date: Dict[str, List[Any]] = defaultdict(list)
             for it in s1_items:
                 s1_by_date[it.datetime.strftime("%Y-%m-%d")].append(it)
-            for d_str in sorted(s1_by_date.keys(), reverse=True):
+            for d_str in sorted(s1_by_date.keys(), reverse=True)[:4]:
                 d_items = s1_by_date[d_str]
                 _, vv = self._fetch_mosaicked_band("vv", d_items, grid_info)
                 _, vh = self._fetch_mosaicked_band("vh", d_items, grid_info)
@@ -1053,7 +1060,7 @@ class Scene2DCollector:
             "sar_bands": sar_bands,
         }
 
-    def fetch_static_terrain_and_osm(self, grid_info: dict, buffer_meters: float = 4000.0) -> Dict[str, np.ndarray]:
+    def fetch_static_terrain_and_osm(self, grid_info: dict, buffer_meters: float = 4000.0, progress_cb=None) -> Dict[str, np.ndarray]:
         """Fetches or loads cached 9 static channels: DEM (4) + OSM accessibility/distances (5)."""
         lat, lon = grid_info["center_lat_lon"]
         cache_dir = Path(CONFIG["MINI_DATASET_DIR"]) / "static_2d_cache"
@@ -1064,6 +1071,8 @@ class Scene2DCollector:
             try:
                 with np.load(cache_file) as z:
                     if all(k in z.files for k in self.STATIC_9_CHANNELS):
+                        if progress_cb:
+                            progress_cb(0.60, "[2D Step 2/4] Loaded cached Copernicus DEM & OSM travel-time rasters...")
                         return {k: z[k].astype(np.float32) for k in self.STATIC_9_CHANNELS}
             except Exception:
                 pass
@@ -1093,6 +1102,8 @@ class Scene2DCollector:
         padded_bbox = (west - 0.01, south - 0.01, east + 0.01, north + 0.01)
 
         # 1. Copernicus DEM 30m
+        if progress_cb:
+            progress_cb(0.48, "[2D Step 2/4] Fetching Copernicus DEM GLO-30 elevation, slope, and aspect...")
         stac = self._get_stac()
         dem_items = list(stac.search(collections=["cop-dem-glo-30"], bbox=padded_bbox).items())
         if not dem_items:
@@ -1146,12 +1157,14 @@ class Scene2DCollector:
             )
 
         # 2. OSM Vectors via Overpass API
+        if progress_cb:
+            progress_cb(0.55, "[2D Step 2/4] Fetching OpenStreetMap roads, trails, powerlines, and camps via Overpass...")
         gdf_utm = self._fetch_overpass_osm(west, south, east, north, grid_info["crs"])
 
-        def _rast(gdf_sub):
-            if gdf_sub is None or gdf_sub.empty:
+        def _rast(df_sub):
+            if df_sub is None or df_sub.empty or "geometry" not in df_sub.columns:
                 return np.zeros(buf_shape_50m, dtype=np.uint8)
-            shapes = [(g, 1) for g in gdf_sub.geometry if g is not None and not g.is_empty]
+            shapes = [(g, 1) for g in df_sub["geometry"] if g is not None and not g.is_empty]
             if not shapes:
                 return np.zeros(buf_shape_50m, dtype=np.uint8)
             return rasterize(shapes, out_shape=buf_shape_50m, transform=buf_transform_50m, fill=0, dtype=np.uint8, all_touched=True)
@@ -1182,6 +1195,8 @@ class Scene2DCollector:
                     cc = cc | gdf_utm["amenity"].isin(["shelter", "firepit"])
                 gdf_camps = gdf_utm[cc]
 
+        if progress_cb:
+            progress_cb(0.60, "[2D Step 2/4] Computing Dijkstra travel time and distance transforms...")
         passable_50m = np.ones(buf_shape_50m, dtype=np.uint8)
         passable_50m[_rast(gdf_water) == 1] = 0
         passable_50m[np.isnan(dem_50m)] = 0
@@ -1215,12 +1230,17 @@ class Scene2DCollector:
             pass
         return results
 
-    def _fetch_overpass_osm(self, west: float, south: float, east: float, north: float, target_crs: Any):
-        import geopandas as gpd
+    def _fetch_overpass_osm(self, west: float, south: float, east: float, north: float, target_crs: Any) -> pd.DataFrame:
+        from pyproj import Transformer
         from shapely.geometry import LineString, Point, Polygon
 
+        empty_df = pd.DataFrame(
+            columns=["geometry", "highway", "railway", "power", "natural", "waterway", "tourism", "amenity", "bridge"]
+        )
+        to_utm = Transformer.from_crs("EPSG:4326", target_crs, always_xy=True)
+
         query = f"""
-        [out:json][timeout:45];
+        [out:json][timeout:25];
         (
           way["highway"~"motorway|trunk|primary|secondary|tertiary|unclassified|residential|service|track|path|footway|motorway_link|trunk_link|primary_link|secondary_link|tertiary_link"]({south:.5f},{west:.5f},{north:.5f},{east:.5f});
           way["railway"~"rail|narrow_gauge|spur"]({south:.5f},{west:.5f},{north:.5f},{east:.5f});
@@ -1237,7 +1257,7 @@ class Scene2DCollector:
         sess = _make_session()
         for url in self.OVERPASS_SERVERS:
             try:
-                r = sess.post(url, data={"data": query}, timeout=50)
+                r = sess.post(url, data={"data": query}, timeout=30)
                 if r.status_code != 200:
                     continue
                 elements = r.json().get("elements", [])
@@ -1246,9 +1266,13 @@ class Scene2DCollector:
                     tags = el.get("tags", {})
                     geom = None
                     if el.get("type") == "node" and "lat" in el and "lon" in el:
-                        geom = Point(float(el["lon"]), float(el["lat"]))
+                        x_u, y_u = to_utm.transform(float(el["lon"]), float(el["lat"]))
+                        geom = Point(x_u, y_u)
                     elif "geometry" in el and len(el["geometry"]) >= 2:
-                        coords = [( float(pt["lon"]), float(pt["lat"]) ) for pt in el["geometry"]]
+                        lons = [float(pt["lon"]) for pt in el["geometry"]]
+                        lats = [float(pt["lat"]) for pt in el["geometry"]]
+                        xs, ys = to_utm.transform(lons, lats)
+                        coords = list(zip(xs, ys))
                         if (
                             len(coords) >= 4
                             and coords[0] == coords[-1]
@@ -1275,12 +1299,11 @@ class Scene2DCollector:
                             }
                         )
                 if not rows:
-                    return gpd.GeoDataFrame(geometry=[], crs=target_crs)
-                gdf = gpd.GeoDataFrame(rows, crs="EPSG:4326")
-                return gdf.to_crs(target_crs)
+                    return empty_df
+                return pd.DataFrame(rows)
             except Exception as e:
                 print(f"  [Overpass] mirror {url} failed ({e}), trying next...")
-        return gpd.GeoDataFrame(geometry=[], crs=target_crs)
+        return empty_df
 
     def fetch_soil_moisture(self, grid_info: dict, pre_fire_date: str, default_moisture: float = 0.20) -> np.ndarray:
         """Fetches ERA5-Land top-layer volumetric soil moisture (0-7 cm).
@@ -1329,14 +1352,14 @@ class Scene2DCollector:
 
         if progress_cb:
             progress_cb(0.20, "[2D Step 1/4] Querying Planetary Computer STAC for Sentinel-2 L2A & Sentinel-1 SAR...")
-        sent_res = self.fetch_s2_and_sar(grid_info, pre_fire_str, 30)
+        sent_res = self.fetch_s2_and_sar(grid_info, pre_fire_str, 30, progress_cb=progress_cb)
 
         if progress_cb:
-            progress_cb(0.50, "[2D Step 2/4] Fetching Copernicus DEM GLO-30 & OpenStreetMap roads (Dijkstra travel time)...")
-        stat_res = self.fetch_static_terrain_and_osm(grid_info, 4000.0)
+            progress_cb(0.46, "[2D Step 2/4] Fetching Copernicus DEM GLO-30 & OpenStreetMap roads (Dijkstra travel time)...")
+        stat_res = self.fetch_static_terrain_and_osm(grid_info, 4000.0, progress_cb=progress_cb)
 
         if progress_cb:
-            progress_cb(0.75, "[2D Step 3/4] Fetching ERA5-Land volumetric soil moisture (0-7 cm)...")
+            progress_cb(0.62, "[2D Step 3/4] Fetching ERA5-Land volumetric soil moisture (0-7 cm)...")
         soil_arr = self.fetch_soil_moisture(grid_info, pre_fire_str)
 
         t0_date_str = sent_res["t0_date"]

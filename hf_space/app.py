@@ -14,7 +14,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from config_and_features import CONFIG, RADII
+from config_and_features import CI, CONFIG, RADII, build_2d_np
 from live import score_single_location
 from make_map import (
     build_grid_features,
@@ -101,183 +101,191 @@ def run_iberia_map_and_compare(
     force_refresh: bool,
     progress=gr.Progress(track_tqdm=False),
 ):
-    day = datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d").date()
-    reg, store = _get_registry_and_store()
-    pts_path = _find_points_csv()
-    pts, meta_df = load_points(pts_path)
+    try:
+        day = datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d").date()
+        reg, store = _get_registry_and_store()
+        pts_path = _find_points_csv()
+        pts, meta_df = load_points(pts_path)
 
-    cache_key = f"{day}_{len(pts)}"
-    if force_refresh or cache_key not in _GRID_CACHE or int(collect_2d_limit) > 0:
-        grid_data = build_grid_features(
-            pts=pts,
-            day=day,
-            meta_df=meta_df,
-            collect_2d_limit=int(collect_2d_limit),
-            collect_2d_strategy=collect_2d_strategy,
-            store=store,
-            reg=reg,
-            progress_cb=lambda frac, desc: progress(frac, desc=desc),
-        )
-        _GRID_CACHE[cache_key] = grid_data
-    else:
-        progress(0.35, desc=f"Loading cached features for {day}...")
-        grid_data = _GRID_CACHE[cache_key]
-
-    progress(0.82, desc="Evaluating models and rendering maps...")
-    models_to_run = []
-    for m in (model_a, model_b):
-        if m and m not in models_to_run:
-            models_to_run.append(m)
-    if also_score_all:
-        for m in reg.available_models(include_2d=True):
-            if m not in models_to_run:
-                models_to_run.append(m)
-
-    out_df = pts.copy()
-    out_df["date"] = str(day)
-    out_df["has_2d_scene"] = grid_data["has_2d_mask"]
-    out_df["recent_fires_7d_50km"] = grid_data["HIST_TAB"][:, 2 * 4 + 3].astype(int)
-    out_df["recent_fires_30d_50km"] = grid_data["HIST_TAB"][:, 4 * 4 + 3].astype(int)
-
-    outputs: Dict[str, Dict[str, Any]] = {}
-    summary_rows = []
-    for m_name in models_to_run:
-        try:
-            res = gpu_predict(
+        cache_key = f"{day}_{len(pts)}"
+        if force_refresh or cache_key not in _GRID_CACHE or int(collect_2d_limit) > 0:
+            grid_data = build_grid_features(
+                pts=pts,
+                day=day,
+                meta_df=meta_df,
+                collect_2d_limit=int(collect_2d_limit),
+                collect_2d_strategy=collect_2d_strategy,
+                store=store,
                 reg=reg,
-                model_name=m_name,
-                tab_1d=grid_data["TAB_1D"],
-                hist_tab=grid_data["HIST_TAB"],
-                clim_feats=grid_data["CLIM_FEATS"],
-                seq=grid_data["SEQ"],
-                static_1d=grid_data["STATIC_1D"],
-                pts_ll=pts[["lat", "lon"]].values,
-                ft_2d=grid_data["FT_2D"],
-                emb32_2d=grid_data["EMB32_2D"],
-                mask=grid_data["has_2d_mask"],
+                progress_cb=lambda frac, desc: progress(frac, desc=desc),
             )
-            outputs[m_name] = res
-            out_df[f"P_{m_name}"] = np.round(res["p"], 4)
-            out_df[f"level_{m_name}"] = res["levels"]
-            out_df[f"expected_50km_{m_name}"] = np.round(res["mu"][50], 2)
-            out_df[f"upper90_50km_{m_name}"] = res["upper90"][50]
-
-            t = res["thresholds"]
-            summary_rows.append(
-                {
-                    "Model": m_name,
-                    "Description": MODEL_CATALOG.get(m_name, {}).get("label", m_name),
-                    "2D Imagery": "Yes" if MODEL_CATALOG.get(m_name, {}).get("requires_2d") else "No (1D/History)",
-                    "Mean P(50km)": round(float(res["p"].mean()), 4),
-                    "Max P(50km)": round(float(res["p"].max()), 4),
-                    "Low (%)": round(100.0 * float((res["levels"] == "Low").mean()), 1),
-                    "Medium (%)": round(100.0 * float((res["levels"] == "Medium").mean()), 1),
-                    "High (%)": round(100.0 * float((res["levels"] == "High").mean()), 1),
-                    "High (count)": int((res["levels"] == "High").sum()),
-                    "Mean E[cnt 50km]": round(float(res["mu"][50].mean()), 2),
-                    "Threshold Low/Med": round(float(t[0]), 3),
-                    "Threshold Med/High": round(float(t[1]), 3),
-                }
-            )
-        except Exception as e:
-            summary_rows.append(
-                {
-                    "Model": m_name,
-                    "Description": f"Error: {e}",
-                    "2D Imagery": "-",
-                    "Mean P(50km)": np.nan,
-                    "Max P(50km)": np.nan,
-                    "Low (%)": np.nan,
-                    "Medium (%)": np.nan,
-                    "High (%)": np.nan,
-                    "High (count)": 0,
-                    "Mean E[cnt 50km]": np.nan,
-                    "Threshold Low/Med": np.nan,
-                    "Threshold Med/High": np.nan,
-                }
-            )
-
-    if model_a not in outputs:
-        if outputs:
-            model_a = next(iter(outputs.keys()))
+            _GRID_CACHE[cache_key] = grid_data
         else:
-            raise gr.Error("No selected models could be evaluated. Check the model files in models/.")
-    if model_b not in outputs:
-        model_b = model_a
+            progress(0.35, desc=f"Loading cached features for {day}...")
+            grid_data = _GRID_CACHE[cache_key]
 
-    out_df["delta_P_A_minus_B"] = np.round(outputs[model_a]["p"] - outputs[model_b]["p"], 4)
-    pred_csv_path = store.save_daily_predictions(day, out_df)
+        progress(0.82, desc="Evaluating models and rendering maps...")
+        models_to_run = []
+        for m in (model_a, model_b):
+            if m and m not in models_to_run:
+                models_to_run.append(m)
+        if also_score_all:
+            for m in reg.available_models(include_2d=True):
+                if m not in models_to_run:
+                    models_to_run.append(m)
 
-    map_a_path = store.maps_dir / f"map_{model_a}_{day}.png"
-    map_b_path = store.maps_dir / f"map_{model_b}_{day}.png"
-    cmp_path = store.maps_dir / f"compare_{model_a}_vs_{model_b}_{day}.png"
+        out_df = pts.copy()
+        out_df["date"] = str(day)
+        out_df["has_2d_scene"] = grid_data["has_2d_mask"]
+        out_df["recent_fires_7d_50km"] = grid_data["HIST_TAB"][:, 2 * 4 + 3].astype(int)
+        out_df["recent_fires_30d_50km"] = grid_data["HIST_TAB"][:, 4 * 4 + 3].astype(int)
 
-    draw_single_map(pts, outputs[model_a], day, map_a_path, has_2d_mask=grid_data["has_2d_mask"])
-    draw_single_map(pts, outputs[model_b], day, map_b_path, has_2d_mask=grid_data["has_2d_mask"])
-    _, cmp_stats = draw_comparison_map(
-        pts, outputs[model_a], outputs[model_b], day, cmp_path, has_2d_mask=grid_data["has_2d_mask"]
-    )
+        outputs: Dict[str, Dict[str, Any]] = {}
+        summary_rows = []
+        for m_name in models_to_run:
+            try:
+                res = gpu_predict(
+                    reg=reg,
+                    model_name=m_name,
+                    tab_1d=grid_data["TAB_1D"],
+                    hist_tab=grid_data["HIST_TAB"],
+                    clim_feats=grid_data["CLIM_FEATS"],
+                    seq=grid_data["SEQ"],
+                    static_1d=grid_data["STATIC_1D"],
+                    pts_ll=pts[["lat", "lon"]].values,
+                    ft_2d=grid_data["FT_2D"],
+                    emb32_2d=grid_data["EMB32_2D"],
+                    mask=grid_data["has_2d_mask"],
+                )
+                outputs[m_name] = res
+                out_df[f"P_{m_name}"] = np.round(res["p"], 4)
+                out_df[f"level_{m_name}"] = res["levels"]
+                out_df[f"expected_50km_{m_name}"] = np.round(res["mu"][50], 2)
+                out_df[f"upper90_50km_{m_name}"] = res["upper90"][50]
 
-    summary_df = pd.DataFrame(summary_rows)
-    top_df = out_df.sort_values(by=f"P_{model_a}", ascending=False).head(50).reset_index(drop=True)
+                t = res["thresholds"]
+                summary_rows.append(
+                    {
+                        "Model": m_name,
+                        "Description": MODEL_CATALOG.get(m_name, {}).get("label", m_name),
+                        "2D Imagery": "Yes" if MODEL_CATALOG.get(m_name, {}).get("requires_2d") else "No (1D/History)",
+                        "Mean P(50km)": round(float(res["p"].mean()), 4),
+                        "Max P(50km)": round(float(res["p"].max()), 4),
+                        "Low (%)": round(100.0 * float((res["levels"] == "Low").mean()), 1),
+                        "Medium (%)": round(100.0 * float((res["levels"] == "Medium").mean()), 1),
+                        "High (%)": round(100.0 * float((res["levels"] == "High").mean()), 1),
+                        "High (count)": int((res["levels"] == "High").sum()),
+                        "Mean E[cnt 50km]": round(float(res["mu"][50].mean()), 2),
+                        "Threshold Low/Med": round(float(t[0]), 3),
+                        "Threshold Med/High": round(float(t[1]), 3),
+                    }
+                )
+            except Exception as e:
+                summary_rows.append(
+                    {
+                        "Model": m_name,
+                        "Description": f"Error: {e}",
+                        "2D Imagery": "-",
+                        "Mean P(50km)": np.nan,
+                        "Max P(50km)": np.nan,
+                        "Low (%)": np.nan,
+                        "Medium (%)": np.nan,
+                        "High (%)": np.nan,
+                        "High (count)": 0,
+                        "Mean E[cnt 50km]": np.nan,
+                        "Threshold Low/Med": np.nan,
+                        "Threshold Med/High": np.nan,
+                    }
+                )
 
-    info_text = (
-        f"Evaluation completed for {day} ({len(pts)} grid locations).\n"
-        f"Comparison: {model_a} vs {model_b}: level agreement = {cmp_stats['level_agreement_pct']}%, "
-        f"correlation r = {cmp_stats['pearson_r']}, mean absolute difference = {cmp_stats['mean_abs_diff']}.\n"
-        f"FIRMS detections past 30 days: {grid_data['n_firms_detections']} detections across {grid_data['n_covered_days']}/30 covered days. "
-        f"2D scenes available in cache: {grid_data['n_2d_scenes']}.\n"
-        f"Predictions saved to: {pred_csv_path}"
-    )
+        if model_a not in outputs:
+            if outputs:
+                model_a = next(iter(outputs.keys()))
+            else:
+                return None, None, None, pd.DataFrame(summary_rows), pd.DataFrame(), None, "No selected models could be evaluated. Check the model files in models/."
+        if model_b not in outputs:
+            model_b = model_a
 
-    progress(1.0, desc="Done")
-    return str(cmp_path), str(map_a_path), str(map_b_path), summary_df, top_df, str(pred_csv_path), info_text
+        out_df["delta_P_A_minus_B"] = np.round(outputs[model_a]["p"] - outputs[model_b]["p"], 4)
+        pred_csv_path = store.save_daily_predictions(day, out_df)
+
+        map_a_path = store.maps_dir / f"map_{model_a}_{day}.png"
+        map_b_path = store.maps_dir / f"map_{model_b}_{day}.png"
+        cmp_path = store.maps_dir / f"compare_{model_a}_vs_{model_b}_{day}.png"
+
+        draw_single_map(pts, outputs[model_a], day, map_a_path, has_2d_mask=grid_data["has_2d_mask"])
+        draw_single_map(pts, outputs[model_b], day, map_b_path, has_2d_mask=grid_data["has_2d_mask"])
+        _, cmp_stats = draw_comparison_map(
+            pts, outputs[model_a], outputs[model_b], day, cmp_path, has_2d_mask=grid_data["has_2d_mask"]
+        )
+
+        summary_df = pd.DataFrame(summary_rows)
+        top_df = out_df.sort_values(by=f"P_{model_a}", ascending=False).head(50).reset_index(drop=True)
+
+        info_text = (
+            f"Evaluation completed for {day} ({len(pts)} grid locations).\n"
+            f"Comparison: {model_a} vs {model_b}: level agreement = {cmp_stats['level_agreement_pct']}%, "
+            f"correlation r = {cmp_stats['pearson_r']}, mean absolute difference = {cmp_stats['mean_abs_diff']}.\n"
+            f"FIRMS detections past 30 days: {grid_data['n_firms_detections']} detections across {grid_data['n_covered_days']}/30 covered days. "
+            f"2D scenes available in cache: {grid_data['n_2d_scenes']}.\n"
+            f"Predictions saved to: {pred_csv_path}"
+        )
+
+        progress(1.0, desc="Done")
+        return str(cmp_path), str(map_a_path), str(map_b_path), summary_df, top_df, str(pred_csv_path), info_text
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return None, None, None, pd.DataFrame(), pd.DataFrame(), None, f"Error during Iberia grid evaluation: {type(exc).__name__}: {exc}"
 
 
 def _render_2d_patch_diagnostic(scene_2d: Dict[str, Any], lat: float, lon: float, day_str: str, out_path: Path) -> Path:
     x = np.asarray(scene_2d["X_2d"], dtype=np.float32)
+    x32 = build_2d_np(x)[0]
     fig, axes = plt.subplots(2, 4, figsize=(16, 8), dpi=140)
     ax = axes.ravel()
 
     rgb = np.stack([x[2], x[1], x[0]], axis=-1)
     rgb = np.nan_to_num(rgb, nan=0.0)
+    if np.percentile(np.abs(rgb), 99) > 2.0:
+        rgb = rgb / 10000.0
     rgb_disp = np.clip(rgb / 0.30, 0.0, 1.0) ** 0.85
     ax[0].imshow(rgb_disp)
     ax[0].set_title(f"Sentinel-2 RGB ({scene_2d.get('s2_Source_Date', 'N/A')})")
 
-    im1 = ax[1].imshow(np.nan_to_num(x[10], 0.0), cmap="RdYlGn", vmin=-0.2, vmax=0.8)
+    im1 = ax[1].imshow(np.nan_to_num(x32[CI["NDVI"]], 0.0), cmap="RdYlGn", vmin=-0.2, vmax=0.8)
     ax[1].set_title("NDVI")
     plt.colorbar(im1, ax=ax[1], fraction=0.046)
 
-    im2 = ax[2].imshow(np.nan_to_num(x[11], 0.0), cmap="Spectral", vmin=-0.5, vmax=0.7)
+    im2 = ax[2].imshow(np.nan_to_num(x32[CI["NBR"]], 0.0), cmap="Spectral", vmin=-0.5, vmax=0.7)
     ax[2].set_title("NBR")
     plt.colorbar(im2, ax=ax[2], fraction=0.046)
 
-    im3 = ax[3].imshow(np.nan_to_num(x[12], 0.0), cmap="BrBG", vmin=-0.5, vmax=0.6)
-    ax[3].set_title("NDWI")
+    im3 = ax[3].imshow(np.nan_to_num(x32[CI["NDMI"]], 0.0), cmap="BrBG", vmin=-0.5, vmax=0.6)
+    ax[3].set_title("NDMI")
     plt.colorbar(im3, ax=ax[3], fraction=0.046)
 
-    im4 = ax[4].imshow(np.nan_to_num(x[13], 0.0), cmap="gray")
-    ax[4].set_title("Sentinel-1 SAR VV")
+    im4 = ax[4].imshow(np.nan_to_num(x32[CI["SAR_VV"]], 0.0), cmap="gray")
+    ax[4].set_title("Sentinel-1 SAR VV (dB)")
     plt.colorbar(im4, ax=ax[4], fraction=0.046)
 
-    im5 = ax[5].imshow(np.nan_to_num(x[16], 0.0), cmap="terrain")
+    im5 = ax[5].imshow(np.nan_to_num(x32[CI["Elevation"]], 0.0), cmap="terrain")
     ax[5].set_title("Copernicus DEM (m)")
     plt.colorbar(im5, ax=ax[5], fraction=0.046)
 
-    im6 = ax[6].imshow(np.nan_to_num(x[17], 0.0), cmap="magma")
+    im6 = ax[6].imshow(np.nan_to_num(x32[CI["Slope"]], 0.0), cmap="magma")
     ax[6].set_title("Slope (deg)")
     plt.colorbar(im6, ax=ax[6], fraction=0.046)
 
-    im7 = ax[7].imshow(np.nan_to_num(x[20], 0.0), cmap="viridis_r")
-    ax[7].set_title("OSM Road Travel Time (min)")
+    im7 = ax[7].imshow(np.nan_to_num(x32[CI["Travel_Time_Roads"]], 0.0), cmap="viridis_r")
+    ax[7].set_title("OSM Road Travel Time (h)")
     plt.colorbar(im7, ax=ax[7], fraction=0.046)
 
     for a in ax:
         a.set_xticks([])
         a.set_yticks([])
 
-    plt.suptitle(f"22-channel 2D satellite patch (256x256 at 10m) - ({lat:.4f}, {lon:.4f}) on {day_str}", fontsize=12)
+    plt.suptitle(f"22-channel 2D satellite patch ({x.shape[1]}x{x.shape[2]} at 100m) - ({lat:.4f}, {lon:.4f}) on {day_str}", fontsize=12)
     plt.tight_layout()
     plt.savefig(out_path)
     plt.close(fig)
@@ -288,7 +296,7 @@ def _render_single_point_model_chart(preds: Dict[str, Any], lat: float, lon: flo
     valid = [(k, v) for k, v in preds.items() if isinstance(v, dict) and "P_fire_50km" in v]
     valid.sort(key=lambda item: item[1]["P_fire_50km"])
 
-    fig, ax = plt.subplots(figsize=(9.5, max(3.8, 0.52 * len(valid))), dpi=140)
+    fig, ax = plt.subplots(figsize=(9.5, max(3.8, 0.52 * max(1, len(valid)))), dpi=140)
     names = [f"{k} {'(2D image)' if v.get('used_2d_imagery') else '(1D)'}" for k, v in valid]
     probs = [v["P_fire_50km"] for _, v in valid]
     bar_colors = [
@@ -296,16 +304,17 @@ def _render_single_point_model_chart(preds: Dict[str, Any], lat: float, lon: flo
         for _, v in valid
     ]
 
-    bars = ax.barh(names, probs, color=bar_colors, edgecolor="#333333", height=0.65)
-    for bar, (_, v) in zip(bars, valid):
-        w = bar.get_width()
-        ax.text(
-            min(w + 0.015, 0.96),
-            bar.get_y() + bar.get_height() / 2,
-            f"{w:.3f} ({v['risk_level']}, E[50km]={v['expected_count']['50km']})",
-            va="center",
-            fontsize=8.5,
-        )
+    if valid:
+        bars = ax.barh(names, probs, color=bar_colors, edgecolor="#333333", height=0.65)
+        for bar, (_, v) in zip(bars, valid):
+            w = bar.get_width()
+            ax.text(
+                min(w + 0.015, 0.96),
+                bar.get_y() + bar.get_height() / 2,
+                f"{w:.3f} ({v['risk_level']}, E[50km]={v['expected_count']['50km']})",
+                va="center",
+                fontsize=8.5,
+            )
     ax.set_xlim(0, 1.08)
     ax.set_xlabel("P(fire within 50 km)")
     ax.set_title(f"Model Comparison for ({lat:.4f}, {lon:.4f}) on {day_str}")
@@ -323,55 +332,73 @@ def run_single_point_analysis(
     collect_2d: bool,
     progress=gr.Progress(track_tqdm=False),
 ):
-    progress(0.05, desc="[Step 1/6] Starting single-location pipeline...")
-    res = score_single_location(
-        lat=float(lat),
-        lon=float(lon),
-        target_day_str=str(date_str).strip()[:10],
-        models=["all"],
-        collect_2d=bool(collect_2d),
-        save_to_mini_dataset=True,
-        progress_cb=lambda frac, desc: progress(frac, desc=desc),
-    )
-    _, store = _get_registry_and_store()
-    preds = res["predictions"]
+    try:
+        progress(0.05, desc="[Step 1/6] Starting single-location pipeline...")
+        res = score_single_location(
+            lat=float(lat),
+            lon=float(lon),
+            target_day_str=str(date_str).strip()[:10],
+            models=["all"],
+            collect_2d=bool(collect_2d),
+            save_to_mini_dataset=True,
+            progress_cb=lambda frac, desc: progress(frac, desc=desc),
+        )
+        _, store = _get_registry_and_store()
+        preds = res["predictions"]
 
-    rows = []
-    for m, v in preds.items():
-        if "P_fire_50km" in v:
-            rows.append(
-                {
-                    "Model": m,
-                    "Type": "2D Image + 1D" if v.get("used_2d_imagery") else "1D + History/Clim",
-                    "P(fire <= 50km)": v["P_fire_50km"],
-                    "Risk Level": v["risk_level"],
-                    "E[5km]": v["expected_count"]["5km"],
-                    "E[10km]": v["expected_count"]["10km"],
-                    "E[25km]": v["expected_count"]["25km"],
-                    "E[50km]": v["expected_count"]["50km"],
-                    "Upper 90% (50km)": v["upper_90pct_count"]["50km"],
-                    "Thresholds (Low/Med/High)": f"{v['thresholds_low_med_high'][0]:.2f} / {v['thresholds_low_med_high'][1]:.2f}",
-                }
-            )
-    df_out = pd.DataFrame(rows).sort_values(by="P(fire <= 50km)", ascending=False).reset_index(drop=True)
+        rows = []
+        errors = []
+        for m, v in preds.items():
+            if "P_fire_50km" in v:
+                rows.append(
+                    {
+                        "Model": m,
+                        "Type": "2D Image + 1D" if v.get("used_2d_imagery") else "1D + History/Clim",
+                        "P(fire <= 50km)": v["P_fire_50km"],
+                        "Risk Level": v["risk_level"],
+                        "E[5km]": v["expected_count"]["5km"],
+                        "E[10km]": v["expected_count"]["10km"],
+                        "E[25km]": v["expected_count"]["25km"],
+                        "E[50km]": v["expected_count"]["50km"],
+                        "Upper 90% (50km)": v["upper_90pct_count"]["50km"],
+                        "Thresholds (Low/Med/High)": f"{v['thresholds_low_med_high'][0]:.2f} / {v['thresholds_low_med_high'][1]:.2f}",
+                    }
+                )
+            elif "error" in v:
+                errors.append(f"{m}: {v['error']}")
 
-    chart_path = store.maps_dir / f"point_models_{lat:.3f}_{lon:.3f}_{res['date']}.png"
-    _render_single_point_model_chart(preds, float(lat), float(lon), res["date"], chart_path)
+        if rows:
+            df_out = pd.DataFrame(rows).sort_values(by="P(fire <= 50km)", ascending=False).reset_index(drop=True)
+        else:
+            df_out = pd.DataFrame(columns=["Model", "Type", "P(fire <= 50km)", "Risk Level", "E[5km]", "E[10km]", "E[25km]", "E[50km]", "Upper 90% (50km)", "Thresholds (Low/Med/High)"])
 
-    patch_img_path = None
-    if res.get("scene_2d") is not None:
-        patch_img_path = store.maps_dir / f"patch2d_{lat:.3f}_{lon:.3f}_{res['date']}.png"
-        _render_2d_patch_diagnostic(res["scene_2d"], float(lat), float(lon), res["date"], patch_img_path)
+        chart_path = store.maps_dir / f"point_models_{lat:.3f}_{lon:.3f}_{res['date']}.png"
+        _render_single_point_model_chart(preds, float(lat), float(lon), res["date"], chart_path)
 
-    info_text = (
-        f"Location: ({lat:.4f}, {lon:.4f}) on {res['date']}\n"
-        f"2D satellite patch (22 channels): {'collected' if res['has_2d_scene'] else 'not collected'} "
-        f"(Sentinel-2 source date: {res.get('s2_source_date')})\n"
-        f"FIRMS detections within 50 km: 7-day count = {res['recent_fires_7d_50km']}, 30-day count = {res['recent_fires_30d_50km']}\n"
-        f"Saved scene path: {res.get('saved_npz_path') or 'none'}"
-    )
-    progress(1.0, desc="Done")
-    return str(chart_path), (str(patch_img_path) if patch_img_path else None), df_out, info_text
+        patch_img_path = None
+        if res.get("scene_2d") is not None:
+            patch_img_path = store.maps_dir / f"patch2d_{lat:.3f}_{lon:.3f}_{res['date']}.png"
+            _render_2d_patch_diagnostic(res["scene_2d"], float(lat), float(lon), res["date"], patch_img_path)
+
+        status_2d = "collected" if res["has_2d_scene"] else "not collected"
+        if res.get("scene_2d_error"):
+            status_2d += f" (2D warning: {res['scene_2d_error']})"
+
+        info_lines = [
+            f"Location: ({lat:.4f}, {lon:.4f}) on {res['date']}",
+            f"2D satellite patch (22 channels): {status_2d} (Sentinel-2 source date: {res.get('s2_source_date')})",
+            f"FIRMS detections within 50 km: 7-day count = {res['recent_fires_7d_50km']}, 30-day count = {res['recent_fires_30d_50km']}",
+            f"Saved scene path: {res.get('saved_npz_path') or 'none'}",
+        ]
+        if errors:
+            info_lines.append("Model notes: " + "; ".join(errors))
+
+        progress(1.0, desc="Done")
+        return str(chart_path), (str(patch_img_path) if patch_img_path else None), df_out, "\n".join(info_lines)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return None, None, pd.DataFrame(), f"Error during single-location evaluation: {type(exc).__name__}: {exc}"
 
 
 def refresh_mini_dataset_view():

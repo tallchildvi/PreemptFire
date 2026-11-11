@@ -55,27 +55,32 @@ CHANNELS_2D: List[str] = [
 ]
 
 S2_NAMES = [f"B{b}" for b in ("02", "03", "04", "05", "06", "07", "08", "8A", "11", "12")]
-INDEX_NAMES = ["NDVI", "NBR", "NBR2", "NDWI", "EVI", "NDRE", "NDII", "MSI", "SAR_RATIO", "SAR_RVI"]
+INDEX_NAMES = ["NDVI", "NDMI", "NBR", "NBR2", "EVI", "NDRE", "MSI", "NMDI", "SAR_RATIO", "SAR_RVI"]
 ALL_2D_NAMES = CHANNELS_2D + INDEX_NAMES
-ALL_TORCH_CH = CHANNELS_2D + INDEX_NAMES
+ALL_TORCH_CH = CHANNELS_2D + INDEX_NAMES + ["MASK_WATER"]
 CI = {n: i for i, n in enumerate(ALL_2D_NAMES)}
 
 CONTEXT_1D: List[str] = [
     "days_since_rain",
     "days_since_t0_pass",
     "int1_t0_to_target_precip_sum",
-    "int1_t0_to_target_rh_max",
-    "int1_t0_to_target_rh_mean",
     "int1_t0_to_target_rh_min",
     "int1_t0_to_target_temp_max",
     "int1_t0_to_target_temp_mean",
-    "int1_t0_to_target_temp_min",
-    "int1_t0_to_target_vpd_max",
     "int1_t0_to_target_vpd_mean",
     "int1_t0_to_target_wind_max",
-    "int1_t0_to_target_wind_mean",
     "lookback_30d_precip_sum",
+    "lookback_30d_rh_min",
+    "lookback_30d_temp_max",
+    "lookback_30d_temp_mean",
+    "lookback_30d_vpd_mean",
+    "lookback_30d_wind_max",
     "lookback_7d_precip_sum",
+    "lookback_7d_rh_min",
+    "lookback_7d_temp_max",
+    "lookback_7d_temp_mean",
+    "lookback_7d_vpd_mean",
+    "lookback_7d_wind_max",
     "population_10km_log1p",
     "population_50km_log1p",
     "target_dew_point_mean",
@@ -258,11 +263,15 @@ def build_seq_and_static(
     n = len(TAB_1D)
     obs = np.ones((n, H, 1), dtype=np.float32)
     seq = np.concatenate([np.log1p(np.maximum(HC, 0.0)) / 3.0, obs], axis=2).astype(np.float32)
-    if TAB_1D.shape[1] >= 38:
+    if TAB_1D.shape[1] >= 39:
+        x1_nn = TAB_1D[:, :35].copy()
+        x1_nn[:, WIND_COL] = TAB_1D[:, 35]
+        st_1d = np.hstack([x1_nn, TAB_1D[:, 36:39]])
+    elif TAB_1D.shape[1] >= 38:
         st_1d = TAB_1D[:, :38]
     else:
         st_1d = TAB_1D
-    clim_cols = 47 - st_1d.shape[1]
+    clim_cols = max(0, 47 - st_1d.shape[1])
     static_1d = np.hstack([st_1d, CLIM_FEATS[:, :clim_cols]]).astype(np.float32)
     return seq, static_1d
 
