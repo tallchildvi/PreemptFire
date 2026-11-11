@@ -466,14 +466,9 @@ def run_post_hoc_ground_truth(
     focal_lat: float,
     focal_lon: float,
     local_radius_km: float,
-    firms_keys_str: str = "",
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
-        if firms_keys_str and firms_keys_str.strip():
-            CONFIG["FIRMS_MAP_KEY"] = firms_keys_str.strip()
-            CONFIG["FIRMS_MAP_KEYS"] = firms_keys_str.strip()
-
         day = _parse_day(date_str)
         r_km = int(radius_km)
         reg, store = _get_registry_and_store()
@@ -530,7 +525,7 @@ def run_post_hoc_ground_truth(
             model_name = next(iter(model_preds.keys()))
 
         progress(0.72, desc=f"[Step 3/3] Post-hoc fetching actual FIRMS detections on {day} and 7-day window...")
-        firms_gt = fetch_post_hoc_firms(day, firms_keys=firms_keys_str, progress_cb=None)
+        firms_gt = fetch_post_hoc_firms(day, progress_cb=None)
         fire_1d_df = firms_gt["fire_1d_df"]
         fire_7d_df = firms_gt["fire_7d_df"]
         end_7d = firms_gt["end_7d"]
@@ -704,14 +699,9 @@ def run_post_hoc_ground_truth(
 def run_batch_post_hoc_evaluation(
     dates_csv_str: str,
     radius_km: int,
-    firms_keys_str: str = "",
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
-        if firms_keys_str and firms_keys_str.strip():
-            CONFIG["FIRMS_MAP_KEY"] = firms_keys_str.strip()
-            CONFIG["FIRMS_MAP_KEYS"] = firms_keys_str.strip()
-
         raw_parts = [p.strip()[:10] for p in str(dates_csv_str or "").replace("\n", ",").split(",") if p.strip()]
         days: List[Any] = []
         for p in raw_parts:
@@ -1021,14 +1011,6 @@ def build_app() -> gr.Blocks:
                     gt_lon_in = gr.Number(value=-4.65, label="Local Check Longitude")
                     gt_loc_rad_in = gr.Slider(minimum=5, maximum=150, step=5, value=50, label="Local Coordinate Check Radius (km)")
 
-                with gr.Row():
-                    gt_firms_keys_in = gr.Textbox(
-                        value=CONFIG.get("FIRMS_MAP_KEY", ""),
-                        label="NASA FIRMS API Key Pool (Enter 1, 2, or 3 keys separated by comma; auto-failover/rotation on quota/limit)",
-                        placeholder="e.g. key1, key2, key3",
-                        scale=3,
-                    )
-
                 run_gt_btn = gr.Button("Fetch Actual Detections (1d & 7d) and Compute Reliability & Lift", variant="primary")
                 gt_status_out = gr.Textbox(label="Probabilistic Calibration & Risk Stratification Summary", lines=13, interactive=False)
 
@@ -1066,12 +1048,12 @@ def build_app() -> gr.Blocks:
 
                 run_gt_btn.click(
                     fn=run_post_hoc_ground_truth,
-                    inputs=[gt_date_in, gt_model_in, gt_radius_in, gt_lat_in, gt_lon_in, gt_loc_rad_in, gt_firms_keys_in],
+                    inputs=[gt_date_in, gt_model_in, gt_radius_in, gt_lat_in, gt_lon_in, gt_loc_rad_in],
                     outputs=[gt_map_out, gt_rel_table_out, gt_models_table_out, gt_radii_table_out, gt_local_table_out, gt_status_out],
                 )
                 run_batch_gt_btn.click(
                     fn=run_batch_post_hoc_evaluation,
-                    inputs=[batch_dates_in, batch_rad_in, gt_firms_keys_in],
+                    inputs=[batch_dates_in, batch_rad_in],
                     outputs=[batch_agg_table_out, batch_daily_table_out, batch_gt_status_out],
                 )
 
