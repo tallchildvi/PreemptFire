@@ -25,6 +25,17 @@ from make_map import (
 from mini_dataset_store import MiniDatasetStore
 from model_registry import COLORS, LEVELS, MODEL_CATALOG, ModelRegistry
 
+try:
+    import spaces
+    GPU = spaces.GPU
+except Exception:
+    def GPU(func=None, **kwargs):
+        if func is not None:
+            return func
+        def dec(f):
+            return f
+        return dec
+
 _GRID_CACHE: Dict[str, Dict[str, Any]] = {}
 
 
@@ -50,18 +61,6 @@ def _model_choices() -> List[Tuple[str, str]]:
         status_tag = "ready" if avail else "weights missing"
         choices.append((f"[{status_tag}] {k}: {info['label']}", k))
     return choices
-
-
-try:
-    import spaces
-    GPU = spaces.GPU
-except Exception:
-    def GPU(func=None, **kwargs):
-        if func is not None:
-            return func
-        def dec(f):
-            return f
-        return dec
 
 
 @GPU
