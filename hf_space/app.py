@@ -70,8 +70,15 @@ def _model_choices() -> List[Tuple[str, str]]:
     return choices
 
 
+def _parse_day(date_str: str):
+    s = str(date_str or "").strip()[:10]
+    if not s:
+        s = "2025-08-12"
+    return datetime.strptime(s, "%Y-%m-%d").date()
+
+
 @GPU
-def gpu_predict(
+def _gpu_predict_torch(
     reg: ModelRegistry,
     model_name: str,
     tab_1d: np.ndarray,
@@ -98,6 +105,47 @@ def gpu_predict(
     )
 
 
+def gpu_predict(
+    reg: ModelRegistry,
+    model_name: str,
+    tab_1d: np.ndarray,
+    hist_tab: np.ndarray,
+    clim_feats: np.ndarray,
+    seq: Optional[np.ndarray],
+    static_1d: Optional[np.ndarray],
+    pts_ll: Optional[np.ndarray],
+    ft_2d: Optional[np.ndarray],
+    emb32_2d: Optional[np.ndarray],
+    mask: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    if model_name in ("nn_ts", "stack_all"):
+        return _gpu_predict_torch(
+            reg=reg,
+            model_name=model_name,
+            tab_1d=tab_1d,
+            hist_tab=hist_tab,
+            clim_feats=clim_feats,
+            seq=seq,
+            static_1d=static_1d,
+            pts_ll=pts_ll,
+            ft_2d=ft_2d,
+            emb32_2d=emb32_2d,
+            mask=mask,
+        )
+    return reg.predict_model(
+        model_name=model_name,
+        TAB_1D=tab_1d,
+        HIST_TAB=hist_tab,
+        CLIM_FEATS=clim_feats,
+        SEQ=seq,
+        STATIC_1D=static_1d,
+        pts_lat_lon=pts_ll,
+        FT_2D=ft_2d,
+        EMB32_2D=emb32_2d,
+        has_2d_mask=mask,
+    )
+
+
 def run_iberia_map_and_compare(
     date_str: str,
     model_a: str,
@@ -109,7 +157,7 @@ def run_iberia_map_and_compare(
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
-        day = datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d").date()
+        day = _parse_day(date_str)
         reg, store = _get_registry_and_store()
         pts_path = _find_points_csv()
         pts, meta_df = load_points(pts_path)
@@ -340,11 +388,12 @@ def run_single_point_analysis(
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
+        day_parsed = _parse_day(date_str)
         progress(0.05, desc="[Step 1/6] Starting single-location pipeline...")
         res = score_single_location(
             lat=float(lat),
             lon=float(lon),
-            target_day_str=str(date_str).strip()[:10],
+            target_day_str=day_parsed.isoformat(),
             models=["all"],
             collect_2d=bool(collect_2d),
             save_to_mini_dataset=True,
@@ -418,7 +467,7 @@ def run_post_hoc_ground_truth(
     progress=gr.Progress(track_tqdm=False),
 ):
     try:
-        day = datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d").date()
+        day = _parse_day(date_str)
         r_km = int(radius_km)
         reg, store = _get_registry_and_store()
         pts_path = _find_points_csv()

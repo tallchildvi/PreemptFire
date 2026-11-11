@@ -44,12 +44,34 @@ MAX_INVALID_RATIO = 0.20
 MIN_DEM_VALID_RATIO = 0.98
 
 
-def _make_session() -> requests.Session:
+import threading
+
+_WEATHER_LOCK = threading.Lock()
+
+
+def _make_session(retry_429: bool = True) -> requests.Session:
     s = requests.Session()
-    retries = Retry(total=4, backoff_factor=1.0, status_forcelist=[429, 500, 502, 503, 504])
+    codes = [429, 500, 502, 503, 504] if retry_429 else [500, 502, 503, 504]
+    retries = Retry(total=3, backoff_factor=0.6, status_forcelist=codes)
     s.mount("https://", HTTPAdapter(max_retries=retries))
     s.mount("http://", HTTPAdapter(max_retries=retries))
     return s
+
+
+def _open_meteo_urls_for_date(weather_day: date) -> List[str]:
+    days_ago = (date.today() - weather_day).days
+    if days_ago < 5:
+        return [
+            "https://api.open-meteo.com/v1/forecast",
+            "https://historical-forecast-api.open-meteo.com/v1/forecast",
+            "https://archive-api.open-meteo.com/v1/archive",
+        ]
+    if weather_day.year >= 2021:
+        return [
+            "https://archive-api.open-meteo.com/v1/archive",
+            "https://historical-forecast-api.open-meteo.com/v1/forecast",
+        ]
+    return ["https://archive-api.open-meteo.com/v1/archive"]
 
 
 # 1. WEATHER COLLECTOR (Open-Meteo Single & Batched Multi-Point)
@@ -162,38 +184,86 @@ def _parse_open_meteo_payload(
 
 
 def fetch_weather(lat: float, lon: float, weather_day: date, t0_date: date, rain_mm: float = 1.5) -> Dict[str, float]:
-    """Fetches 60-day Open-Meteo weather for a single point (matches WeatherFetcher)."""
-    start = weather_day - timedelta(days=60)
-    recent = (date.today() - weather_day).days < 5
-    url = "https://api.open-meteo.com/v1/forecast" if recent else "https://archive-api.open-meteo.com/v1/archive"
+    """Fetches Open-Meteo weather for a single point with instant multi-endpoint failover."""
+    lookback_days = max(31, min(60, (weather_day - t0_date).days + 2))
+    start = weather_day - timedelta(days=lookback_days)
     params = {
         "latitude": round(float(lat), 4),
         "longitude": round(float(lon), 4),
         "start_date": start.isoformat(),
         "end_date": weather_day.isoformat(),
-        "hourly": HOURLY_VARS,
-        "daily": ["precipitation_sum"],
+        "hourly": ",".join(HOURLY_VARS),
+        "daily": "precipitation_sum",
         "timezone": "UTC",
     }
-    sess = _make_session()
-    r = sess.get(url, params=params, timeout=40)
-    if r.status_code != 200 and not recent:
-        # Fallback to forecast API if archive doesn't cover the date yet
-        r = sess.get("https://api.open-meteo.com/v1/forecast", params=params, timeout=40)
-    r.raise_for_status()
-    return _parse_open_meteo_payload(r.json(), weather_day, t0_date, rain_mm=rain_mm)
+    sess = _make_session(retry_429=False)
+    last_err = None
+    for url in _open_meteo_urls_for_date(weather_day):
+        try:
+            r = sess.get(url, params=params, timeout=25)
+            if r.status_code == 429:
+                continue
+            r.raise_for_status()
+            return _parse_open_meteo_payload(r.json(), weather_day, t0_date, rain_mm=rain_mm)
+        except Exception as e:
+            last_err = e
+    raise RuntimeError(f"Open-Meteo single-point weather fetch failed: {last_err}")
+
+
+def _interpolate_weather_idw(
+    pts: pd.DataFrame,
+    cell_coords: List[Tuple[float, float]],
+    cell_dicts: List[Dict[str, float]],
+    k: int = 4,
+) -> List[Dict[str, float]]:
+    """Interpolates synoptic weather dictionaries from grid cells to target points via spherical KDTree IDW."""
+    if len(cell_dicts) == 1:
+        return [dict(cell_dicts[0]) for _ in range(len(pts))]
+
+    c_lats = np.array([c[0] for c in cell_coords], dtype=np.float64)
+    c_lons = np.array([c[1] for c in cell_coords], dtype=np.float64)
+    tree = cKDTree(to_xyz(c_lats, c_lons))
+    p_xyz = to_xyz(pts["lat"].values, pts["lon"].values)
+    k_use = min(k, len(cell_dicts))
+    dists, idxs = tree.query(p_xyz, k=k_use)
+    if k_use == 1:
+        dists = dists[:, None]
+        idxs = idxs[:, None]
+
+    weights = 1.0 / np.maximum(dists, 1e-5) ** 2
+    weights /= weights.sum(axis=1, keepdims=True)
+
+    feat_keys = [fk for fk in cell_dicts[0].keys() if fk != "target_wind_direction_mean"]
+    mat = np.array([[d.get(fk, 0.0) for fk in feat_keys] for d in cell_dicts], dtype=np.float32)
+    wdirs = np.radians(np.array([d.get("target_wind_direction_mean", 0.0) for d in cell_dicts], dtype=np.float32))
+    w_sin = np.sin(wdirs)
+    w_cos = np.cos(wdirs)
+
+    interp_mat = np.einsum("ij,ijk->ik", weights, mat[idxs])
+    interp_sin = np.sum(weights * w_sin[idxs], axis=1)
+    interp_cos = np.sum(weights * w_cos[idxs], axis=1)
+    interp_wdir = (np.degrees(np.arctan2(interp_sin, interp_cos)) + 360.0) % 360.0
+
+    out_list: List[Dict[str, float]] = []
+    for i in range(len(pts)):
+        row_d = {fk: float(interp_mat[i, j]) for j, fk in enumerate(feat_keys)}
+        row_d["target_wind_direction_mean"] = float(interp_wdir[i])
+        out_list.append(row_d)
+    return out_list
 
 
 def fetch_weather_cells(
     pts: pd.DataFrame,
     day: date,
     gap: int = 3,
-    cell: float = 0.25,
-    batch_size: int = 25,
+    cell: float = 0.5,
+    batch_size: int = 50,
     use_cache: bool = True,
     progress_cb=None,
 ) -> Tuple[List[Dict[str, float]], int]:
-    """Batched Open-Meteo weather fetcher over 0.25-deg cells with disk caching and live step progress."""
+    """Batched Open-Meteo weather fetcher over synoptic cells with multi-endpoint failover,
+    disk caching, and spherical KDTree IDW interpolation.
+    """
     wd = day - timedelta(days=1)
     t0 = wd - timedelta(days=gap)
     key = (
@@ -204,115 +274,114 @@ def fetch_weather_cells(
     unique_keys = list(dict.fromkeys(key))
     cells = {k: (float(k.split("_")[0]), float(k.split("_")[1])) for k in unique_keys}
 
-    cache_dir = Path(CONFIG["MINI_DATASET_DIR"]) / "weather_cache"
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    cache_file = cache_dir / f"weather_cells_{wd.isoformat()}_gap{gap}_c{cell}.json"
+    cache_dirs = [
+        Path(CONFIG["MINI_DATASET_DIR"]) / "weather_cache",
+        Path(__file__).resolve().parent / "weather_cache",
+        Path(__file__).resolve().parent / "data" / "weather_cache",
+    ]
+    cache_dirs[0].mkdir(parents=True, exist_ok=True)
+    cache_file = cache_dirs[0] / f"weather_cells_{wd.isoformat()}_gap{gap}_c{cell}.json"
 
-    res: Dict[str, Optional[Dict[str, float]]] = {}
-    if use_cache and cache_file.exists():
-        try:
-            cached = json.loads(cache_file.read_text(encoding="utf-8"))
-            for k in unique_keys:
-                if k in cached and cached[k] is not None:
-                    res[k] = cached[k]
-        except Exception:
-            pass
+    with _WEATHER_LOCK:
+        res: Dict[str, Optional[Dict[str, float]]] = {}
+        if use_cache:
+            for cdir in cache_dirs:
+                for cand_cell in (cell, 0.25, 0.5):
+                    cf = cdir / f"weather_cells_{wd.isoformat()}_gap{gap}_c{cand_cell}.json"
+                    if cf.exists():
+                        try:
+                            cached = json.loads(cf.read_text(encoding="utf-8"))
+                            if cand_cell == cell:
+                                for k in unique_keys:
+                                    if k in cached and cached[k] is not None:
+                                        res[k] = cached[k]
+                            elif len(cached) >= 50:
+                                c_coords = [(float(ck.split("_")[0]), float(ck.split("_")[1])) for ck, cv in cached.items() if cv is not None]
+                                c_dicts = [cv for cv in cached.values() if cv is not None]
+                                if progress_cb:
+                                    progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(c_dicts)} cells).")
+                                return _interpolate_weather_idw(pts, c_coords, c_dicts), len(c_dicts)
+                        except Exception:
+                            pass
 
-    missing_keys = [k for k in unique_keys if k not in res]
-    if missing_keys:
-        start = wd - timedelta(days=60)
-        recent = (date.today() - wd).days < 5
-        url = "https://api.open-meteo.com/v1/forecast" if recent else "https://archive-api.open-meteo.com/v1/archive"
-        batches = [missing_keys[s : s + batch_size] for s in range(0, len(missing_keys), batch_size)]
-        n_batches = len(batches)
+        missing_keys = [k for k in unique_keys if k not in res]
+        if missing_keys:
+            lookback_days = max(31, min(60, gap + 2))
+            start = wd - timedelta(days=lookback_days)
+            candidate_urls = _open_meteo_urls_for_date(wd)
+            throttled_urls: set = set()
+            batches = [missing_keys[s : s + batch_size] for s in range(0, len(missing_keys), batch_size)]
+            n_batches = len(batches)
+            sess = _make_session(retry_429=False)
 
-        def _fetch_batch(b_idx_and_keys):
-            b_idx, b_keys = b_idx_and_keys
-            sess = _make_session()
-            lats = ",".join(str(round(cells[k][0], 4)) for k in b_keys)
-            lons = ",".join(str(round(cells[k][1], 4)) for k in b_keys)
-            params = {
-                "latitude": lats,
-                "longitude": lons,
-                "start_date": start.isoformat(),
-                "end_date": wd.isoformat(),
-                "hourly": ",".join(HOURLY_VARS),
-                "daily": "precipitation_sum",
-                "timezone": "UTC",
-            }
-            out_chunk: Dict[str, Optional[Dict[str, float]]] = {}
-            for attempt in range(3):
-                try:
-                    r = sess.get(url, params=params, timeout=45)
-                    if r.status_code == 429:
-                        time.sleep(2 + 2 * attempt)
+            if progress_cb:
+                progress_cb(
+                    0.05,
+                    f"[Step 1/5] Open-Meteo ERA5 weather: fetching {n_batches} batches ({len(missing_keys)} synoptic cells)...",
+                )
+
+            done_cells = len(unique_keys) - len(missing_keys)
+            for b_idx, b_keys in enumerate(batches):
+                lats = ",".join(str(round(cells[k][0], 4)) for k in b_keys)
+                lons = ",".join(str(round(cells[k][1], 4)) for k in b_keys)
+                params = {
+                    "latitude": lats,
+                    "longitude": lons,
+                    "start_date": start.isoformat(),
+                    "end_date": wd.isoformat(),
+                    "hourly": ",".join(HOURLY_VARS),
+                    "daily": "precipitation_sum",
+                    "timezone": "UTC",
+                }
+                urls_to_try = [u for u in candidate_urls if u not in throttled_urls] or list(candidate_urls)
+                for url in urls_to_try:
+                    try:
+                        r = sess.get(url, params=params, timeout=30)
+                        if r.status_code == 429:
+                            throttled_urls.add(url)
+                            continue
+                        r.raise_for_status()
+                        payload = r.json()
+                        items = payload if isinstance(payload, list) else [payload]
+                        if len(items) == len(b_keys):
+                            for k, item in zip(b_keys, items):
+                                try:
+                                    res[k] = _parse_open_meteo_payload(item, wd, t0)
+                                except Exception:
+                                    res[k] = None
+                            break
+                    except Exception:
                         continue
-                    r.raise_for_status()
-                    payload = r.json()
-                    items = payload if isinstance(payload, list) else [payload]
-                    if len(items) == len(b_keys):
-                        for k, item in zip(b_keys, items):
-                            try:
-                                out_chunk[k] = _parse_open_meteo_payload(item, wd, t0)
-                            except Exception:
-                                out_chunk[k] = None
-                        return b_idx, out_chunk
-                except Exception:
-                    time.sleep(1 + attempt)
 
-            for k in b_keys:
-                la, lo = cells[k]
-                try:
-                    out_chunk[k] = fetch_weather(la, lo, wd, t0)
-                except Exception:
-                    out_chunk[k] = None
-            return b_idx, out_chunk
-
-        done_batches = 0
-        done_cells = len(unique_keys) - len(missing_keys)
-        if progress_cb:
-            progress_cb(
-                0.05,
-                f"[Step 1/5] Open-Meteo ERA5 weather: starting {n_batches} batches ({len(missing_keys)} cells to fetch)...",
-            )
-
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            futures = [pool.submit(_fetch_batch, (i, b)) for i, b in enumerate(batches)]
-            for fut in as_completed(futures):
-                b_idx, chunk_res = fut.result()
-                res.update(chunk_res)
-                done_batches += 1
-                done_cells += len(chunk_res)
+                done_batches = b_idx + 1
+                done_cells += len(b_keys)
                 frac = 0.05 + 0.30 * (done_batches / max(n_batches, 1))
                 msg = (
                     f"[Step 1/5] Open-Meteo ERA5 weather: batch {done_batches}/{n_batches} complete "
-                    f"({done_cells}/{len(unique_keys)} cells fetched)"
+                    f"({done_cells}/{len(unique_keys)} synoptic cells fetched)"
                 )
                 print(f"  {msg}")
                 if progress_cb:
                     progress_cb(frac, msg)
 
-        if use_cache:
-            try:
-                valid_to_save = {k: v for k, v in res.items() if v is not None}
-                if valid_to_save:
-                    cache_file.write_text(json.dumps(valid_to_save), encoding="utf-8")
-            except Exception:
-                pass
-    else:
-        if progress_cb:
-            progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(unique_keys)} cells).")
+            if use_cache:
+                try:
+                    valid_to_save = {k: v for k, v in res.items() if v is not None}
+                    if valid_to_save:
+                        cache_file.write_text(json.dumps(valid_to_save), encoding="utf-8")
+                except Exception:
+                    pass
+        else:
+            if progress_cb:
+                progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(unique_keys)} cells).")
 
-    bad = [k for k in unique_keys if res.get(k) is None]
-    ok = [k for k in unique_keys if res.get(k) is not None]
-    if not ok:
-        raise RuntimeError("All Open-Meteo weather cells failed; check network connection.")
-    for k in bad:
-        la, lo = cells[k]
-        nearest = min(ok, key=lambda q: (cells[q][0] - la) ** 2 + (cells[q][1] - lo) ** 2)
-        res[k] = res[nearest]
+    ok_keys = [k for k in unique_keys if res.get(k) is not None]
+    if not ok_keys:
+        raise RuntimeError("Open-Meteo weather fetch failed across all endpoints; check network or try again in 60s.")
 
-    return [res[k] for k in key], len(cells)
+    c_coords = [cells[k] for k in ok_keys]
+    c_dicts = [res[k] for k in ok_keys]  # type: ignore[misc]
+    return _interpolate_weather_idw(pts, c_coords, c_dicts), len(ok_keys)
 
 
 # 2. LAST SENTINEL-2 PASS (STAC metadata only, for 1D single-point scoring)
