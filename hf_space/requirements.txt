@@ -1,5 +1,7 @@
 gradio>=4.44.0,<5.0.0
 huggingface-hub<1.0.0
+pydantic>=2.8.0,<2.10.0
+fastapi<0.115.0
 numpy>=1.26.0,<2.0.0
 pandas>=2.1.0
 scipy>=1.11.0
