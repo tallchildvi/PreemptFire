@@ -1,5 +1,6 @@
 # PreemptFire: Multimodal GeoAI for Wildfire Susceptibility Forecasting
 
+[![Kaggle Dataset](https://img.shields.io/badge/Kaggle-Dataset%20(100m)-%2320BEFF.svg?style=flat&logo=kaggle&logoColor=white)](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)
 [![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces%20Demo-%23FFD21E.svg?style=flat&logo=huggingface&logoColor=black)](https://huggingface.co/spaces/tallchildvi/PreemptFire)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10 | 3.11](https://img.shields.io/badge/Python-3.10%20%7C%203.11-%233776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
@@ -23,13 +24,69 @@
 
 ---
 
-## Interactive Demonstration
+## Primary Project Resources
 
-The full multi-model forecasting pipeline and benchmarking suite is deployed on Hugging Face Spaces:
-- Application URL: [https://huggingface.co/spaces/tallchildvi/PreemptFire](https://huggingface.co/spaces/tallchildvi/PreemptFire)
-- Direct Mirror: [https://tallchildvi-preemptfire.hf.space](https://tallchildvi-preemptfire.hf.space)
+- **Benchmark Dataset on Kaggle:** [https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)
+- **Interactive Hugging Face Space:** [https://huggingface.co/spaces/tallchildvi/PreemptFire](https://huggingface.co/spaces/tallchildvi/PreemptFire)
+- **Direct Web Mirror:** [https://tallchildvi-preemptfire.hf.space](https://tallchildvi-preemptfire.hf.space)
 
-The space provides synoptic risk mapping across 3,146 regional nodes over the Iberian Peninsula, side-by-side model comparison, 33-channel multimodal raster inspection, and independent post-hoc verification against live NASA FIRMS VIIRS ground-truth satellite detections.
+---
+
+## Benchmark Dataset: PreemptFire-100m
+
+A core deliverable and milestone of this project is the creation and publication of **PreemptFire-100m**, an open-access multimodal benchmark dataset hosted on Kaggle:  
+[https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)
+
+PreemptFire-100m is constructed using the modular data engineering pipeline in `src/data_pipeline/`. It is specifically designed for spatiotemporal wildfire ignition susceptibility forecasting at $t+1$ day lead time. 
+
+### Key Architectural Characteristics
+
+1. **Decoupled, Leakage-Free Design:**  
+   Unlike conventional wildfire datasets that embed active fire perimeters directly into training imagery (inducing severe target leakage), spatial scenes in PreemptFire-100m contain raw multi-sensor observation tensors without embedded labels. Active fire occurrences are decoupled into an independent NASA FIRMS VIIRS ground-truth registry. This allows researchers to formulate dynamic evaluation targets across multiple spatial radii ($R \in \{5, 10, 25, 50\}\text{ km}$) without data leakage.
+
+2. **File Organization:**
+   - `metadata.csv`: Tabular index of all scene footprints, geographic coordinates, acquisition dates, and spatial partition folds.
+   - `schema.json`: Machine-readable definitions of tensor channels, physical units, 1D context variables, and categorical masks.
+   - `firms_points_2017_2025.csv.gz`: Spatially and temporally filtered NASA FIRMS VIIRS 375m active fire detections across the Iberian Peninsula (2017–2025).
+   - `firms_covered_days.csv`: Binary temporal mask validating continuous satellite observation coverage.
+   - `scenes/*.npz`: Standalone compressed NumPy archives containing aligned observation tensors for each spatial footprint.
+
+3. **2D Spatial Observation Tensor (`X_2d`, Shape: `(22, 128, 128)`):**  
+   Each scene covers a $12.8 \times 12.8\text{ km}$ footprint at a uniform spatial resolution of $100\text{ m}$ per pixel:
+
+   | Channel Index | Channel Name | Source Platform | Physical Scale / Units | Description |
+   |:---:|:---|:---|:---|:---|
+   | 0 | `B02` | Sentinel-2 L2A | Surface Reflectance | Blue band ($490\text{ nm}$) |
+   | 1 | `B03` | Sentinel-2 L2A | Surface Reflectance | Green band ($560\text{ nm}$) |
+   | 2 | `B04` | Sentinel-2 L2A | Surface Reflectance | Red band ($665\text{ nm}$) |
+   | 3 | `B05` | Sentinel-2 L2A | Surface Reflectance | Vegetation Red Edge 1 ($705\text{ nm}$) |
+   | 4 | `B06` | Sentinel-2 L2A | Surface Reflectance | Vegetation Red Edge 2 ($740\text{ nm}$) |
+   | 5 | `B07` | Sentinel-2 L2A | Surface Reflectance | Vegetation Red Edge 3 ($783\text{ nm}$) |
+   | 6 | `B08` | Sentinel-2 L2A | Surface Reflectance | Broad Near-Infrared (NIR) ($842\text{ nm}$) |
+   | 7 | `B8A` | Sentinel-2 L2A | Surface Reflectance | Narrow Near-Infrared (NIR) ($865\text{ nm}$) |
+   | 8 | `B11` | Sentinel-2 L2A | Surface Reflectance | Short-Wave Infrared 1 (SWIR-1) ($1610\text{ nm}$) |
+   | 9 | `B12` | Sentinel-2 L2A | Surface Reflectance | Short-Wave Infrared 2 (SWIR-2) ($2190\text{ nm}$) |
+   | 10 | `SAR_VV` | Sentinel-1 GRD | Calibrated Power / dB | Vertical-transmit / vertical-receive radar backscatter |
+   | 11 | `SAR_VH` | Sentinel-1 GRD | Calibrated Power / dB | Vertical-transmit / horizontal-receive radar backscatter |
+   | 12 | `Elevation` | Copernicus DEM GLO-30 | Meters ($\text{m}$) | Digital elevation above sea level |
+   | 13 | `Slope` | Copernicus DEM GLO-30 | Degrees ($^\circ$) | Local terrain slope gradient |
+   | 14 | `Northness` | Copernicus DEM GLO-30 | Vector $[-1.0, 1.0]$ | Topographic aspect: $\cos(\text{aspect}) \times \sin(\text{slope})$ |
+   | 15 | `Eastness` | Copernicus DEM GLO-30 | Vector $[-1.0, 1.0]$ | Topographic aspect: $\sin(\text{aspect}) \times \sin(\text{slope})$ |
+   | 16 | `Travel_Time_Roads` | OSM + Tobler's Function | Hours ($\text{h}$) | Pedestrian travel time friction surface to primary/secondary roads |
+   | 17 | `Travel_Time_Trails` | OSM + Tobler's Function | Hours ($\text{h}$) | Pedestrian travel time friction surface to marked trails/paths |
+   | 18 | `Dist_to_Railways` | OpenStreetMap | Meters ($\text{m}$) | Euclidean distance transform to operational railway tracks |
+   | 19 | `Dist_to_Camps` | OpenStreetMap | Meters ($\text{m}$) | Euclidean distance transform to campsites and recreational grounds |
+   | 20 | `Dist_to_Powerlines` | OpenStreetMap | Meters ($\text{m}$) | Euclidean distance transform to electrical transmission lines |
+   | 21 | `Soil_Moisture` | ERA5-Land (ECMWF) | $\text{m}^3/\text{m}^3$ | Topsoil volumetric water content (layer 1: $0\text{--}7\text{ cm}$) |
+
+4. **Categorical Quality Mask (`scl`, Shape: `(128, 128)`):**  
+   Contains the native Sentinel-2 Scene Classification Layer (`uint8`, classes 0–11) to enable rigorous masking of clouds, cloud shadows, snow, and water bodies.
+
+5. **1D Environmental & Meteorological Context (`context_1d`):**  
+   35 aligned numerical features capturing antecedent weather conditions, drought memory, atmospheric vapor deficit, wind vectors, and local demographic density (WorldPop $\log(1+p)$ at $10\text{ km}$ and $50\text{ km}$).
+
+6. **Reproducible Generation Pipeline:**  
+   The dataset can be generated or extended directly via `src/data_pipeline/generate_dataset.py`, which coordinates multi-worker extraction with SQLite checkpointing (`scenes_tracker`) and automatic resumption upon network interruption.
 
 ---
 
@@ -166,6 +223,24 @@ A core scientific finding demonstrated in this repository is the limitation of r
 
 ---
 
+## Interactive Demonstration on Hugging Face Spaces
+
+The live Gradio web application is hosted on Hugging Face Spaces:  
+[https://huggingface.co/spaces/tallchildvi/PreemptFire](https://huggingface.co/spaces/tallchildvi/PreemptFire)
+
+The application provides four dedicated operational tabs:
+
+1. **Iberia Grid Map and Model Comparison:**  
+   Interactive visualization over all 3,146 Iberian evaluation nodes. Computes daily risk distributions, categorical tiers (Low, Medium, High), probability difference surfaces ($\Delta P$), and inter-model Pearson correlation coefficients. Includes batched Open-Meteo ERA5 ingestion with multi-endpoint failover and spatial KDTree IDW interpolation.
+2. **Single Point Deep Dive:**  
+   Multimodal spatial inspector for any coordinate pair in Iberia. Renders 33-channel spatial rasters (RGB optical, NIR/SWIR false color, SAR polarizations, DEM terrain vectors, OSM road/trail travel times, soil moisture), inspects the 35-variable 1D meteorological context vector, and plots Negative Binomial count distributions for expected fire events.
+3. **Model Evaluation & Benchmark Leaderboard:**  
+   Presents out-of-fold validation metrics across all models (ROC-AUC, PR-AUC, Brier score, tier reliability, empirical lift), confusion matrices, and feature importance rankings.
+4. **Post-Hoc Ground-Truth Verification:**  
+   Performs independent validation against actual NASA FIRMS VIIRS satellite detections for any historical target date, calculating tier hit rates, empirical lift, and discrimination power.
+
+---
+
 ## Repository Structure
 
 ```text
@@ -182,12 +257,13 @@ PreemptFire/
 |   `-- requirements.txt                # Deployment dependencies for Gradio Space
 |-- src/
 |   |-- config.py                       # Global grid parameters (128x128 px @ 100m)
-|   |-- data_pipeline/                  # Offline data extraction engines
+|   |-- data_pipeline/                  # Offline data extraction engines (Kaggle dataset generator)
 |   |   |-- single_scene_collector.py   # Multi-sensor collector (Sentinel 1/2, DEM, OSM, Weather)
 |   |   |-- sentinel_fetcher.py         # STAC client for Sentinel-2 L2A & Sentinel-1 SAR
 |   |   |-- osm_dem_fetcher.py          # Topography and OSM travel-time friction surfaces
 |   |   |-- weather_fetcher.py          # Open-Meteo ERA5 historical reanalysis parser
 |   |   |-- population_fetcher.py       # Demographic density extractor (WorldPop)
+|   |   |-- hdf5_writer.py              # Sharded tensor writer
 |   |   `-- generate_dataset.py         # Multi-worker shard generator with SQLite tracking
 |   |-- modeling/                       # Model training and offline evaluation
 |   |   |-- train_catboost.py           # CatBoost baseline training scripts
