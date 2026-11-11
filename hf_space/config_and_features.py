@@ -1,43 +1,42 @@
-"""Core configuration and exact feature engineering routines for PreemptFire.
-
-Unifies the 1D context, 30-day FIRMS history, multi-year FIRMS climatology,
-30-day sequence tensor (for nn_ts), 202-dim 2D image statistics (for tab_full),
-and 33-channel tensor + SimCLR 32-dim PCA embedding (for tab_ssl_full).
-Matches `preemptfire-v5_(2).ipynb` and the `approach_b` repository branch 1-to-1.
-"""
+"""Feature definitions and transformation routines for PreemptFire."""
 from __future__ import annotations
 
-from datetime import date, timedelta
+import math
 import os
+from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 import pandas as pd
+from scipy.optimize import minimize_scalar
 from scipy.spatial import cKDTree
+from scipy.stats import nbinom
 
 BASE_DIR = Path(__file__).resolve().parent
 
-CONFIG = {
-    "FIRMS_MAP_KEY": os.getenv("FIRMS_MAP_KEY", os.getenv("FIRMS_API_KEY_1", "")),
+CONFIG: Dict[str, Any] = {
+    "FIRMS_MAP_KEY": os.getenv("FIRMS_MAP_KEY", ""),
     "GEE_PROJECT": os.getenv("GEE_PROJECT", ""),
     "GEE_SERVICE_ACCOUNT": os.getenv("GEE_SERVICE_ACCOUNT", ""),
     "GEE_KEY_FILE": os.getenv("GEE_KEY_FILE", ""),
-    "HF_TOKEN": os.getenv("HF_TOKEN", ""),
-    "HF_DATASET_REPO": os.getenv("HF_DATASET_REPO", ""),
+    "FIRMS_HISTORY": os.getenv("PF_FIRMS_HISTORY", str(BASE_DIR / "firms_points_2017_2025.csv.gz")),
+    "FIRMS_COVERED": os.getenv("PF_FIRMS_COVERED", str(BASE_DIR / "firms_covered_days.csv")),
+    "HISTORICAL_FIRMS_CSV": os.getenv("PF_FIRMS_HISTORY", str(BASE_DIR / "firms_points_2017_2025.csv.gz")),
+    "HISTORICAL_COVERED_CSV": os.getenv("PF_FIRMS_COVERED", str(BASE_DIR / "firms_covered_days.csv")),
+    "POPULATION_CACHE_CSV": os.getenv("PF_POPULATION_CACHE", str(BASE_DIR / "population_cache.csv")),
+    "POPULATION_CACHE": os.getenv("PF_POPULATION_CACHE", str(BASE_DIR / "population_cache.csv")),
+    "WEATHER_GAP_DAYS": int(os.getenv("PF_WEATHER_GAP_DAYS", "10")),
+    "HISTORY_DAYS": int(os.getenv("PF_HISTORY_DAYS", "30")),
+    "CLIM_WINDOW_DAYS": int(os.getenv("PF_CLIM_WINDOW_DAYS", "15")),
     "MODEL_DIR": os.getenv("PF_MODEL_DIR", str(BASE_DIR / "models")),
-    "DATA_DIR": os.getenv("PF_DATA_DIR", str(BASE_DIR / "data")),
     "MINI_DATASET_DIR": os.getenv("PF_MINI_DATASET_DIR", str(BASE_DIR / "mini_dataset")),
-    "FIRMS_HISTORY": os.getenv("PF_FIRMS_HISTORY", str(BASE_DIR / "data" / "firms_points_2017_2025.csv.gz")),
-    "FIRMS_COVERED": os.getenv("PF_FIRMS_COVERED", str(BASE_DIR / "data" / "firms_covered_days.csv")),
-    "METADATA_CSV": os.getenv("PF_METADATA_CSV", str(BASE_DIR / "data" / "metadata.csv")),
-    "OOF_CSV": os.getenv("PF_OOF_CSV", str(BASE_DIR / "data" / "oof_predictions.csv")),
-    "COUNT_METRICS_CSV": os.getenv("PF_COUNT_METRICS_CSV", str(BASE_DIR / "data" / "count_metrics.csv")),
-    "POPULATION_CACHE": os.getenv("PF_POPULATION_CACHE", str(BASE_DIR / "data" / "population_cache.csv")),
 }
 
 IBERIA_BBOX = "-9.5,35.9,3.4,43.9"  # lon_min,lat_min,lon_max,lat_max
 R_EARTH = 6371.0088
-RADII_KM: Tuple[int, ...] = (5, 10, 25, 50)
+RADII: Tuple[int, ...] = (5, 10, 25, 50)
+RADII_KM: Tuple[int, ...] = RADII
 PRIMARY_R = 50
 HIST_DAYS = 30
 HIST_WINDOWS: Tuple[int, ...] = (1, 3, 7, 14, 30)
@@ -46,7 +45,6 @@ INTERVAL_ALPHA = 0.1
 LEVELS = ["Low", "Medium", "High"]
 COLORS = ["#fee08b", "#f46d43", "#a50026"]
 
-# 22 Canonical 2D channels from PatchExtractor
 CHANNELS_2D: List[str] = [
     "B02", "B03", "B04", "B05", "B06", "B07", "B08", "B8A", "B11", "B12",
     "SAR_VV", "SAR_VH",
@@ -55,37 +53,29 @@ CHANNELS_2D: List[str] = [
     "Dist_to_Railways", "Dist_to_Camps", "Dist_to_Powerlines",
     "Soil_Moisture",
 ]
-S2_NAMES = CHANNELS_2D[:10]
-INDEX_NAMES: List[str] = [
-    "NDVI", "NDMI", "NBR", "NBR2", "EVI",
-    "NDRE", "MSI", "NMDI", "SAR_RATIO", "SAR_RVI",
-]
-ALL_2D_NAMES: List[str] = CHANNELS_2D + INDEX_NAMES
-ALL_TORCH_CH: List[str] = CHANNELS_2D + INDEX_NAMES + ["MASK_WATER"]
-CI = {n: i for i, n in enumerate(CHANNELS_2D)}
 
-# 35 Canonical 1D context features (alphabetical order)
+S2_NAMES = [f"B{b}" for b in ("02", "03", "04", "05", "06", "07", "08", "8A", "11", "12")]
+INDEX_NAMES = ["NDVI", "NBR", "NBR2", "NDWI", "EVI", "NDRE", "NDII", "MSI", "SAR_RATIO", "SAR_RVI"]
+ALL_2D_NAMES = CHANNELS_2D + INDEX_NAMES
+ALL_TORCH_CH = CHANNELS_2D + INDEX_NAMES
+CI = {n: i for i, n in enumerate(ALL_2D_NAMES)}
+
 CONTEXT_1D: List[str] = [
     "days_since_rain",
     "days_since_t0_pass",
     "int1_t0_to_target_precip_sum",
+    "int1_t0_to_target_rh_max",
+    "int1_t0_to_target_rh_mean",
     "int1_t0_to_target_rh_min",
     "int1_t0_to_target_temp_max",
     "int1_t0_to_target_temp_mean",
+    "int1_t0_to_target_temp_min",
+    "int1_t0_to_target_vpd_max",
     "int1_t0_to_target_vpd_mean",
     "int1_t0_to_target_wind_max",
+    "int1_t0_to_target_wind_mean",
     "lookback_30d_precip_sum",
-    "lookback_30d_rh_min",
-    "lookback_30d_temp_max",
-    "lookback_30d_temp_mean",
-    "lookback_30d_vpd_mean",
-    "lookback_30d_wind_max",
     "lookback_7d_precip_sum",
-    "lookback_7d_rh_min",
-    "lookback_7d_temp_max",
-    "lookback_7d_temp_mean",
-    "lookback_7d_vpd_mean",
-    "lookback_7d_wind_max",
     "population_10km_log1p",
     "population_50km_log1p",
     "target_dew_point_mean",
@@ -107,12 +97,17 @@ LOG_COLS = [i for i, c in enumerate(CONTEXT_1D) if "precip" in c or c.startswith
 WIND_COL = CONTEXT_1D.index("target_wind_direction_mean")
 
 TAB_1D_NAMES: List[str] = CONTEXT_1D + ["wind_dir_cos", "wind_dir_cos2", "doy_sin", "doy_cos"]
-HIST_TAB_NAMES: List[str] = [f"h{w}d_{R}km" for w in HIST_WINDOWS for R in RADII_KM] + ["hist_cov"]
+TAB_1D_COL_NAMES: List[str] = TAB_1D_NAMES
+
+HIST_TAB_NAMES: List[str] = [f"h{w}d_{R}km" for w in HIST_WINDOWS for R in RADII] + ["hist_cov"]
+HIST_COL_NAMES: List[str] = HIST_TAB_NAMES
+
 CLIM_NAMES: List[str] = (
-    [f"clim_lograte_{R}km" for R in RADII_KM]
-    + [f"clim_pday_{R}km" for R in RADII_KM]
+    [f"clim_lograte_{R}km" for R in RADII]
+    + [f"clim_pday_{R}km" for R in RADII]
     + ["clim_ncov"]
 )
+CLIM_COL_NAMES: List[str] = CLIM_NAMES
 
 
 def get_ft_names(H: int = 128) -> List[str]:
@@ -129,8 +124,6 @@ FT_NAMES: List[str] = get_ft_names(128)
 TAB_ALL_NAMES: List[str] = TAB_1D_NAMES + FT_NAMES
 
 
-# SPHERICAL GEOMETRY HELPERS
-
 def to_xyz(lat, lon) -> np.ndarray:
     la, lo = np.radians(np.asarray(lat, float)), np.radians(np.asarray(lon, float))
     return np.c_[np.cos(la) * np.cos(lo), np.cos(la) * np.sin(lo), np.sin(la)]
@@ -145,15 +138,11 @@ def circ(a, b):
     return np.minimum(d, 365 - d)
 
 
-# 1D CONTEXT FEATURES (35 raw -> 39 transformed)
-
 def raw_context_vector(ctx: Dict[str, float]) -> np.ndarray:
-    """Extracts the 35 canonical 1D features in exact alphabetical order."""
     return np.array([float(ctx.get(k, 0.0)) for k in CONTEXT_1D], dtype=np.float32)
 
 
 def context_features(ctx: Dict[str, float] | np.ndarray, day: date) -> np.ndarray:
-    """Transforms 35 raw context features into 39 TAB_1D features (exact match to Cell 10)."""
     if isinstance(ctx, dict):
         x = np.array([float(ctx[k]) for k in CONTEXT_1D], dtype=np.float64)
     else:
@@ -171,8 +160,31 @@ def context_features(ctx: Dict[str, float] | np.ndarray, day: date) -> np.ndarra
     ].astype(np.float32)
 
 
+def one_d_features(
+    weather_dict: Dict[str, float] | np.ndarray,
+    pop_10km_log1p: float,
+    pop_50km_log1p: float,
+    weather_day: date,
+    s2_date: Optional[str | date] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    if isinstance(weather_dict, dict):
+        ctx = dict(weather_dict)
+    else:
+        ctx = {k: float(weather_dict[i]) for i, k in enumerate(CONTEXT_1D[: len(weather_dict)])}
+    ctx["population_10km_log1p"] = float(pop_10km_log1p)
+    ctx["population_50km_log1p"] = float(pop_50km_log1p)
+    if s2_date and str(s2_date) != "None":
+        try:
+            s2_d = datetime.strptime(str(s2_date)[:10], "%Y-%m-%d").date()
+            ctx["days_since_t0_pass"] = float(max(1, min(60, (weather_day - s2_d).days)))
+        except Exception:
+            pass
+    raw_1d = raw_context_vector(ctx)
+    tab_1d = context_features(raw_1d, weather_day)
+    return raw_1d, tab_1d
+
+
 def transform_1d_for_nn(x1_raw: np.ndarray) -> np.ndarray:
-    """Transforms (N, 35) raw X1 into (N, 36) for PyTorch neural nets (exact match to Cell 21)."""
     x1 = np.nan_to_num(np.asarray(x1_raw, dtype=np.float32).copy(), nan=0.0, posinf=0.0, neginf=0.0)
     if x1.ndim == 1:
         x1 = x1[None, :]
@@ -182,17 +194,14 @@ def transform_1d_for_nn(x1_raw: np.ndarray) -> np.ndarray:
     return np.column_stack([x1, np.cos(wd)]).astype(np.float32)
 
 
-# 30-DAY FIRE HISTORY (21 tabular features + (30, 5) sequence tensor)
-
 def history_many(
     pts_xyz: np.ndarray,
     fire: pd.DataFrame,
     covered: set,
     day: date,
-    radii: Tuple[int, ...] = RADII_KM,
+    radii: Tuple[int, ...] = RADII,
     H: int = HIST_DAYS,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Computes (X_hist (N, 21), HC (N, H, 4), SEQ (N, H, 5)) for N locations at once."""
+) -> Tuple[np.ndarray, np.ndarray]:
     n = len(pts_xyz)
     HC = np.zeros((n, H, len(radii)), dtype=np.float32)
     obs = np.zeros(H, dtype=np.float32)
@@ -223,9 +232,7 @@ def history_many(
 
     cols = [HC[:, H - w :, ri].sum(1) for w in HIST_WINDOWS if w <= H for ri in range(len(radii))]
     X_hist = np.column_stack(cols + [np.full(n, obs.mean(), dtype=np.float32)]).astype(np.float32)
-    obs_broadcast = np.broadcast_to(obs[None, :, None], (n, H, 1))
-    SEQ = np.concatenate([np.log1p(HC) / 3.0, obs_broadcast], axis=2).astype(np.float32)
-    return X_hist, HC, SEQ
+    return X_hist, HC
 
 
 def history_single(
@@ -234,20 +241,33 @@ def history_single(
     lat: float,
     lon: float,
     day: date,
-    radii: Tuple[int, ...] = RADII_KM,
+    radii: Tuple[int, ...] = RADII,
     H: int = HIST_DAYS,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Single-point wrapper around history_many."""
+) -> Tuple[np.ndarray, np.ndarray]:
     xyz = to_xyz([lat], [lon])
-    X_hist, HC, SEQ = history_many(xyz, fire, covered, day, radii=radii, H=H)
-    return X_hist[0], HC[0], SEQ[0]
+    X_hist, HC = history_many(xyz, fire, covered, day, radii=radii, H=H)
+    return X_hist[0], HC[0]
 
 
-# MULTI-YEAR FIRE CLIMATOLOGY (9 features + rate/pday/ncov)
+def build_seq_and_static(
+    HC: np.ndarray,
+    TAB_1D: np.ndarray,
+    CLIM_FEATS: np.ndarray,
+    H: int = HIST_DAYS,
+) -> Tuple[np.ndarray, np.ndarray]:
+    n = len(TAB_1D)
+    obs = np.ones((n, H, 1), dtype=np.float32)
+    seq = np.concatenate([np.log1p(np.maximum(HC, 0.0)) / 3.0, obs], axis=2).astype(np.float32)
+    if TAB_1D.shape[1] >= 38:
+        st_1d = TAB_1D[:, :38]
+    else:
+        st_1d = TAB_1D
+    clim_cols = 47 - st_1d.shape[1]
+    static_1d = np.hstack([st_1d, CLIM_FEATS[:, :clim_cols]]).astype(np.float32)
+    return seq, static_1d
+
 
 class ClimatologyIndex:
-    """In-memory KDTree index of historical FIRMS detections (2017-2025) for fast queries."""
-
     def __init__(self, hist_path: str | Path, cov_path: Optional[str | Path] = None):
         self.hist_path = Path(hist_path)
         self.cov_path = Path(cov_path) if cov_path else None
@@ -265,7 +285,6 @@ class ClimatologyIndex:
             return self.tree is not None
         self._loaded = True
         if not self.hist_path.exists():
-            # Try fallback uncompressed or compressed variants
             alt_gz = self.hist_path.with_suffix(self.hist_path.suffix + ".gz")
             alt_csv = Path(str(self.hist_path).replace(".csv.gz", ".csv"))
             if alt_gz.exists():
@@ -273,7 +292,6 @@ class ClimatologyIndex:
             elif alt_csv.exists():
                 self.hist_path = alt_csv
             else:
-                print(f"  [Climatology] WARNING: {self.hist_path} not found. Climatology features will use zeros.")
                 return False
 
         hist = pd.read_csv(self.hist_path)
@@ -297,10 +315,9 @@ class ClimatologyIndex:
         self,
         pts_xyz: np.ndarray,
         day: date,
-        radii: Tuple[int, ...] = RADII_KM,
+        radii: Tuple[int, ...] = RADII,
         window: int = CLIM_WINDOW,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
-        """Returns (X_clim (N, 9), rate (N, 4), pday (N, 4), ncov)."""
         n = len(pts_xyz)
         rate = np.zeros((n, len(radii)), dtype=np.float32)
         pday = np.zeros((n, len(radii)), dtype=np.float32)
@@ -352,10 +369,42 @@ def get_climatology_index() -> ClimatologyIndex:
     return _CLIM_INDEX
 
 
-# 2D RASTER PREPROCESSING (202 tabular stats for tab_full & 33-ch for SimCLR)
+def climatology_many(
+    pts_xyz: np.ndarray,
+    day: date,
+    radii: Tuple[int, ...] = RADII,
+    window: int = CLIM_WINDOW,
+    hist_path: Optional[str | Path] = None,
+    cov_path: Optional[str | Path] = None,
+) -> np.ndarray:
+    idx = get_climatology_index()
+    if hist_path and Path(hist_path).exists():
+        idx.hist_path = Path(hist_path)
+    if cov_path and Path(cov_path).exists():
+        idx.cov_path = Path(cov_path)
+    X_clim, _, _, _ = idx.query_many(pts_xyz, day, radii=radii, window=window)
+    return X_clim
+
+
+def fit_nb_alpha(y: np.ndarray, mu: np.ndarray) -> float:
+    yv = np.round(np.clip(np.asarray(y, dtype=float), 0, None))
+    mu_v = np.clip(np.asarray(mu, dtype=float), 1e-6, None)
+
+    def nb_nll(alpha_val):
+        r = 1.0 / max(alpha_val, 1e-4)
+        return float(-np.mean(nbinom.logpmf(yv, r, r / (r + mu_v))))
+
+    try:
+        res = minimize_scalar(lambda la: nb_nll(math.exp(la)), bounds=(-6, 4), method="bounded")
+        return float(math.exp(res.x))
+    except Exception:
+        return 4.0
+
+
+fit_alpha = fit_nb_alpha
+
 
 def detect_scales(sample_x2d: np.ndarray) -> Tuple[str, str]:
-    """Detects Sentinel-2 (0_1 vs 0_10000) and SAR (db vs linear) scales."""
     s2 = sample_x2d[:, :10].astype(np.float32)
     s2 = s2[np.isfinite(s2)]
     sar = sample_x2d[:, 10:12].astype(np.float32)
@@ -366,7 +415,6 @@ def detect_scales(sample_x2d: np.ndarray) -> Tuple[str, str]:
 
 
 def build_2d_np(x: np.ndarray) -> np.ndarray:
-    """Builds 32-channel array (22 raw + 10 spectral/SAR indices) exactly as in Cell 10."""
     if x.ndim == 3:
         x = x[None, ...]
     x = np.nan_to_num(x.astype(np.float32), nan=0.0, posinf=0.0, neginf=0.0).copy()
@@ -409,7 +457,6 @@ def build_2d_np(x: np.ndarray) -> np.ndarray:
 
 
 def compute_2d_tab_features(x2d: np.ndarray, scl: np.ndarray) -> np.ndarray:
-    """Computes the 202 tabular image statistics (FT) from (X_2d, scl) as in Cell 10."""
     if x2d.ndim == 3:
         x2d = x2d[None, ...]
     if scl.ndim == 2:
@@ -434,12 +481,21 @@ def compute_2d_tab_features(x2d: np.ndarray, scl: np.ndarray) -> np.ndarray:
     return np.column_stack([f[k] for k in names]).astype(np.float32)
 
 
-def build_33ch_array(x2d: np.ndarray, scl: np.ndarray) -> np.ndarray:
-    """Builds the 33-channel tensor (32 channels + water mask) for SimCLR / CNN models (Cell 21)."""
+def build_33ch_array(x2d: np.ndarray, scl: np.ndarray, size: int = 128) -> np.ndarray:
     if x2d.ndim == 3:
         x2d = x2d[None, ...]
     if scl.ndim == 2:
         scl = scl[None, ...]
     out32 = build_2d_np(x2d)
     water = (scl == 6).astype(np.float32)[:, None, :, :]
-    return np.concatenate([out32, water], axis=1).astype(np.float32)
+    arr33 = np.concatenate([out32, water], axis=1).astype(np.float32)
+    if arr33.shape[2] != size or arr33.shape[3] != size:
+        # Center crop or pad to requested size
+        H, W = arr33.shape[2], arr33.shape[3]
+        if H >= size and W >= size:
+            sy = (H - size) // 2
+            sx = (W - size) // 2
+            arr33 = arr33[:, :, sy : sy + size, sx : sx + size]
+    if arr33.ndim == 4 and arr33.shape[0] == 1:
+        return arr33[0]
+    return arr33
