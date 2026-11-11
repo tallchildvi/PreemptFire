@@ -1,0 +1,49 @@
+name: Sync to Hugging Face Space
+
+on:
+  push:
+    branches:
+      - approach_b
+      - main
+    paths:
+      - 'hf_space/**'
+      - '.github/workflows/sync_to_hf.yml'
+  workflow_dispatch:
+
+jobs:
+  sync-to-hf:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitHub repository
+        uses: actions/checkout@v4
+
+      - name: Push to Hugging Face Space
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          if [ -z "$HF_TOKEN" ]; then
+            echo "Error: HF_TOKEN secret is not set in GitHub repository secrets."
+            echo "Please configure HF_TOKEN in Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          echo "Cloning Hugging Face Space repository..."
+          GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://tallchildvi:${HF_TOKEN}@huggingface.co/spaces/tallchildvi/PreemptFire hf_repo
+
+          echo "Syncing files from hf_space to Hugging Face repository root..."
+          # Sync application files while preserving models directory on Hugging Face
+          rsync -av --exclude='.git' --exclude='__pycache__' --exclude='models' hf_space/ hf_repo/
+
+          cd hf_repo
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "Changes detected, committing and pushing..."
+            git add -A
+            git commit -m "Sync from GitHub commit ${GITHUB_SHA:0:7}"
+            git push origin main
+            echo "Successfully pushed updates to Hugging Face Space."
+          else
+            echo "No changes detected. Hugging Face Space is already up to date."
+          fi
