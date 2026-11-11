@@ -47,9 +47,44 @@ def _model_choices() -> List[Tuple[str, str]]:
     choices = []
     for k, info in MODEL_CATALOG.items():
         avail = rep.get(k, {}).get("available", False)
-        status_tag = "ready" if avail else "weights missing"
-        choices.append((f"[{status_tag}] {k}: {info['label']}", k))
-    return choices
+try:
+    import spaces
+    GPU = spaces.GPU
+except Exception:
+    def GPU(func=None, **kwargs):
+        if func is not None:
+            return func
+        def dec(f):
+            return f
+        return dec
+
+
+@GPU
+def gpu_predict(
+    reg: ModelRegistry,
+    model_name: str,
+    tab_1d: np.ndarray,
+    hist_tab: np.ndarray,
+    clim_feats: np.ndarray,
+    seq: Optional[np.ndarray],
+    static_1d: Optional[np.ndarray],
+    pts_ll: Optional[np.ndarray],
+    ft_2d: Optional[np.ndarray],
+    emb32_2d: Optional[np.ndarray],
+    mask: Optional[np.ndarray],
+) -> Dict[str, Any]:
+    return reg.predict_model(
+        model_name=model_name,
+        TAB_1D=tab_1d,
+        HIST_TAB=hist_tab,
+        CLIM_FEATS=clim_feats,
+        SEQ=seq,
+        STATIC_1D=static_1d,
+        pts_lat_lon=pts_ll,
+        FT_2D=ft_2d,
+        EMB32_2D=emb32_2d,
+        has_2d_mask=mask,
+    )
 
 
 def run_iberia_map_and_compare(
@@ -104,17 +139,18 @@ def run_iberia_map_and_compare(
     summary_rows = []
     for m_name in models_to_run:
         try:
-            res = reg.predict_model(
+            res = gpu_predict(
+                reg=reg,
                 model_name=m_name,
-                TAB_1D=grid_data["TAB_1D"],
-                HIST_TAB=grid_data["HIST_TAB"],
-                CLIM_FEATS=grid_data["CLIM_FEATS"],
-                SEQ=grid_data["SEQ"],
-                STATIC_1D=grid_data["STATIC_1D"],
-                pts_lat_lon=pts[["lat", "lon"]].values,
-                FT_2D=grid_data["FT_2D"],
-                EMB32_2D=grid_data["EMB32_2D"],
-                has_2d_mask=grid_data["has_2d_mask"],
+                tab_1d=grid_data["TAB_1D"],
+                hist_tab=grid_data["HIST_TAB"],
+                clim_feats=grid_data["CLIM_FEATS"],
+                seq=grid_data["SEQ"],
+                static_1d=grid_data["STATIC_1D"],
+                pts_ll=pts[["lat", "lon"]].values,
+                ft_2d=grid_data["FT_2D"],
+                emb32_2d=grid_data["EMB32_2D"],
+                mask=grid_data["has_2d_mask"],
             )
             outputs[m_name] = res
             out_df[f"P_{m_name}"] = np.round(res["p"], 4)
