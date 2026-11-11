@@ -47,6 +47,11 @@ def _model_choices() -> List[Tuple[str, str]]:
     choices = []
     for k, info in MODEL_CATALOG.items():
         avail = rep.get(k, {}).get("available", False)
+        status_tag = "ready" if avail else "weights missing"
+        choices.append((f"[{status_tag}] {k}: {info['label']}", k))
+    return choices
+
+
 try:
     import spaces
     GPU = spaces.GPU
