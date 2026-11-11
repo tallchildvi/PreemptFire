@@ -24,6 +24,13 @@ from make_map import (
 )
 from mini_dataset_store import MiniDatasetStore
 from model_registry import COLORS, LEVELS, MODEL_CATALOG, ModelRegistry
+from post_hoc_evaluation import (
+    compute_actual_counts_per_point,
+    draw_ground_truth_comparison_map,
+    evaluate_levels_against_actual,
+    evaluate_local_radius_around_point,
+    fetch_post_hoc_firms,
+)
 
 try:
     import spaces
@@ -401,6 +408,203 @@ def run_single_point_analysis(
         return None, None, pd.DataFrame(), f"Error during single-location evaluation: {type(exc).__name__}: {exc}"
 
 
+def run_post_hoc_ground_truth(
+    date_str: str,
+    model_name: str,
+    radius_km: int,
+    focal_lat: float,
+    focal_lon: float,
+    local_radius_km: float,
+    progress=gr.Progress(track_tqdm=False),
+):
+    try:
+        day = datetime.strptime(str(date_str).strip()[:10], "%Y-%m-%d").date()
+        r_km = int(radius_km)
+        reg, store = _get_registry_and_store()
+        pts_path = _find_points_csv()
+        pts, meta_df = load_points(pts_path)
+
+        cache_key = f"{day}_{len(pts)}"
+        if cache_key not in _GRID_CACHE:
+            progress(0.05, desc=f"[Step 1/3] Computing pre-fire features strictly up to {day} - 1 day (zero leakage)...")
+            grid_data = build_grid_features(
+                pts=pts,
+                day=day,
+                meta_df=meta_df,
+                collect_2d_limit=0,
+                collect_2d_strategy="top_risk",
+                store=store,
+                reg=reg,
+                progress_cb=lambda frac, desc: progress(0.05 + 0.50 * frac, desc=desc),
+            )
+            _GRID_CACHE[cache_key] = grid_data
+        else:
+            progress(0.30, desc=f"[Step 1/3] Loaded pre-fire features for {day} (strictly up to {day} - 1 day)...")
+            grid_data = _GRID_CACHE[cache_key]
+
+        progress(0.58, desc="[Step 2/3] Running model predictions before loading ground-truth detections...")
+        models_to_eval = [model_name] if model_name else []
+        for m in reg.available_models(include_2d=True):
+            if m not in models_to_eval:
+                models_to_eval.append(m)
+
+        model_preds: Dict[str, Dict[str, Any]] = {}
+        for m in models_to_eval:
+            try:
+                model_preds[m] = gpu_predict(
+                    reg=reg,
+                    model_name=m,
+                    tab_1d=grid_data["TAB_1D"],
+                    hist_tab=grid_data["HIST_TAB"],
+                    clim_feats=grid_data["CLIM_FEATS"],
+                    seq=grid_data["SEQ"],
+                    static_1d=grid_data["STATIC_1D"],
+                    pts_ll=pts[["lat", "lon"]].values,
+                    ft_2d=grid_data["FT_2D"],
+                    emb32_2d=grid_data["EMB32_2D"],
+                    mask=grid_data["has_2d_mask"],
+                )
+            except Exception:
+                pass
+
+        if not model_preds:
+            return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), "No models could be evaluated."
+
+        if model_name not in model_preds:
+            model_name = next(iter(model_preds.keys()))
+
+        progress(0.72, desc=f"[Step 3/3] Post-hoc fetching actual FIRMS detections on {day} and 7-day window...")
+        firms_gt = fetch_post_hoc_firms(day, progress_cb=None)
+        fire_1d_df = firms_gt["fire_1d_df"]
+        fire_7d_df = firms_gt["fire_7d_df"]
+        end_7d = firms_gt["end_7d"]
+
+        counts_1d = compute_actual_counts_per_point(pts, fire_1d_df, radii=RADII)
+        counts_7d = compute_actual_counts_per_point(pts, fire_7d_df, radii=RADII)
+
+        prim_out = model_preds[model_name]
+        gt_map_path = store.maps_dir / f"ground_truth_{model_name}_{day}_R{r_km}km.png"
+        draw_ground_truth_comparison_map(
+            pts=pts,
+            levels=prim_out["levels"],
+            probs=prim_out["p"],
+            thresholds=prim_out["thresholds"],
+            model_name=model_name,
+            target_day=day,
+            fire_1d_df=fire_1d_df,
+            fire_7d_df=fire_7d_df,
+            actual_1d_r=counts_1d[r_km],
+            actual_7d_r=counts_7d[r_km],
+            radius_km=r_km,
+            out_path=gt_map_path,
+        )
+
+        model_rows = []
+        for m, out in model_preds.items():
+            model_rows.append(
+                evaluate_levels_against_actual(
+                    levels=out["levels"],
+                    probs=out["p"],
+                    actual_counts=counts_1d[r_km],
+                    model_name=m,
+                    window_label=f"1d ({day})",
+                    radius_km=r_km,
+                )
+            )
+            model_rows.append(
+                evaluate_levels_against_actual(
+                    levels=out["levels"],
+                    probs=out["p"],
+                    actual_counts=counts_7d[r_km],
+                    model_name=m,
+                    window_label=f"7d ({day} to {end_7d})",
+                    radius_km=r_km,
+                )
+            )
+        df_models_gt = pd.DataFrame(model_rows)
+
+        radii_rows = []
+        for R in RADII:
+            radii_rows.append(
+                evaluate_levels_against_actual(
+                    levels=prim_out["levels"],
+                    probs=prim_out["p"],
+                    actual_counts=counts_1d[int(R)],
+                    model_name=model_name,
+                    window_label=f"1d ({day})",
+                    radius_km=int(R),
+                )
+            )
+            radii_rows.append(
+                evaluate_levels_against_actual(
+                    levels=prim_out["levels"],
+                    probs=prim_out["p"],
+                    actual_counts=counts_7d[int(R)],
+                    model_name=model_name,
+                    window_label=f"7d ({day} to {end_7d})",
+                    radius_km=int(R),
+                )
+            )
+        df_radii_gt = pd.DataFrame(radii_rows)
+
+        local_rows = []
+        for m, out in model_preds.items():
+            local_rows.append(
+                evaluate_local_radius_around_point(
+                    pts=pts,
+                    center_lat=float(focal_lat),
+                    center_lon=float(focal_lon),
+                    search_radius_km=float(local_radius_km),
+                    levels=out["levels"],
+                    probs=out["p"],
+                    actual_1d=counts_1d[r_km],
+                    actual_7d=counts_7d[r_km],
+                    model_name=m,
+                )
+            )
+        df_local_gt = pd.DataFrame(local_rows)
+
+        s1 = evaluate_levels_against_actual(
+            prim_out["levels"], prim_out["p"], counts_1d[r_km], model_name, f"1d ({day})", r_km
+        )
+        s7 = evaluate_levels_against_actual(
+            prim_out["levels"], prim_out["p"], counts_7d[r_km], model_name, f"7d ({day} to {end_7d})", r_km
+        )
+        loc_prim = evaluate_local_radius_around_point(
+            pts, float(focal_lat), float(focal_lon), float(local_radius_km),
+            prim_out["levels"], prim_out["p"], counts_1d[r_km], counts_7d[r_km], model_name
+        )
+
+        status_lines = [
+            f"Post-hoc ground-truth verification for {day} (strictly isolated from pre-fire features up to {day} - 1 day):",
+            f"Raw VIIRS fire detections in Iberia: {len(fire_1d_df)} on {day} (1d) | {len(fire_7d_df)} across {day}..{end_7d} (7d, {len(firms_gt['covered_7d'])}/7 covered days).",
+            f"",
+            f"[{model_name} | Radius R = {r_km} km | Target Day ({day})]:",
+            f"  - Active fire grid scenes: {s1['Active Fire Scenes']}",
+            f"  - Marked High (separately): {s1['Marked High (count)']}/{s1['Active Fire Scenes']} ({s1['Marked High (%)']}%) -> All High? {s1['All in Radius High?']}",
+            f"  - Marked Medium (separately): {s1['Marked Medium (count)']}/{s1['Active Fire Scenes']} ({s1['Marked Medium (%)']}%) -> All Medium? {s1['All in Radius Medium?']}",
+            f"  - Marked Medium+High (combined): {s1['Marked Med+High (count)']}/{s1['Active Fire Scenes']} ({s1['Marked Med+High (%)']}%) -> All Med+High? {s1['All in Radius Med+High?']}",
+            f"  - Missed (Low): {s1['Missed / Low (count)']}/{s1['Active Fire Scenes']} ({s1['Missed / Low (%)']}%)",
+            f"",
+            f"[{model_name} | Radius R = {r_km} km | 7-Day Window ({day} to {end_7d})]:",
+            f"  - Active fire grid scenes: {s7['Active Fire Scenes']}",
+            f"  - Marked High (separately): {s7['Marked High (count)']}/{s7['Active Fire Scenes']} ({s7['Marked High (%)']}%) -> All High? {s7['All in Radius High?']}",
+            f"  - Marked Medium (separately): {s7['Marked Medium (count)']}/{s7['Active Fire Scenes']} ({s7['Marked Medium (%)']}%) -> All Medium? {s7['All in Radius Medium?']}",
+            f"  - Marked Medium+High (combined): {s7['Marked Med+High (count)']}/{s7['Active Fire Scenes']} ({s7['Marked Med+High (%)']}%) -> All Med+High? {s7['All in Radius Med+High?']}",
+            f"  - Missed (Low): {s7['Missed / Low (count)']}/{s7['Active Fire Scenes']} ({s7['Missed / Low (%)']}%)",
+            f"",
+            f"[Local Coordinate Check around ({float(focal_lat):.4f}, {float(focal_lon):.4f}) within {float(local_radius_km):.0f} km | {model_name}]:",
+            f"  - Grid scenes inside radius: {loc_prim['Scenes in Radius']} (All High? {loc_prim['All High?']} [{loc_prim['High (count)']}/{loc_prim['Scenes in Radius']}], All Medium? {loc_prim['All Medium?']} [{loc_prim['Medium (count)']}/{loc_prim['Scenes in Radius']}], All Med+High? {loc_prim['All Med+High?']} [{loc_prim['Med+High (count)']}/{loc_prim['Scenes in Radius']}])",
+        ]
+
+        progress(1.0, desc="Done")
+        return str(gt_map_path), df_models_gt, df_radii_gt, df_local_gt, "\n".join(status_lines)
+    except Exception as exc:
+        import traceback
+        traceback.print_exc()
+        return None, pd.DataFrame(), pd.DataFrame(), pd.DataFrame(), f"Error in post-hoc evaluation: {type(exc).__name__}: {exc}"
+
+
 def refresh_mini_dataset_view():
     _, store = _get_registry_and_store()
     st = store.summary_stats()
@@ -461,7 +665,7 @@ def build_app() -> gr.Blocks:
         gr.Markdown(
             "# PreemptFire: Wildfire Risk Assessment and Model Comparison (Iberia)\n"
             "Interactive interface for running multi-model wildfire predictions (1D, GRU sequence models, and 2D satellite models) "
-            "with dataset persistence."
+            "with dataset persistence and isolated post-hoc ground-truth verification."
         )
 
         with gr.Tabs():
@@ -556,7 +760,46 @@ def build_app() -> gr.Blocks:
                     outputs=[pt_chart_out, pt_patch_out, pt_table_out, pt_status_out],
                 )
 
-            with gr.TabItem("3. Mini-Dataset and Export"):
+            with gr.TabItem("3. Ground Truth Fire Detections (Post-Hoc Verification)"):
+                gr.Markdown(
+                    "Independent post-hoc evaluation module (`post_hoc_evaluation.py`). "
+                    "Predictions are computed strictly using data up to `Target Date - 1 day` (zero data leakage). "
+                    "After predictions are locked in, actual NASA FIRMS VIIRS detections are fetched for the **Target Day (1d)** "
+                    "and the **7-Day Forward Window (Target Day to +6d)** to verify whether all fire-affected scenes within radius R "
+                    "are marked as **Medium** and **High** (separately and combined)."
+                )
+                with gr.Row():
+                    gt_date_in = gr.Textbox(value="2025-08-12", label="Target Date (YYYY-MM-DD)", scale=1)
+                    gt_model_in = gr.Dropdown(choices=choices, value=default_a, label="Primary Model for Map & Multi-Radius Breakdown", scale=2)
+                    gt_radius_in = gr.Radio(choices=[5, 10, 25, 50], value=50, label="Fire Verification Radius R (km)", scale=1)
+
+                with gr.Row():
+                    gt_lat_in = gr.Number(value=40.15, label="Local Check Latitude")
+                    gt_lon_in = gr.Number(value=-4.65, label="Local Check Longitude")
+                    gt_loc_rad_in = gr.Slider(minimum=5, maximum=150, step=5, value=50, label="Local Coordinate Check Radius (km)")
+
+                run_gt_btn = gr.Button("Fetch Actual Detections (1d & 7d) and Verify Predictions", variant="primary")
+                gt_status_out = gr.Textbox(label="Ground-Truth Verification Summary (Medium & High Coverage)", lines=14, interactive=False)
+
+                gr.Markdown("### Predicted Risk vs Actual Fire Detections (Target Day & 7-Day Window)")
+                gt_map_out = gr.Image(label="Ground-Truth Comparison Map (Predicted vs 1d Actual vs 7d Actual)", type="filepath")
+
+                gr.Markdown("### Coverage of Active Fire Scenes by Risk Level (Medium and High Separately) Across All Models")
+                gt_models_table_out = gr.Dataframe(label="All Models: Ground-Truth Coverage on Target Day (1d) and 7-Day Window (7d)")
+
+                gr.Markdown("### Multi-Radius Breakdown (5 km, 10 km, 25 km, 50 km) for Selected Primary Model")
+                gt_radii_table_out = gr.Dataframe(label="Primary Model Breakdown Across All Radii")
+
+                gr.Markdown("### Local Radius Check Around Selected Coordinate (Are All Scenes in Radius Marked Medium / High?)")
+                gt_local_table_out = gr.Dataframe(label="Local Coordinate Radius Check Across Models")
+
+                run_gt_btn.click(
+                    fn=run_post_hoc_ground_truth,
+                    inputs=[gt_date_in, gt_model_in, gt_radius_in, gt_lat_in, gt_lon_in, gt_loc_rad_in],
+                    outputs=[gt_map_out, gt_models_table_out, gt_radii_table_out, gt_local_table_out, gt_status_out],
+                )
+
+            with gr.TabItem("4. Mini-Dataset and Export"):
                 gr.Markdown(
                     "Collected 2D scenes (.npz), feature tables, predictions, and maps are stored in the mini_dataset/ folder."
                 )
@@ -571,7 +814,7 @@ def build_app() -> gr.Blocks:
                 refresh_ds_btn.click(fn=refresh_mini_dataset_view, inputs=[], outputs=[ds_status_out, ds_meta_table])
                 export_zip_btn.click(fn=create_mini_dataset_zip, inputs=[], outputs=[zip_file_out])
 
-            with gr.TabItem("4. Model and File Status"):
+            with gr.TabItem("5. Model and File Status"):
                 check_btn = gr.Button("Check Files")
                 sys_md, sys_df = get_system_status_markdown()
                 sys_md_out = gr.Textbox(value=sys_md, label="Environment Checks", interactive=False)
