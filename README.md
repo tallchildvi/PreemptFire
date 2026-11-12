@@ -1,5 +1,6 @@
 # PreemptFire: Multimodal GeoAI for Wildfire Susceptibility Forecasting
 
+[![DOI: 10.5281/zenodo.24061983](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.24061983-blue.svg)](https://doi.org/10.5281/zenodo.24061983)
 [![Kaggle Dataset](https://img.shields.io/badge/Kaggle-Dataset%20(100m)-%2320BEFF.svg?style=flat&logo=kaggle&logoColor=white)](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)
 [![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces%20Demo-%23FFD21E.svg?style=flat&logo=huggingface&logoColor=black)](https://huggingface.co/spaces/tallchildvi/PreemptFire)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -26,18 +27,20 @@
 
 ## Primary Project Resources
 
+- **Zenodo Dataset Archive (DOI: 10.5281/zenodo.24061983):** [https://doi.org/10.5281/zenodo.24061983](https://doi.org/10.5281/zenodo.24061983)
 - **Benchmark Dataset on Kaggle:** [https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)
 - **Interactive Hugging Face Space:** [https://huggingface.co/spaces/tallchildvi/PreemptFire](https://huggingface.co/spaces/tallchildvi/PreemptFire)
 - **Direct Web Mirror:** [https://tallchildvi-preemptfire.hf.space](https://tallchildvi-preemptfire.hf.space)
 
 ---
 
-## Benchmark Dataset: PreemptFire-100m
+## Benchmark Dataset
 
-A core deliverable and milestone of this project is the creation and publication of **PreemptFire-100m**, an open-access multimodal benchmark dataset hosted on Kaggle:  
-[https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)
+A core deliverable and milestone of this project is the creation and open-access publication of the **Multimodal Benchmark Dataset for Next-Day Wildfire Ignition Susceptibility Forecasting in the Iberian Peninsula**:
+- **Zenodo Archive (Citable DOI):** [https://doi.org/10.5281/zenodo.24061983](https://doi.org/10.5281/zenodo.24061983)
+- **Kaggle Dataset Mirror:** [https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)
 
-PreemptFire-100m is constructed using the modular data engineering pipeline in `src/data_pipeline/`. It is specifically designed for spatiotemporal wildfire ignition susceptibility forecasting at $t+1$ day lead time. 
+The dataset is constructed using the modular data engineering pipeline in `src/data_pipeline/`. It is specifically designed for spatiotemporal wildfire ignition susceptibility forecasting at $t+1$ day lead time. 
 
 ### Key Architectural Characteristics
 
@@ -312,6 +315,29 @@ For Google Earth Engine demographic extractions (offline pipeline):
 
 ```bash
 export GEE_PROJECT="your_gee_project_id"
+```
+
+---
+
+## Citation
+
+If you use this benchmark dataset or codebase in your research, please cite it as follows:
+
+```bibtex
+@dataset{levashov_2026_24061983,
+  author       = {Levashov, Andrii},
+  title        = {{Multimodal Benchmark Dataset for Next-Day Wildfire Ignition Susceptibility Forecasting in the Iberian Peninsula}},
+  month        = nov,
+  year         = 2026,
+  publisher    = {Zenodo},
+  version      = {1.0.0},
+  doi          = {10.5281/zenodo.24061983},
+  url          = {https://doi.org/10.5281/zenodo.24061983}
+}
+```
+
+```text
+Levashov, A. (2026). Multimodal Benchmark Dataset for Next-Day Wildfire Ignition Susceptibility Forecasting in the Iberian Peninsula (Version 1.0.0) [Data set]. Zenodo. https://doi.org/10.5281/zenodo.24061983
 ```
 
 ---
