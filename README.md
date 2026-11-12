@@ -10,7 +10,6 @@
 **Machine Learning and Modeling:**  
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![CatBoost](https://img.shields.io/badge/CatBoost-GBDT-%23FFCC00.svg?style=flat&logoColor=black)](https://catboost.ai/)
-[![Self-Supervised Learning: SimCLR](https://img.shields.io/badge/Pretext%20Learning-SimCLR%20(SSL)-%238A2BE2.svg?style=flat)](https://github.com/tallchildvi/PreemptFire)
 [![scikit-learn](https://img.shields.io/badge/scikit--learn-%23F7931E.svg?style=flat&logo=scikit-learn&logoColor=white)](https://scikit-learn.org/)
 [![pandas](https://img.shields.io/badge/pandas-%23150458.svg?style=flat&logo=pandas&logoColor=white)](https://pandas.pydata.org/)
 [![NumPy](https://img.shields.io/badge/NumPy-%23013243.svg?style=flat&logo=numpy&logoColor=white)](https://numpy.org/)
