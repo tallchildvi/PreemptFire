@@ -82,7 +82,7 @@ class SpatialFeatureFetcher:
                 )
             except Exception as e:
                 wait = self.retry_backoff ** attempt
-                print(f"  [STAC] Init attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s...")
+                print(f"  STAC init attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s...")
                 time.sleep(wait)
         return None
 
@@ -176,7 +176,7 @@ class SpatialFeatureFetcher:
             except Exception as e:
                 last_err = e
                 wait = self.retry_backoff ** attempt
-                print(f"  [DEM] Attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s...")
+                print(f"  DEM attempt {attempt + 1}/{self.max_retries} failed ({e}), retrying in {wait:.0f}s...")
                 time.sleep(wait)
                 self.stac_client = self._init_stac_client()
 

@@ -73,7 +73,7 @@ class DatasetGenerator:
             recovered = cursor.rowcount
             conn.commit()
             if recovered > 0:
-                print(f"[RECOVERY] Reverted {recovered} interrupted scenes back to PENDING.")
+                print(f"Reverted {recovered} interrupted scenes back to pending state.")
 
     def sync_from_csv(self, df: pd.DataFrame):
         """Registers new points from CSV into SQLite tracker."""
@@ -196,8 +196,7 @@ class DatasetGenerator:
         if max_scenes:
             pending_scenes = pending_scenes[:max_scenes]
 
-        print(f"\n--- Found {len(pending_scenes)} scenes pending processing ---")
-        print(f"--- Starting sequential execution (Grid: {self.patch_size}x{self.patch_size}) ---")
+        print(f"\nProcessing {len(pending_scenes)} scenes (grid: {self.patch_size}x{self.patch_size})...")
 
         for idx, scene in enumerate(pending_scenes, 1):
             result_msg = self._process_single_scene(scene)
@@ -211,7 +210,7 @@ if __name__ == "__main__":
     if not os.path.exists(csv_input_path):
         raise FileNotFoundError(f"Input CSV file not found: {csv_input_path}")
 
-    print("--- Initializing 100m Single-Patch DatasetGenerator ---")
+    print("Initializing 100m dataset generator...")
     generator = DatasetGenerator(
         points_csv_path=csv_input_path,
         output_shards_dir=output_shards_dir,

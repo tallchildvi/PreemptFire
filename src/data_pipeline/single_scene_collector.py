@@ -232,29 +232,24 @@ if __name__ == "__main__":
     test_lon = -7.0011
     test_date = "2022-10-09"
 
-    print(f"=== Collecting Raw 100m Single-Patch Scene [{test_lat}, {test_lon}] on {test_date} ===")
+    print(f"Collecting raw 100m scene ({test_lat}, {test_lon}) on {test_date}...")
     sample = collector.collect_sample(
         lat=test_lat, lon=test_lon, target_date=test_date, is_fire=1
     )
 
     if not sample:
-        print("[Error] Scene collection failed or rejected by quality gate.")
+        print("Scene collection failed or was rejected by quality gate.")
         raise SystemExit(1)
 
     meta = sample["metadata"]
-    print("\n" + "=" * 65)
-    print(f" TIMINGS BREAKDOWN (Total: {meta['elapsed_seconds']:.2f}s | T0: {meta['t0_date']})")
-    print("=" * 65)
+    print(f"Timings (total: {meta['elapsed_seconds']:.2f}s | T0: {meta['t0_date']}):")
     for k, v in meta["timings"].items():
         print(f"  {k:<28}: {v:>8.2f}s")
 
     context_1d = sample["context_1d"]
-    print("\n" + "=" * 65)
-    print(f" RAW 1D CONTEXT VECTOR (Total features: {len(context_1d)})")
-    print("=" * 65)
+    print(f"\n1D context features ({len(context_1d)} features):")
     for key in sorted(context_1d.keys()):
         print(f"  {key:<32}: {context_1d[key]:>12.4f}")
-    print("=" * 65 + "\n")
 
     scene_id = f"SCENE_{test_lat:.4f}_{test_lon:.4f}_{test_date.replace('-', '')}"
     patches = list(extractor.extract_patches(sample, scene_id=scene_id))

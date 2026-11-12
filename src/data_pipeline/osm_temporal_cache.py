@@ -167,12 +167,12 @@ def fetch_overpass_at_date(
 
             except Exception as e:
                 wait_time = RETRY_BACKOFF ** attempt
-                print(f"  [OSM] {endpoint} attempt {attempt + 1}/{MAX_RETRIES} failed ({e}), retrying in {wait_time:.0f}s...")
+                print(f"Overpass: {endpoint} attempt {attempt + 1}/{MAX_RETRIES} failed ({e}), retrying in {wait_time:.0f}s...")
                 time.sleep(wait_time)
 
-        print(f"  [OSM] {endpoint} exhausted — trying next mirror...")
+        print(f"Overpass: {endpoint} exhausted, trying next mirror...")
 
-    print("  [OSM] all mirrors failed for this bbox query.")
+    print("Overpass: all mirrors failed for this bounding box query.")
     return None
 
 _db_connection: Optional[sqlite3.Connection] = None
@@ -226,10 +226,10 @@ def query_osm_at_date(
             return merged.to_crs(target_crs) if str(merged.crs) != target_crs else merged
 
         except Exception as e:
-            print(f"  [OSM Cache] corrupt shard ({e}) — refreshing from overpass...")
+            print(f"  Corrupt shard ({e}) — refreshing from overpass...")
 
     # 2. cache miss: fetch from overpass
-    print(f"  [OSM] cache miss for {target_date} bbox=[{snapped[0]:.1f},{snapped[1]:.1f},{snapped[2]:.1f},{snapped[3]:.1f}]")
+    print(f"  Cache miss for {target_date} bbox=[{snapped[0]:.1f},{snapped[1]:.1f},{snapped[2]:.1f},{snapped[3]:.1f}]")
     gdf = fetch_overpass_at_date(*snapped, date_str=target_date)
     if gdf is None:
         return None
@@ -246,7 +246,7 @@ def query_osm_at_date(
         gdf[valid_cols].to_file(gpkg_file, layer="osm_features", driver="GPKG")
 
     index_put(conn, cache_key, *snapped, target_date, gpkg_file, feature_count)
-    print(f"  [OSM] cached {feature_count} features → {gpkg_file.name}")
+    print(f"  Cached {feature_count} features -> {gpkg_file.name}")
 
     if gdf.empty:
         return gpd.GeoDataFrame(geometry=[], crs=target_crs)
@@ -313,7 +313,7 @@ if __name__ == "__main__":
     print(f"starting cache pre-warming: {len(df_points)} points mapped to {len(unique_requests)} unique tiles...")
 
     for idx, (bbox_coords, d_val) in enumerate(unique_requests, 1):
-        print(f"\n[{idx}/{len(unique_requests)}] caching {d_val} for bbox={bbox_coords}")
+        print(f"\n({idx}/{len(unique_requests)}) caching {d_val} for bbox={bbox_coords}")
         query_osm_at_date(*bbox_coords, target_date=d_val, target_crs="EPSG:4326")
 
     print("\ncache pre-warming complete.")

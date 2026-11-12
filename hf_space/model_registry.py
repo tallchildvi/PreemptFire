@@ -549,7 +549,7 @@ class ModelRegistry:
             for k, idx in enumerate(valid_indices):
                 EMB32[idx] = emb32_valid[k].astype(np.float32)
         except Exception as e:
-            print(f"[ModelRegistry] SimCLR embedding note: {e}")
+            print(f"Model registry - SimCLR embedding note: {e}")
 
         return FT, EMB32, has_2d
 

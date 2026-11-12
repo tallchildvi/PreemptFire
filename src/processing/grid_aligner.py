@@ -111,7 +111,7 @@ if __name__ == "__main__":
     info = aligner.get_master_grid_info(lat=test_lat, lon=test_lon)
     row_f, col_f = aligner.latlon_to_pixel(test_lat, test_lon, info)
 
-    print("=== GridAligner Verification ===")
+    print("GridAligner verification:")
     print(f"Center (lat, lon) : {info['center_lat_lon']} -> pixel (row={row_f:.2f}, col={col_f:.2f})")
     print(f"UTM Zone EPSG     : {info['epsg']}")
     print(f"Master Grid Shape : {info['shape']} @ {info['pixel_scale_m']}m/px")

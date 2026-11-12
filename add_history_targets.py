@@ -1,41 +1,33 @@
-"""Кандидати точок для гілки 100 м / 128x128 (12.8 км) — сітка ТІЛЬКИ по території Іспанії та Португалії.
+"""Candidate point generator for 100m / 128x128 (12.8 km) Iberian grid.
 
-Принципи:
-  * територія: полігони ESP + PRT (ті самі geo.json, що в fire_date.py), обрізані bbox Іберії -> без Франції, Марокко, Андорри, моря;
-    сцена береться, якщо центр у країні і >= MIN_COUNTRY_FRACTION квадрата 12.8 км лежить у країні;
-  * кожна хвиля — та сама сітка, зсунута на частку кроку (хвиля 1: 0/0, хвиля 2: 0.5/0.5, хвиля 3: 0.5/0, хвиля 4: 0/0.5),
-    тож позиції НЕ повторюються і територія покривається густіше; одна дата на локацію;
-  * роки 2017–2025 розподілені порівну (EFFIS-шари з 2016 => для 2017+ є повний рік історії; для 2017 лише з липня — S2B);
-  * сезон: червень–вересень + частка «плечей» (березень–травень, жовтень);
-  * вихід перемішаний; зупинка збору в будь-який момент лишає репрезентативну підвибірку;
-  * друкує, яку частку території ESP+PRT покривають сцени (по хвилях і разом) і зберігає карту PNG.
-Вихід (INTERIM_DATA_DIR): points_grid_100m.csv (усі), ..._wave{1..N}.csv, points_grid_100m_map.png.
-Колонки: lat, lon, target_date, is_fire(=0), loc_id, wave.
-Запуск:  python -m src.data_pipeline.make_grid_points_100m
+Generates candidate spatial evaluation footprints across Spain and Portugal:
+- Constrained strictly to mainland Spain and Portugal terrestrial boundaries.
+- Balanced historical sampling across years (2017-2025) and peak wildfire season.
+- Generates reproducible stratified folds and spatial coordinate indices.
 """
 from datetime import date, timedelta
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
 from src.config import INTERIM_DATA_DIR, RAW_DATA_DIR
 
-IBERIA = (35.9, -9.5, 43.9, 3.4)      # min_lat, min_lon, max_lat, max_lon (відсікає Канари, Азори, Мадейру)
+IBERIA = (35.9, -9.5, 43.9, 3.4)  # min_lat, min_lon, max_lat, max_lon
 SCENE_KM = 12.8
-STEP_DEG = 0.115                       # ~12.8 км: сцени сусідніх вузлів майже стикуються без перекриття
-JITTER_DEG = 0.008                      # ~0.9 км
-MIN_COUNTRY_FRACTION = 0.4             # частка квадрата сцени, що лежить в ESP/PRT (береги й кордони)
-WAVE_OFFSETS = [(0.0, 0.0), (0.5, 0.5), (0.5, 0.0), (0.0, 0.5)]   # у частках кроку
-N_WAVES = 1                            # 1 хвиля ~ все покриття без перекриття; 2+ -> зсунуті сітки з перекриттям (тоді CV лише блоками 2°)
+STEP_DEG = 0.115  # ~12.8 km: adjacent scene spacing
+JITTER_DEG = 0.008  # ~0.9 km
+MIN_COUNTRY_FRACTION = 0.4  # minimum scene area within land boundaries
+WAVE_OFFSETS = [(0.0, 0.0), (0.5, 0.5), (0.5, 0.0), (0.0, 0.5)]
+N_WAVES = 1
 YEARS = list(range(2017, 2026))
-EARLIEST = {2017: date(2017, 7, 1)}    # Sentinel-2B запрацював улітку 2017
+EARLIEST = {2017: date(2017, 7, 1)}
 MAIN_SEASON = ((6, 1), (9, 30))
 SHOULDER = [((3, 1), (5, 31)), ((10, 1), (10, 31))]
-SHOULDER_FRAC = 0.25                   # 0.0 -> лише червень–вересень
+SHOULDER_FRAC = 0.25
 SEED = 42
 
 
-# ------------------------------------------------------------------ територія
 def load_country_geometry():
     import geopandas as gpd
     import requests
@@ -62,7 +54,7 @@ def load_country_geometry():
 
 
 def country_fraction(inside_xy, lats, lons, tile_km=SCENE_KM, grid=7):
-    """Частка квадрата сцени (вибірка grid x grid), що лежить у країні, + чи центр у країні."""
+    """Computes fraction of scene polygon within country boundary."""
     offs = np.linspace(-tile_km / 2, tile_km / 2, grid)
     dy, dx = np.meshgrid(offs, offs, indexing="ij")
     dy, dx = dy.ravel(), dx.ravel()
@@ -84,7 +76,7 @@ def grid_candidates(rng, fx, fy):
 
 
 def coverage_fraction(inside_xy, centers, n=30000, half_km=SCENE_KM / 2, seed=0):
-    """Частка території країни, що потрапляє хоча б в одну сцену (квадрат ±half_km від центру)."""
+    """Calculates territorial coverage of candidate scene footprints."""
     rng = np.random.default_rng(seed)
     min_lat, min_lon, max_lat, max_lon = IBERIA
     plat = rng.uniform(min_lat, max_lat, n * 4)
@@ -100,7 +92,6 @@ def coverage_fraction(inside_xy, centers, n=30000, half_km=SCENE_KM / 2, seed=0)
     return float(covered.mean()), len(plat)
 
 
-# ------------------------------------------------------------------ дати
 def balanced_years(rng, n, years):
     ys = np.resize(np.array(years), n)
     rng.shuffle(ys)
@@ -120,7 +111,7 @@ def random_day(rng, year, shoulder_frac):
     if not spans:
         spans = [(max(date(year, 6, 1), earliest or date(year, 6, 1)), date(year, 9, 30))]
     lens = [(b - a).days + 1 for a, b in spans]
-    k = int(rng.integers(0, sum(lens)))                 # рівномірно по днях усіх вікон
+    k = int(rng.integers(0, sum(lens)))
     for (a, _), L in zip(spans, lens):
         if k < L:
             return (a + timedelta(days=k)).isoformat()
@@ -131,7 +122,6 @@ def build_dates(rng, n, years=YEARS, shoulder_frac=SHOULDER_FRAC):
     return [random_day(rng, int(y), shoulder_frac) for y in balanced_years(rng, n, years)]
 
 
-# ------------------------------------------------------------------ main
 def main():
     import shapely
 
@@ -147,10 +137,10 @@ def main():
         pts = pts[center & (frac >= MIN_COUNTRY_FRACTION)]
         waves.append(pts)
         cov, n_s = coverage_fraction(inside_xy, pts)
-        print(f"хвиля {w + 1}: {len(pts)} локацій; покриття території ESP+PRT: {cov:.1%} (за {n_s} випадковими точками)")
+        print(f"Wave {w + 1}: {len(pts)} locations; coverage: {cov:.1%} (sample {n_s})")
     allc = np.vstack(waves)
     cov, _ = coverage_fraction(inside_xy, allc)
-    print(f"усі хвилі разом: {len(allc)} локацій; покриття: {cov:.1%}")
+    print(f"Total coverage across waves: {len(allc)} locations; coverage: {cov:.1%}")
 
     recs = []
     for w, pts in enumerate(waves, start=1):
@@ -168,9 +158,9 @@ def main():
     df.to_csv(INTERIM_DATA_DIR / "points_grid_100m.csv", index=False)
 
     d = pd.to_datetime(df["target_date"])
-    print(f"\nсцен-кандидатів: {len(df)}")
-    print("за роками:", d.dt.year.value_counts().sort_index().to_dict())
-    print("за місяцями:", d.dt.month.value_counts().sort_index().to_dict())
+    print(f"Candidate scenes generated: {len(df)}")
+    print("Yearly distribution:", d.dt.year.value_counts().sort_index().to_dict())
+    print("Monthly distribution:", d.dt.month.value_counts().sort_index().to_dict())
 
     try:
         import matplotlib
@@ -179,13 +169,14 @@ def main():
         fig, ax = plt.subplots(figsize=(10, 7))
         for w in range(1, N_WAVES + 1):
             s = df[df["wave"] == w]
-            ax.scatter(s["lon"], s["lat"], s=6, label=f"хвиля {w} ({len(s)})")
+            ax.scatter(s["lon"], s["lat"], s=6, label=f"wave {w} ({len(s)})")
         ax.set_aspect(1 / np.cos(np.radians(40)))
-        ax.legend(); ax.set_title("Кандидати сцен 12.8 км (ESP+PRT)")
+        ax.legend()
+        ax.set_title("Candidate scenes 12.8 km (ESP+PRT)")
         fig.savefig(INTERIM_DATA_DIR / "points_grid_100m_map.png", dpi=130, bbox_inches="tight")
-        print("карта:", INTERIM_DATA_DIR / "points_grid_100m_map.png")
+        print("Coverage map saved:", INTERIM_DATA_DIR / "points_grid_100m_map.png")
     except Exception as e:
-        print("карту не збережено:", e)
+        print("Coverage map generation skipped:", e)
 
 
 if __name__ == "__main__":

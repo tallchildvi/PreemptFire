@@ -152,10 +152,7 @@ class Date:
             np.sin(lat_rad),
         ])
 
-    # =========================================================================
-    # FIRMS 5-DAY CHUNK DISK CACHE (NASA API MAX DAY_RANGE IS 5)
-    # =========================================================================
-
+    # FIRMS 5-day chunk disk cache (NASA API max day range is 5)
     def _get_chunk_lock(self, chunk_key: str) -> threading.Lock:
         with self._cache_lock:
             if chunk_key not in self._chunk_locks:
@@ -229,10 +226,7 @@ class Date:
         mask = (combined["acq_date"] >= s_str) & (combined["acq_date"] <= e_str)
         return combined[mask].reset_index(drop=True)
 
-    # =========================================================================
-    # STAGE 1: EARLY POINT-LEVEL FILTERING & POLYGON PRE-CHECK
-    # =========================================================================
-
+    # Stage 1: Point-level filtering and polygon pre-check
     def _land_filter(
         self,
         lats: np.ndarray,
@@ -440,7 +434,7 @@ class Date:
 
                 dropped_count = len(df) - int(clean_mask.sum())
                 if verbose and dropped_count > 0:
-                    print(f"  [early filter] dropped {dropped_count} points near industrial/agro sources (< {industrial_radius_km} km)")
+                    print(f"  Dropped {dropped_count} points near industrial/agro sources (< {industrial_radius_km} km)")
 
                 df = df[clean_mask].reset_index(drop=True)
 
@@ -480,7 +474,7 @@ class Date:
 
             dropped_count = len(df) - len(valid_indices)
             if dropped_count > 0:
-                print(f"  [early filter] retained {len(valid_indices)} burned-area verified points (dropped {dropped_count})")
+                print(f"  Retained {len(valid_indices)} burned-area verified points (dropped {dropped_count})")
 
             return df.loc[df.index.isin(valid_indices)].reset_index(drop=True)
         except Exception as e:
@@ -579,10 +573,7 @@ class Date:
         )
         return self.df_window_fires
 
-    # =========================================================================
-    # STAGE 2: CENTROID AGGREGATION & FIRE-LEVEL FILTERING (LOOKBACK)
-    # =========================================================================
-
+    # Stage 2: Centroid aggregation and fire-level filtering
     def _aggregate_to_centroids(self, cluster_radius_km: float = 15.0) -> pd.DataFrame:
         """merge nearby verified fire pixels belonging to the same fire complex into a single centroid"""
         if self.df_area.empty:
@@ -713,10 +704,7 @@ class Date:
         ].copy()
         self.df_area_filtered["is_fire"] = 1
 
-    # =========================================================================
-    # STAGE 3: NEGATIVE SAMPLING
-    # =========================================================================
-
+    # Stage 3: Negative sampling
     def generate_hard_negatives(
         self,
         min_shift_km: float = 30.0,

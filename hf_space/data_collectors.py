@@ -322,13 +322,13 @@ def fetch_weather_cells(
                                     c_coords = [cells[k] for k in res.keys()]
                                     c_dicts = [res[k] for k in res.keys()]  # type: ignore[misc]
                                     if progress_cb:
-                                        progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(c_dicts)} cells).")
+                                        progress_cb(0.35, f"Step 1/5: Open-Meteo ERA5 weather loaded from cache ({len(c_dicts)} cells).")
                                     return _interpolate_weather_idw(pts, c_coords, c_dicts), len(c_dicts)
                             elif len(norm_cached) >= 50:
                                 c_coords = [(float(ck.split("_")[0]), float(ck.split("_")[1])) for ck in norm_cached.keys()]
                                 c_dicts = list(norm_cached.values())
                                 if progress_cb:
-                                    progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(c_dicts)} cells).")
+                                    progress_cb(0.35, f"Step 1/5: Open-Meteo ERA5 weather loaded from cache ({len(c_dicts)} cells).")
                                 return _interpolate_weather_idw(pts, c_coords, c_dicts), len(c_dicts)
                         except Exception:
                             pass
@@ -346,7 +346,7 @@ def fetch_weather_cells(
             if progress_cb:
                 progress_cb(
                     0.05,
-                    f"[Step 1/5] Open-Meteo ERA5 weather: fetching {n_batches} batches ({len(missing_keys)} synoptic cells)...",
+                    f"Step 1/5: Open-Meteo ERA5 weather: fetching {n_batches} batches ({len(missing_keys)} synoptic cells)...",
                 )
 
             done_cells = len(unique_keys) - len(missing_keys)
@@ -392,7 +392,7 @@ def fetch_weather_cells(
                 done_cells += len(b_keys)
                 frac = 0.05 + 0.30 * (done_batches / max(n_batches, 1))
                 msg = (
-                    f"[Step 1/5] Open-Meteo ERA5 weather: batch {done_batches}/{n_batches} complete "
+                    f"Step 1/5: Open-Meteo ERA5 weather: batch {done_batches}/{n_batches} complete "
                     f"({done_cells}/{len(unique_keys)} synoptic cells fetched)"
                 )
                 print(f"  {msg}")
@@ -408,7 +408,7 @@ def fetch_weather_cells(
                     pass
         else:
             if progress_cb:
-                progress_cb(0.35, f"[Step 1/5] Open-Meteo ERA5 weather loaded from cache ({len(unique_keys)} cells).")
+                progress_cb(0.35, f"Step 1/5: Open-Meteo ERA5 weather loaded from cache ({len(unique_keys)} cells).")
 
     ok_keys = [k for k in unique_keys if res.get(k) is not None]
     if not ok_keys:
@@ -444,7 +444,7 @@ def last_sentinel_pass(
         if items:
             return max(i.datetime.date() for i in items)
     except Exception as e:
-        print(f"  [Sentinel STAC] metadata search failed ({e})")
+        print(f"  Sentinel STAC: metadata search failed ({e})")
     return weather_day - timedelta(days=3)
 
 
@@ -468,7 +468,7 @@ def _init_gee() -> bool:
             ee.Initialize(project=proj)
         return True
     except Exception as e:
-        print(f"  [GEE] Earth Engine not initialized ({e})")
+        print(f"  Earth Engine note: not initialized ({e})")
         return False
 
 
@@ -520,7 +520,7 @@ def fetch_population_single(lat: float, lon: float, year: int = 2020, cache_path
                 float(np.log1p(p.get("r", 0.0))),
             )
         except Exception as e:
-            print(f"  [Population GEE] single fetch failed ({e})")
+            print(f"  Population GEE single fetch failed ({e})")
 
     if cpath.exists():
         try:
@@ -546,7 +546,7 @@ def fetch_population_points(
 ) -> pd.DataFrame:
     """Returns DataFrame with columns [population_10km_log1p, population_50km_log1p] for all grid points."""
     if progress_cb:
-        progress_cb(0.36, f"[Step 2/5] Population density (10km / 50km): checking cache for {len(pts)} locations...")
+        progress_cb(0.36, f"Step 2/5: Population density (10km / 50km): checking cache for {len(pts)} locations...")
     cpath = Path(cache or CONFIG["POPULATION_CACHE"])
     if cpath.exists():
         try:
@@ -566,7 +566,7 @@ def fetch_population_points(
             )
             if not m["population_10km_log1p"].isna().any():
                 if progress_cb:
-                    progress_cb(0.42, f"[Step 2/5] Population loaded from cache ({len(pts)} locations).")
+                    progress_cb(0.42, f"Step 2/5: Population loaded from cache ({len(pts)} locations).")
                 return m[["population_10km_log1p", "population_50km_log1p"]].reset_index(drop=True)
             valid_c = c.dropna(subset=["population_10km_log1p", "population_50km_log1p"]).reset_index(drop=True)
             if len(valid_c) > 0:
@@ -576,10 +576,10 @@ def fetch_population_points(
                 m.loc[miss, "population_10km_log1p"] = valid_c["population_10km_log1p"].values[idx]
                 m.loc[miss, "population_50km_log1p"] = valid_c["population_50km_log1p"].values[idx]
                 if progress_cb:
-                    progress_cb(0.42, f"[Step 2/5] Population loaded and interpolated from cache ({len(pts)} locations).")
+                    progress_cb(0.42, f"Step 2/5: Population loaded and interpolated from cache ({len(pts)} locations).")
                 return m[["population_10km_log1p", "population_50km_log1p"]].reset_index(drop=True)
         except Exception as e:
-            print(f"  [Population Cache] warning reading {cpath}: {e}")
+            print(f"  Population cache warning reading {cpath}: {e}")
 
     if metadata_df is not None and {"population_10km_log1p", "population_50km_log1p"} <= set(metadata_df.columns):
         la_c = next(col for col in ("lat", "latitude") if col in metadata_df.columns)
@@ -616,7 +616,7 @@ def fetch_population_points(
                     (f_["properties"]["i"], f_["properties"]["R"], float(f_["properties"].get("sum", 0.0)))
                     for f_ in out
                 ]
-                msg = f"[Step 2/5] Population GEE WorldPop: {min(s + 200, len(pts))}/{len(pts)} points fetched"
+                msg = f"Step 2/5: Population GEE WorldPop: {min(s + 200, len(pts))}/{len(pts)} points fetched"
                 print(f"  {msg}")
                 if progress_cb:
                     progress_cb(0.36 + 0.08 * (min(s + 200, len(pts)) / max(len(pts), 1)), msg)
@@ -631,10 +631,10 @@ def fetch_population_points(
             pd.concat([pts.reset_index(drop=True), res.reset_index(drop=True)], axis=1).to_csv(cpath, index=False)
             return res
         except Exception as e:
-            print(f"  [Population GEE] batch fetch failed ({e}), using fallback.")
+            print(f"  Population GEE batch fetch failed ({e}), using fallback.")
 
     if progress_cb:
-        progress_cb(0.44, "[Step 2/5] Population: using regional baseline priors (no GEE/cache found).")
+        progress_cb(0.44, "Step 2/5: Population: using regional baseline priors (no GEE/cache found).")
     return pd.DataFrame(
         {
             "population_10km_log1p": np.full(len(pts), 8.85, dtype=np.float32),
@@ -672,7 +672,7 @@ def fetch_firms_days(
     covered: set = set()
 
     if progress_cb:
-        progress_cb(0.46, f"[Step 3/5] NASA FIRMS fire history: checking local archive ({first} to {last})...")
+        progress_cb(0.46, f"Step 3/5: NASA FIRMS fire history: checking local archive ({first} to {last})...")
 
     hist_path = Path(CONFIG["FIRMS_HISTORY"])
     cov_path = Path(CONFIG["FIRMS_COVERED"])
@@ -715,7 +715,7 @@ def fetch_firms_days(
                         covered.add(d_iter)
                         d_iter += timedelta(days=1)
         except Exception as e:
-            print(f"  [FIRMS Archive] warning reading local archive: {e}")
+            print(f"  FIRMS archive warning reading local archive: {e}")
 
     all_req_days = {first + timedelta(days=i) for i in range((last - first).days + 1)}
     missing_days = sorted(all_req_days - covered)
@@ -723,15 +723,15 @@ def fetch_firms_days(
         pts = pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame(columns=["latitude", "longitude", "acq_date"])
         _LAST_FIRMS_DIAGNOSTICS["total_detections"] = len(pts)
         if progress_cb:
-            progress_cb(0.58, f"[Step 3/5] NASA FIRMS: loaded {len(pts)} detections across {len(covered)} days from archive.")
+            progress_cb(0.58, f"Step 3/5: NASA FIRMS: loaded {len(pts)} detections across {len(covered)} days from archive.")
         return pts, covered
 
     keys = get_firms_keys(firms_keys)
     _LAST_FIRMS_DIAGNOSTICS["keys_configured"] = len(keys)
     if not keys:
-        msg = "WARNING: No FIRMS_MAP_KEY configured. Please provide one or more NASA FIRMS MAP_KEYs in UI or environment."
+        msg = "Warning: No FIRMS_MAP_KEY configured. Please provide one or more NASA FIRMS MAP_KEYs in UI or environment."
         _LAST_FIRMS_DIAGNOSTICS["last_error"] = msg
-        print(f"  [FIRMS API] {msg}")
+        print(f"  FIRMS API: {msg}")
         pts = pd.concat(frames, ignore_index=True).drop_duplicates() if frames else pd.DataFrame(columns=["latitude", "longitude", "acq_date"])
         return pts, covered
 
@@ -761,7 +761,7 @@ def fetch_firms_days(
         if progress_cb:
             progress_cb(
                 0.46 + 0.12 * (done_span / total_span),
-                f"[Step 3/5] NASA FIRMS API: fetching {d.isoformat()} (+{n} days)...",
+                f"Step 3/5: NASA FIRMS API: fetching {d.isoformat()} (+{n} days)...",
             )
 
         df = None
@@ -803,7 +803,7 @@ def fetch_firms_days(
                             fetch_success = True
                             _LAST_FIRMS_DIAGNOSTICS["last_src"] = src
                             _LAST_FIRMS_DIAGNOSTICS["last_error"] = None
-                            print(f"  [FIRMS API] Successfully fetched {len(df)} {src} detections for {d} (+{n}d) using Key #{key_idx + 1} ({key_masked})")
+                            print(f"  FIRMS API: Successfully fetched {len(df)} {src} detections for {d} (+{n}d) using Key #{key_idx + 1} ({key_masked})")
                             break
 
                         # Check for key exhaustion, transaction limit, or auth errors
@@ -816,7 +816,7 @@ def fetch_firms_days(
                         )
                         if is_key_err:
                             last_err_detail = f"Key #{key_idx + 1} ({key_masked}) error: HTTP {r.status_code} ({resp_text[:120]})"
-                            print(f"  [FIRMS API] {last_err_detail}. Switching to next key...")
+                            print(f"  FIRMS API: {last_err_detail}. Switching to next key...")
                             key_has_auth_error = True
                             break
 
@@ -832,7 +832,7 @@ def fetch_firms_days(
 
             if not fetch_success:
                 _LAST_FIRMS_DIAGNOSTICS["last_error"] = last_err_detail or "All FIRMS keys and sources failed."
-                print(f"  [FIRMS API] WARNING: Failed to fetch {d} (+{n}d) across {len(keys)} keys: {_LAST_FIRMS_DIAGNOSTICS['last_error']}")
+                print(f"  FIRMS API warning: Failed to fetch {d} (+{n}d) across {len(keys)} keys: {_LAST_FIRMS_DIAGNOSTICS['last_error']}")
 
         if df is not None and len(df) and "latitude" in df.columns:
             df["acq_date"] = df["acq_date"].astype(str).str[:10]
@@ -1159,7 +1159,7 @@ class Scene2DCollector:
             if progress_cb:
                 progress_cb(
                     0.22 + 0.06 * (idx_d / max(1, len(cand_dates))),
-                    f"[2D Step 1/4] Checking Sentinel-2 cloud mask (SCL) for {cand_date}...",
+                    f"Step 1/4: Checking Sentinel-2 cloud mask (SCL) for {cand_date}...",
                 )
             d_items = by_date[cand_date]
             _, scl = self._fetch_mosaicked_band("SCL", d_items, grid_info)
@@ -1180,7 +1180,7 @@ class Scene2DCollector:
 
         _, chosen_t0, chosen_items, chosen_scl, chosen_loss = best_candidate
         if progress_cb:
-            progress_cb(0.30, f"[2D Step 1/4] Downloading 10 Sentinel-2 spectral bands for {chosen_t0}...")
+            progress_cb(0.30, f"Step 1/4: Downloading 10 Sentinel-2 spectral bands for {chosen_t0}...")
 
         chosen_bands: Dict[str, np.ndarray] = {"SCL": chosen_scl}
         rem = [b for b in self.OPTICAL_BANDS if b != "SCL"]
@@ -1192,7 +1192,7 @@ class Scene2DCollector:
 
         # 2. Sentinel-1 RTC SAR
         if progress_cb:
-            progress_cb(0.40, "[2D Step 1/4] Querying Sentinel-1 RTC SAR backscatter (VV, VH)...")
+            progress_cb(0.40, "Step 1/4: Querying Sentinel-1 RTC SAR backscatter (VV, VH)...")
         sar_bands: Dict[str, np.ndarray] = {}
         try:
             s1_items = list(
@@ -1213,7 +1213,7 @@ class Scene2DCollector:
                     sar_bands = {"SAR_VV": vv, "SAR_VH": vh}
                     break
         except Exception as e:
-            print(f"  [Sentinel-1 SAR] warning: {e}")
+            print(f"  Sentinel-1 SAR warning: {e}")
 
         return {
             "bands_t0": chosen_bands,
@@ -1234,7 +1234,7 @@ class Scene2DCollector:
                 with np.load(cache_file) as z:
                     if all(k in z.files for k in self.STATIC_9_CHANNELS):
                         if progress_cb:
-                            progress_cb(0.60, "[2D Step 2/4] Loaded cached Copernicus DEM & OSM travel-time rasters...")
+                            progress_cb(0.60, "Step 2/4: Loaded cached Copernicus DEM & OSM travel-time rasters...")
                         return {k: z[k].astype(np.float32) for k in self.STATIC_9_CHANNELS}
             except Exception:
                 pass
@@ -1265,7 +1265,7 @@ class Scene2DCollector:
 
         # 1. Copernicus DEM 30m
         if progress_cb:
-            progress_cb(0.48, "[2D Step 2/4] Fetching Copernicus DEM GLO-30 elevation, slope, and aspect...")
+            progress_cb(0.48, "Step 2/4: Fetching Copernicus DEM GLO-30 elevation, slope, and aspect...")
         stac = self._get_stac()
         dem_items = list(stac.search(collections=["cop-dem-glo-30"], bbox=padded_bbox).items())
         if not dem_items:
@@ -1320,7 +1320,7 @@ class Scene2DCollector:
 
         # 2. OSM Vectors via Overpass API
         if progress_cb:
-            progress_cb(0.55, "[2D Step 2/4] Fetching OpenStreetMap roads, trails, powerlines, and camps via Overpass...")
+            progress_cb(0.55, "Step 2/4: Fetching OpenStreetMap roads, trails, powerlines, and camps via Overpass...")
         gdf_utm = self._fetch_overpass_osm(west, south, east, north, grid_info["crs"])
 
         def _rast(df_sub):
@@ -1358,7 +1358,7 @@ class Scene2DCollector:
                 gdf_camps = gdf_utm[cc]
 
         if progress_cb:
-            progress_cb(0.60, "[2D Step 2/4] Computing Dijkstra travel time and distance transforms...")
+            progress_cb(0.60, "Step 2/4: Computing Dijkstra travel time and distance transforms...")
         passable_50m = np.ones(buf_shape_50m, dtype=np.uint8)
         passable_50m[_rast(gdf_water) == 1] = 0
         passable_50m[np.isnan(dem_50m)] = 0
@@ -1464,7 +1464,7 @@ class Scene2DCollector:
                     return empty_df
                 return pd.DataFrame(rows)
             except Exception as e:
-                print(f"  [Overpass] mirror {url} failed ({e}), trying next...")
+                print(f"  Overpass mirror {url} failed ({e}), trying next...")
         return empty_df
 
     def fetch_soil_moisture(self, grid_info: dict, pre_fire_date: str, default_moisture: float = 0.20) -> np.ndarray:
@@ -1513,15 +1513,15 @@ class Scene2DCollector:
         pre_fire_str = wd.isoformat()
 
         if progress_cb:
-            progress_cb(0.20, "[2D Step 1/4] Querying Planetary Computer STAC for Sentinel-2 L2A & Sentinel-1 SAR...")
+            progress_cb(0.20, "Step 1/4: Querying Planetary Computer STAC for Sentinel-2 L2A & Sentinel-1 SAR...")
         sent_res = self.fetch_s2_and_sar(grid_info, pre_fire_str, 30, progress_cb=progress_cb)
 
         if progress_cb:
-            progress_cb(0.46, "[2D Step 2/4] Fetching Copernicus DEM GLO-30 & OpenStreetMap roads (Dijkstra travel time)...")
+            progress_cb(0.46, "Step 2/4: Fetching Copernicus DEM GLO-30 & OpenStreetMap roads (Dijkstra travel time)...")
         stat_res = self.fetch_static_terrain_and_osm(grid_info, 4000.0, progress_cb=progress_cb)
 
         if progress_cb:
-            progress_cb(0.62, "[2D Step 3/4] Fetching ERA5-Land volumetric soil moisture (0-7 cm)...")
+            progress_cb(0.62, "Step 3/4: Fetching ERA5-Land volumetric soil moisture (0-7 cm)...")
         soil_arr = self.fetch_soil_moisture(grid_info, pre_fire_str)
 
         t0_date_str = sent_res["t0_date"]

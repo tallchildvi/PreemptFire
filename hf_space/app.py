@@ -526,7 +526,7 @@ def run_post_hoc_ground_truth(
                 )
             except Exception as exc:
                 model_errors[m] = f"{type(exc).__name__}: {exc}"
-                print(f"  [Post-Hoc] Model {m} failed: {model_errors[m]}")
+                print(f"  Post-hoc model {m} failed: {model_errors[m]}")
 
         if not model_preds:
             err_msg = "; ".join(f"{k}: {v}" for k, v in model_errors.items())
@@ -790,7 +790,7 @@ def run_batch_post_hoc_evaluation(
                     r7["Date"] = str(day)
                     day_rows_7d.append(r7)
                 except Exception as exc:
-                    print(f"  [Batch Post-Hoc] Model {m} on {day} failed: {exc}")
+                    print(f"  Batch post-hoc model {m} on {day} failed: {exc}")
 
             if day_rows_1d:
                 df_d1 = evaluate_vs_fwi_benchmark(pd.DataFrame(day_rows_1d))

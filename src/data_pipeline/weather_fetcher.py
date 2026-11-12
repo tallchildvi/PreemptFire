@@ -200,7 +200,7 @@ if __name__ == "__main__":
     test_target_date = "2022-08-08"
     test_t0_date = "2022-08-05"
 
-    print(f"=== Testing Raw WeatherFetcher for [{test_lat}, {test_lon}] on {test_target_date} ===")
+    print(f"Testing raw WeatherFetcher for ({test_lat}, {test_lon}) on {test_target_date}...")
     t_start = time.perf_counter()
     metrics = fetcher.fetch_all_weather_metrics(
         lat=test_lat, lon=test_lon, target_date=test_target_date, t0_date=test_t0_date

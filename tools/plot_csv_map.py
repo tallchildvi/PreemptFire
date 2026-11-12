@@ -7,25 +7,23 @@ import pandas as pd
 def generate_points_map(csv_path: str, output_html: str):
     input_file = Path(csv_path)
     if not input_file.exists():
-        print(f"Помилка: Файл {input_file} не знайдено.")
+        print(f"Error: File {input_file} not found.")
         return
 
-    print(f"Читання даних з {input_file.name}...")
+    print(f"Reading data from {input_file.name}...")
     df = pd.read_csv(input_file)
 
     if df.empty:
-        print("Помилка: CSV файл порожній.")
+        print("Error: CSV file is empty.")
         return
 
-    # Підтримка різних варіантів назв колонок
     lat_col = "latitude" if "latitude" in df.columns else "lat"
     lon_col = "longitude" if "longitude" in df.columns else "lon"
 
     if lat_col not in df.columns or lon_col not in df.columns:
-        print("Помилка: Не знайдено колонок координат (latitude/lat, longitude/lon).")
+        print("Error: Coordinate columns (latitude/lat, longitude/lon) not found.")
         return
 
-    # Автоматичне центрування карти за медіаною всіх точок
     center_lat = df[lat_col].median()
     center_lon = df[lon_col].median()
 
@@ -36,14 +34,12 @@ def generate_points_map(csv_path: str, output_html: str):
         control_scale=True,
     )
 
-    # Додавання супутникового шару
     folium.TileLayer(
         tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
         attr="Esri World Imagery",
         name="Satellite (Esri)",
     ).add_to(m)
 
-    # Шари для зручного увімкнення/вимкнення точок
     fg_fires = folium.FeatureGroup(name="Active Fires (1)", show=True)
     fg_negatives = folium.FeatureGroup(name="Background Negatives (0)", show=True)
 
@@ -52,7 +48,6 @@ def generate_points_map(csv_path: str, output_html: str):
         lat = row[lat_col]
         lon = row[lon_col]
         
-        # Пропускаємо пошкоджені рядки
         if pd.isna(lat) or pd.isna(lon):
             continue
 
@@ -61,11 +56,11 @@ def generate_points_map(csv_path: str, output_html: str):
         frp = row.get("frp", 0.0)
         
         if is_fire == 1:
-            color = "#e11d48"  # Червоний
+            color = "#e11d48"
             fg = fg_fires
             label = "Fire"
         else:
-            color = "#16a34a"  # Зелений
+            color = "#16a34a"
             fg = fg_negatives
             label = "Negative"
 
@@ -100,24 +95,14 @@ def generate_points_map(csv_path: str, output_html: str):
     out_path.parent.mkdir(parents=True, exist_ok=True)
     m.save(str(out_path))
     
-    print(f"Успішно нанесено {points_added} точок.")
-    print(f"Інтерактивну карту збережено у: {out_path.resolve()}")
+    print(f"Rendered {points_added} points.")
+    print(f"Map saved to: {out_path.resolve()}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Generate interactive HTML map from points CSV")
-    parser.add_argument(
-        "--csv",
-        type=str,
-        default="data/interim/points_dataset_thinned.csv",
-        help="Path to the input CSV file containing lat/lon and is_fire columns",
-    )
-    parser.add_argument(
-        "--output",
-        type=str,
-        default="data/interim/csv_points_map.html",
-        help="Path to save the output interactive HTML map",
-    )
-
+    parser.add_argument("--csv", required=True, help="Path to input points CSV")
+    parser.add_argument("--out", default="points_map.html", help="Path to output HTML file")
     args = parser.parse_args()
-    generate_points_map(csv_path=args.csv, output_html=args.output)
+
+    generate_points_map(args.csv, args.out)

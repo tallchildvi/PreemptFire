@@ -28,7 +28,7 @@ def extract_tabular_dataset(h5_path: str, chunk_size: int = 256) -> pd.DataFrame
     Streams chunks from HDF5, computes 10 physical indices, and aggregates spatial
     statistics across valid pixels (excluding clouds, shadows, and water).
     """
-    print(f"[INFO] Extracting tabular features from: {h5_path}")
+    print(f"Extracting tabular features from: {h5_path}")
 
     with h5py.File(h5_path, "r") as f:
         n_samples = f["X_2d"].shape[0]
@@ -146,7 +146,7 @@ def extract_tabular_dataset(h5_path: str, chunk_size: int = 256) -> pd.DataFrame
             all_chunks.append(chunk_df)
 
             if end_idx % 2048 == 0 or end_idx == n_samples:
-                print(f"[PROGRESS] Processed {end_idx}/{n_samples} patches...")
+                print(f"Processed {end_idx}/{n_samples} patches...")
 
     full_df = pd.concat(all_chunks, ignore_index=True)
     return full_df
@@ -232,7 +232,7 @@ def cv_compare(df: pd.DataFrame, n_splits: int = 5, iterations: int = 400) -> pd
         rows.append({"features": name, "groups": gcol, "n_feat": len(cols),
                      "ROC-AUC": f"{np.mean(roc):.3f} ± {np.std(roc):.3f}",
                      "PR-AUC": f"{np.mean(pr):.3f} ± {np.std(pr):.3f}"})
-        print(f"[CV] {name:16s} groups={gcol:14s} ROC {np.mean(roc):.3f}±{np.std(roc):.3f}  "
+        print(f"CV: {name:16s} groups={gcol:14s} ROC {np.mean(roc):.3f}±{np.std(roc):.3f}  "
               f"PR {np.mean(pr):.3f}±{np.std(pr):.3f}", flush=True)
     return pd.DataFrame(rows)
 
@@ -245,9 +245,8 @@ def train_catboost(df: pd.DataFrame, output_model_path: str, use_coords: bool = 
     y = df["is_fire"].astype(int)
     groups = df[group_col]
 
-    print("\n" + "=" * 65)
-    print(f"[INFO] Feature Matrix Shape:      {X.shape}")
-    print(f"[INFO] Total Input Features:      {len(feature_cols)}  (coords={use_coords}, doy={use_doy}, groups={group_col})")
+    print(f"\nFeature matrix shape:      {X.shape}")
+    print(f"Total input features:      {len(feature_cols)}  (coords={use_coords}, doy={use_doy}, groups={group_col})")
 
     gkf = GroupKFold(n_splits=5)
     train_idx, val_idx = next(gkf.split(X, y, groups=groups))
@@ -255,13 +254,13 @@ def train_catboost(df: pd.DataFrame, output_model_path: str, use_coords: bool = 
     X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
     X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
 
-    print(f"[INFO] Train Split: {len(X_train):6d} patches (Fire=1: {y_train.sum()})")
-    print(f"[INFO] Val Split:   {len(X_val):6d} patches (Fire=1: {y_val.sum()})")
+    print(f"Train split: {len(X_train):6d} patches (Fire=1: {y_train.sum()})")
+    print(f"Val split:   {len(X_val):6d} patches (Fire=1: {y_val.sum()})")
 
     neg_count = int((y_train == 0).sum())
     pos_count = int((y_train == 1).sum())
     scale_pos = float(neg_count / max(pos_count, 1))
-    print(f"[INFO] Computed scale_pos_weight: {scale_pos:.3f}")
+    print(f"Computed scale_pos_weight: {scale_pos:.3f}")
 
     train_pool = Pool(X_train, y_train)
     val_pool = Pool(X_val, y_val)
@@ -278,7 +277,7 @@ def train_catboost(df: pd.DataFrame, output_model_path: str, use_coords: bool = 
         verbose=100,
     )
 
-    print("\n[INFO] Fitting CatBoost Classifier...")
+    print("\nFitting CatBoost classifier...")
     model.fit(train_pool, eval_set=val_pool, use_best_model=True)
 
     preds_proba = model.predict_proba(X_val)[:, 1]
@@ -287,13 +286,11 @@ def train_catboost(df: pd.DataFrame, output_model_path: str, use_coords: bool = 
     roc_auc = roc_auc_score(y_val, preds_proba)
     pr_auc = average_precision_score(y_val, preds_proba)
 
-    print("\n" + "=" * 65)
-    print(f"VALIDATION RESULTS (GROUP-KFOLD BY {group_col.upper()}, FOLD 0):")
+    print(f"\nValidation results (GroupKFold by {group_col}, fold 0):")
     print(f"ROC-AUC: {roc_auc:.4f}")
     print(f"PR-AUC:  {pr_auc:.4f}")
-    print("\nClassification Report (Threshold = 0.5):")
+    print("\nClassification report (threshold = 0.5):")
     print(classification_report(y_val, preds_binary, digits=4))
-    print("=" * 65)
 
     importance = model.get_feature_importance()
     imp_df = pd.DataFrame({
@@ -301,11 +298,11 @@ def train_catboost(df: pd.DataFrame, output_model_path: str, use_coords: bool = 
         "importance": importance,
     }).sort_values(by="importance", ascending=False)
 
-    print("\nTOP-20 MOST IMPORTANT FEATURES:")
+    print("\nTop 20 feature importances:")
     print(imp_df.head(20).to_string(index=False))
 
     model.save_model(output_model_path)
-    print(f"\n[SUCCESS] Saved trained model to: {output_model_path}")
+    print(f"\nSaved trained model to: {output_model_path}")
 
 
 def main() -> None:
@@ -323,19 +320,19 @@ def main() -> None:
 
     cache_path = Path(args.cache_parquet)
     if cache_path.exists():
-        print(f"[INFO] Loading cached tabular features from: {cache_path}")
+        print(f"Loading cached tabular features from: {cache_path}")
         df = pd.read_parquet(cache_path)
     else:
         df = extract_tabular_dataset(args.h5)
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         df.to_parquet(cache_path, index=False)
-        print(f"[SUCCESS] Cached extracted features to: {cache_path}")
+        print(f"Cached extracted features to: {cache_path}")
 
     # Old caches have no coordinates: add them from metadata only (seconds, no raster re-read)
     if "lat" not in df.columns or "spatial_group" not in df.columns:
         df = add_meta_features(df, args.h5)
         df.to_parquet(cache_path, index=False)
-        print("[INFO] Added lat/lon/doy/spatial_group to the cache.")
+        print("Added spatial attributes to cache.")
 
     if args.compare:
         table = cv_compare(df)

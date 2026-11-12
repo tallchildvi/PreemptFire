@@ -70,11 +70,11 @@ def score_single_location(
     reg = ModelRegistry(model_dir=model_dir or CONFIG.get("MODEL_DIR", "models"))
 
     if progress_cb:
-        progress_cb(0.08, f"[Step 1/6] Fetching 60-day Open-Meteo ERA5 weather for ({lat:.4f}, {lon:.4f}) up to {wd}...")
+        progress_cb(0.08, f"Step 1/6: Fetching 60-day Open-Meteo ERA5 weather for ({lat:.4f}, {lon:.4f}) up to {wd}...")
     w = fetch_weather(lat, lon, wd, t0)
 
     if progress_cb:
-        progress_cb(0.16, f"[Step 2/6] Fetching population density (10km / 50km) for ({lat:.4f}, {lon:.4f})...")
+        progress_cb(0.16, f"Step 2/6: Fetching population density (10km / 50km) for ({lat:.4f}, {lon:.4f})...")
     p10, p50 = fetch_population_single(lat, lon)
 
     scene_2d: Optional[Dict[str, Any]] = None
@@ -82,7 +82,7 @@ def score_single_location(
     cached_npz = store.has_scene_npz(lat, lon, day)
     if cached_npz is not None:
         if progress_cb:
-            progress_cb(0.45, f"[Step 3/6] Loaded cached 22-channel 2D satellite patch from {cached_npz.name}...")
+            progress_cb(0.45, f"Step 3/6: Loaded cached 22-channel 2D satellite patch from {cached_npz.name}...")
         scene_2d = store.load_scene_npz(cached_npz)
     elif collect_2d:
         try:
@@ -99,7 +99,7 @@ def score_single_location(
             import traceback
             traceback.print_exc()
             scene_2d_error = f"{type(e).__name__}: {e}"
-            print(f"  [2D Collector] Failed to collect 2D patch: {scene_2d_error}")
+            print(f"  Collector error: failed to collect 2D patch: {scene_2d_error}")
 
     s2_date = scene_2d.get("s2_Source_Date") if scene_2d else None
     raw_1d, tab_1d = one_d_features(w, p10, p50, wd, s2_date=s2_date)
@@ -107,13 +107,13 @@ def score_single_location(
 
     H = int(CONFIG["HISTORY_DAYS"])
     if progress_cb:
-        progress_cb(0.68, f"[Step 4/6] Fetching {H}-day NASA FIRMS fire detections ({day - timedelta(days=H)} to {wd})...")
+        progress_cb(0.68, f"Step 4/6: Fetching {H}-day NASA FIRMS fire detections ({day - timedelta(days=H)} to {wd})...")
     fire_df, covered = fetch_firms_days(lat, lon, day - timedelta(days=H), wd)
     pts_xyz = to_xyz([lat], [lon])
     HIST_TAB, HC = history_many(pts_xyz, fire_df, covered, day, RADII, H=H)
 
     if progress_cb:
-        progress_cb(0.78, "[Step 5/6] Computing historical DOY fire climatology...")
+        progress_cb(0.78, "Step 5/6: Computing historical DOY fire climatology...")
     CLIM_FEATS = climatology_many(
         pts_xyz,
         day,
@@ -126,7 +126,7 @@ def score_single_location(
     SEQ, STATIC_1D = build_seq_and_static(HC, TAB_1D, CLIM_FEATS, H=H)
 
     if progress_cb:
-        progress_cb(0.88, "[Step 6/6] Extracting 2D embeddings (SimCLR + FT) and running model inference...")
+        progress_cb(0.88, "Step 6/6: Extracting 2D embeddings (SimCLR + FT) and running model inference...")
     FT_2D, EMB32_2D, has_2d_mask = reg.compute_2d_embeddings_and_stats([scene_2d])
 
     # Determine which models to run

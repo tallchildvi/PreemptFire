@@ -90,7 +90,7 @@ if __name__ == "__main__":
     fetcher = PopulationFetcher()
     test_lat, test_lon = 41.6986, -7.0011
 
-    print(f"=== Testing PopulationFetcher (1D Context) for [{test_lat}, {test_lon}] ===")
+    print(f"Testing PopulationFetcher for ({test_lat}, {test_lon})...")
     pop_metrics = fetcher.fetch_population_1d(lat=test_lat, lon=test_lon, year=2020)
     for k, v in pop_metrics.items():
         raw_est = np.expm1(v)

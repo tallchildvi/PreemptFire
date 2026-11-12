@@ -29,8 +29,7 @@ search_2023 = client.search(
 )
 item_2023 = list(search_2023.items())[0]
 
-print("=" * 65)
-print("1. ПЕРЕВІРКА МЕТАДАНИХ MICROSOFT STAC:")
+print("1. STAC Metadata Validation:")
 print(f"2021 Date: {item_2021.datetime.date()} | Baseline: {item_2021.properties.get('s2:processing_baseline')}")
 print(f"2023 Date: {item_2023.datetime.date()} | Baseline: {item_2023.properties.get('s2:processing_baseline')}")
 
@@ -39,8 +38,7 @@ b04_bands_2023 = item_2023.assets["B04"].extra_fields.get("raster:bands", [{}])[
 print(f"2021 STAC registered offset: {b04_bands_2021.get('offset', 0)}")
 print(f"2023 STAC registered offset: {b04_bands_2023.get('offset', 0)}")
 
-print("\n" + "=" * 65)
-print("2. ПЕРЕВІРКА РЕАЛЬНИХ ПІКСЕЛІВ ЧЕРЕЗ RASTERIO (СИРИЙ B02 / СИНІЙ КАНАЛ):")
+print("\n2. Direct Pixel Verification (Raw B02 Blue Band):")
 
 with rasterio.open(item_2021.assets["B02"].href) as src:
     w = Window(src.width // 2, src.height // 2, 400, 400)
@@ -55,4 +53,3 @@ v23 = data_2023[data_2023 > 0]
 
 print(f"2021 B02 (PB {item_2021.properties.get('s2:processing_baseline')}): min={np.min(v21):.1f}, 5th percentile={np.percentile(v21, 5):.1f}, median={np.median(v21):.1f}")
 print(f"2023 B02 (PB {item_2023.properties.get('s2:processing_baseline')}): min={np.min(v23):.1f}, 5th percentile={np.percentile(v23, 5):.1f}, median={np.median(v23):.1f}")
-print("=" * 65)

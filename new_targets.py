@@ -1,7 +1,7 @@
-"""Запусти ЛОКАЛЬНО (там, де лежить data/raw/globfire): вирізає Іспанію+Португалію з усіх річних файлів
-вигорілих площ і пише один малий GeoPackage для завантаження в Kaggle як Dataset.
+"""Clips Iberian burned areas from global raw layers into a single GeoPackage.
 
-    python clip_globfire_iberia.py --src data/raw/globfire --out ba_iberia.gpkg
+Usage:
+    python new_targets.py --src data/raw/globfire --out ba_iberia.gpkg
 """
 import argparse
 from pathlib import Path
@@ -16,7 +16,7 @@ a = ap.parse_args()
 
 W, S, E, N = a.bbox
 files = sorted(p for p in Path(a.src).rglob("*") if p.suffix.lower() in (".gpkg", ".geojson", ".shp"))
-assert files, f"У {a.src} немає векторних файлів"
+assert files, f"No vector files found in {a.src}"
 parts = []
 for f in files:
     g = gpd.read_file(f)
@@ -24,10 +24,10 @@ for f in files:
         continue
     g = g.to_crs("EPSG:4326").cx[W:E, S:N].copy()
     g["src_file"] = f.name
-    print(f"{f.name}: {len(g)} полігонів у bbox")
+    print(f"{f.name}: {len(g)} polygons within bounding box")
     if len(g):
         parts.append(g)
 out = pd.concat(parts, ignore_index=True)
 gpd.GeoDataFrame(out, crs="EPSG:4326").to_file(a.out, driver="GPKG")
-print(f"Записано {len(out)} полігонів -> {a.out}")
-print("Колонки:", [c for c in out.columns if c != "geometry"])
+print(f"Saved {len(out)} polygons to {a.out}")
+print("Attributes:", [c for c in out.columns if c != "geometry"])

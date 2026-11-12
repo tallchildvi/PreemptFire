@@ -57,7 +57,7 @@ def load_geofabrik_index(cache_dir: Path) -> gpd.GeoDataFrame:
     index_path = cache_dir / "geofabrik_index.json"
 
     if not index_path.exists():
-        print("  [OSM] Fetching global Geofabrik spatial index...")
+        print("Fetching global Geofabrik spatial index...")
         response = requests.get(GEOFABRIK_INDEX_URL, timeout=30)
         response.raise_for_status()
         index_path.write_text(response.text, encoding="utf-8")
@@ -421,7 +421,7 @@ def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Pa
         if target_path.exists() and target_path.stat().st_size > 10_485_760:
             return target_path
 
-        print(f"\n  [OSM] Downloading historical dump '{region_id}'\n        {history_url}")
+        print(f"\nDownloading historical dump '{region_id}' from {history_url}")
         tmp_path = target_path.with_suffix(".tmp")
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
@@ -451,7 +451,7 @@ def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Pa
                             mb_d = downloaded / 1_048_576
                             mb_t = total_size / 1_048_576
                             speed = mb_d / max(0.1, time.perf_counter() - t0)
-                            sys.stdout.write(f"\r  [Download] {mb_d:.1f}/{mb_t:.1f} MB ({pct:.1f}%) | {speed:.2f} MB/s")
+                            sys.stdout.write(f"\rDownload: {mb_d:.1f}/{mb_t:.1f} MB ({pct:.1f}%) | {speed:.2f} MB/s")
                             sys.stdout.flush()
 
             if tmp_path.stat().st_size < 10_485_760:
@@ -459,7 +459,7 @@ def ensure_history_dump(region_id: str, history_url: str, cache_dir: Path) -> Pa
                 raise RuntimeError(f"Downloaded file {target_path.name} is smaller than 10MB (corrupted).")
 
             tmp_path.rename(target_path)
-            print(f"\n  [OSM] Saved to {target_path.name} ({target_path.stat().st_size / (1024 * 1024):.1f} MB)")
+            print(f"\nSaved to {target_path.name} ({target_path.stat().st_size / (1024 * 1024):.1f} MB)")
 
     return target_path
 
@@ -477,7 +477,7 @@ def get_or_create_snapshot_pbf(osh_path: Path, target_date_str: str) -> Path:
             return snapshot_path
         tmp_snapshot_path = osh_path.parent / f"{osh_path.stem}_{date_tag}.tmp.osm.pbf"
         iso_timestamp = f"{target_date_str.split(' ')[0]}T23:59:59Z"
-        print(f"  [OSM Time-Filter] Generating snapshot for {iso_timestamp}")
+        print(f"Generating snapshot for {iso_timestamp}...")
         t0 = time.perf_counter()
 
         cmd = [
@@ -494,7 +494,7 @@ def get_or_create_snapshot_pbf(osh_path: Path, target_date_str: str) -> Path:
             raise RuntimeError(f"osmium time-filter failed: {res.stderr}")
 
         tmp_snapshot_path.replace(snapshot_path)
-        print(f"  [OSM Time-Filter] Snapshot created: {snapshot_path.name} in {time.perf_counter() - t0:.2f}s")
+        print(f"Snapshot created: {snapshot_path.name} in {time.perf_counter() - t0:.2f}s")
 
         existing_snaps = sorted(
             [p for p in osh_path.parent.glob("*-history_*.osm.pbf") if not p.name.endswith(".tmp.osm.pbf")],

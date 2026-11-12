@@ -41,7 +41,7 @@ class EffisError(RuntimeError):
     pass
 
 
-# ------------------------------------------------------------------ HTTP
+# HTTP session management
 _SESSION: Optional[requests.Session] = None
 
 
@@ -88,7 +88,7 @@ def list_layers(text: str = "") -> List[dict]:
     return [x for x in out if text.lower() in (x["name"] + " " + x["title"]).lower()]
 
 
-# ------------------------------------------------------------------ raster download and decoding
+# Raster download and decoding
 def _decode(content: bytes) -> np.ndarray:
     head = content[:200].lstrip()
     if head.startswith(b"<"):
@@ -202,13 +202,13 @@ def fetch_many(days: Sequence, layer: Optional[str] = None, workers: int = WORKE
             except Exception as e:
                 last = e
                 time.sleep(2 + attempt * 3)
-        print(f"  [EFFIS] {d}: {last}")
+        print(f"  EFFIS error for {d}: {last}")
         return d, None
     with ThreadPoolExecutor(max(1, workers)) as ex:
         return dict(ex.map(one, days))
 
 
-# ------------------------------------------------------------------ sampling
+# Sampling
 def _fill_nan(a: np.ndarray) -> np.ndarray:
     m = np.isnan(a)
     if not m.any():
@@ -253,7 +253,7 @@ def dsr_from_fwi(fwi):
     return 0.0272 * np.maximum(np.asarray(fwi, float), 0.0) ** 1.77
 
 
-# ------------------------------------------------------------------ calibration (FWI -> probability) and tier cut points
+# Calibration (FWI -> probability) and tier cut points
 _CAL: Optional[dict] = None
 
 
@@ -297,7 +297,7 @@ def tier_cuts_p() -> Optional[Tuple[float, float]]:
     return tuple(float(v) for v in np.interp(cal["tiers"], cal["x"], cal["y"])) if cal else None
 
 
-# ------------------------------------------------------------------ interface used by the Space
+# Interface used by the Space
 def compute_fwi_for_grid(lat, lon, day, radius_km: float = 0.0, stat: str = "mean", components: bool = False) -> Dict[str, np.ndarray]:
     """FWI at every grid point for `day` (one request; one more per extra component). Keys follow the old module."""
     lat, lon = np.asarray(lat, float), np.asarray(lon, float)
@@ -311,7 +311,7 @@ def compute_fwi_for_grid(lat, lon, day, radius_km: float = 0.0, stat: str = "mea
             try:
                 out[k] = fwi_for_points(lat, lon, day, layer=f"{prefix}.{k}", radius_km=radius_km, stat=stat)
             except Exception as e:
-                print(f"  [EFFIS] component {k} unavailable: {e}")
+                print(f"  EFFIS component {k} unavailable: {e}")
     out["p_fwi"], out["p_is_calibrated"] = fwi_to_p(fwi)
     return out
 
@@ -335,7 +335,7 @@ def compute_fwi_for_grid_from_tab1d(TAB_1D, col_names=None, weather_day=None, pt
     return compute_fwi_for_grid(ll[:, 0], ll[:, 1], target_day)
 
 
-# ------------------------------------------------------------------ evaluation on the scenes of the notebook
+# Evaluation on labelled scenes
 def scene_fwi(df, lag_days: int = 0, radius_km: float = 0.0, stat: str = "mean", layer: Optional[str] = None) -> np.ndarray:
     """FWI for every row of a frame with lat, lon, date. One request per distinct date (cached)."""
     d = np.array([_as_date(x) - timedelta(days=lag_days) for x in df["date"]])
