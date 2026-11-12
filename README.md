@@ -3,12 +3,14 @@
 [![DOI: 10.5281/zenodo.24061983](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.24061983-blue.svg)](https://doi.org/10.5281/zenodo.24061983)
 [![Kaggle Dataset](https://img.shields.io/badge/Kaggle-Dataset%20(100m)-%2320BEFF.svg?style=flat&logo=kaggle&logoColor=white)](https://www.kaggle.com/datasets/hollyfrogvi/wildfire-iberia-100m)
 [![Hugging Face Spaces](https://img.shields.io/badge/Hugging%20Face-Spaces%20Demo-%23FFD21E.svg?style=flat&logo=huggingface&logoColor=black)](https://huggingface.co/spaces/tallchildvi/PreemptFire)
+[![GitHub Release](https://img.shields.io/badge/Release-v1.0.0-green.svg?style=flat&logo=github)](https://github.com/tallchildvi/PreemptFire/releases/tag/v1.0.0)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10 | 3.11](https://img.shields.io/badge/Python-3.10%20%7C%203.11-%233776AB.svg?style=flat&logo=python&logoColor=white)](https://www.python.org/)
 
 **Machine Learning and Modeling:**  
 [![PyTorch](https://img.shields.io/badge/PyTorch-%23EE4C2C.svg?style=flat&logo=PyTorch&logoColor=white)](https://pytorch.org/)
 [![CatBoost](https://img.shields.io/badge/CatBoost-GBDT-%23FFCC00.svg?style=flat&logoColor=black)](https://catboost.ai/)
+[![Self-Supervised Learning: SimCLR](https://img.shields.io/badge/Pretext%20Learning-SimCLR%20(SSL)-%238A2BE2.svg?style=flat)](https://github.com/tallchildvi/PreemptFire)
 [![scikit-learn](https://img.shields.io/badge/scikit--learn-%23F7931E.svg?style=flat&logo=scikit-learn&logoColor=white)](https://scikit-learn.org/)
 [![pandas](https://img.shields.io/badge/pandas-%23150458.svg?style=flat&logo=pandas&logoColor=white)](https://pandas.pydata.org/)
 [![NumPy](https://img.shields.io/badge/NumPy-%23013243.svg?style=flat&logo=numpy&logoColor=white)](https://numpy.org/)
@@ -196,6 +198,15 @@ The repository implements multiple machine learning paradigms, ranging from grad
 | **`fwi`** | EFFIS / GWIS | ECMWF CFFDRS FWI | Standard Canadian Forest Fire Weather Index physical baseline queried from the Copernicus WMS service. |
 | **`stack_no_img`** | Stacking Ensemble | Tabular + Recurrent | Blended ensemble combining non-image models (`tab_clim_full`, `tab_hist`, `nn_ts`, `clim`). |
 | **`stack_all`** | Stacking Ensemble | Multimodal | Full multimodal ensemble combining visual, recurrent, and tabular models. |
+
+### Note on Self-Supervised Learning (SSL / SimCLR)
+
+To extract dense spatial-spectral representations directly from multi-sensor satellite imagery without target leakage or the requirement for manual ignition annotations, the framework incorporates a self-supervised visual representation pipeline:
+
+- **Pretext Task:** A deep convolutional ResNet encoder (`make_encoder_v5`) is pre-trained using contrastive learning (**SimCLR** with InfoNCE loss) directly on unlabelled 33-channel spatial rasters ($128 \times 128\text{ px}$ at $100\text{ m/px}$). Inputs span optical bands ($B02\text{--}B12$), SAR backscatter ($VV, VH$), topographic gradients, infrastructure friction surfaces, and volumetric soil moisture.
+- **Dimensionality Reduction:** High-dimensional latent activations from the visual encoder are compressed into 32 orthogonal visual components via Principal Component Analysis (PCA, `simclr_pca_32.pkl`).
+- **Downstream Feature Fusion (`tab_ssl_full`):** These 32 visual embeddings are concatenated with the 69 tabular meteorological, demographic, and fire history features to form a 101-dimensional feature vector evaluated with CatBoost.
+- **Analytical Role:** Contrastive SSL demonstrates how unlabelled multimodal Earth observation data can be mapped into compact, transferrable environmental embeddings. While hand-crafted domain statistics coupled with historical fire climatology (`tab_clim_full`) yield superior discrimination on this specific benchmark due to strong spatial persistence, the SSL encoder provides a scalable pathway for zero-shot hazard characterization across unmonitored geographic regions.
 
 ---
 
