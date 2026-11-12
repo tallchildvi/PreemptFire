@@ -113,7 +113,7 @@ Unlike systems focused on active fire perimeter tracking or post-fire burn scar 
 +---------------------------------------+                   +---------------------------------------+
 | - Sentinel-2 Optical (B02-B12, SCL)   |                   | - Open-Meteo ERA5 Reanalysis          |
 | - Sentinel-1 SAR RTC (VV, VH)         |                   |   (T_min/max, RH, VPD, Wind, Precip)  |
-| - Vegetation Indices (NDVI, NDMI, ...) |                   | - Antecedent Drought & Drying Memory  |
+| - Vegetation Indices (NDVI, NDMI, ...)|                   | - Antecedent Drought & Drying Memory  |
 | - Copernicus DEM (Slope, Aspect)      |                   | - WorldPop Demographics (10 km, 50 km)|
 | - OSM Road/Trail Travel Time Surfaces |                   | - NASA FIRMS 30-Day Spatiotemporal    |
 | - Distances to Rail, Camps, Powerlines|                   |   History (5, 10, 25, 50 km radii)    |
@@ -126,7 +126,7 @@ Unlike systems focused on active fire perimeter tracking or post-fire burn scar 
                       |           Model Evaluation & Inference          |
                       +-------------------------------------------------+
                       | - tab_clim_full (CatBoost + Climatology, 69 ft) |
-                      | - tab_ssl_full (CatBoost + SimCLR ResNet, 101 ft)|
+                      | - tab_ssl_full (CatBoost + SimCLR ResNet, 101ft)|
                       | - tab_full (CatBoost + Handcrafted 2D, 262 ft)  |
                       | - nn_ts (PyTorch GRU Time Series + Static)      |
                       | - Physical Baseline: EFFIS CFFDRS FWI (ecmwf)   |
