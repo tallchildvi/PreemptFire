@@ -5,8 +5,13 @@ Generates candidate spatial evaluation footprints across Spain and Portugal:
 - Balanced historical sampling across years (2017-2025) and peak wildfire season.
 - Generates reproducible stratified folds and spatial coordinate indices.
 """
+import sys
 from datetime import date, timedelta
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
 
 import numpy as np
 import pandas as pd

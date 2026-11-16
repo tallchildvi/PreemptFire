@@ -275,6 +275,7 @@ def train_catboost(df: pd.DataFrame, output_model_path: str, use_coords: bool = 
         random_seed=42,
         early_stopping_rounds=60,
         verbose=100,
+        train_dir=str(Path(output_model_path).parent / "catboost_info"),
     )
 
     print("\nFitting CatBoost classifier...")
@@ -301,6 +302,7 @@ def train_catboost(df: pd.DataFrame, output_model_path: str, use_coords: bool = 
     print("\nTop 20 feature importances:")
     print(imp_df.head(20).to_string(index=False))
 
+    Path(output_model_path).parent.mkdir(parents=True, exist_ok=True)
     model.save_model(output_model_path)
     print(f"\nSaved trained model to: {output_model_path}")
 
@@ -308,7 +310,7 @@ def train_catboost(df: pd.DataFrame, output_model_path: str, use_coords: bool = 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train CatBoost baseline on wildfire HDF5 dataset.")
     parser.add_argument("--h5", default="data/processed/dataset.h5", help="Path to HDF5 dataset.")
-    parser.add_argument("--output", default="catboost_baseline.cbm", help="Output model path.")
+    parser.add_argument("--output", default="models/catboost_baseline.cbm", help="Output model path.")
     parser.add_argument("--cache_parquet", default="data/processed/tabular_features.parquet", help="Feature cache path.")
     parser.add_argument("--use_coords", action="store_true", help="Use lat/lon as features in the final model.")
     parser.add_argument("--use_doy", action="store_true", help="Use day-of-year (sin/cos) as features in the final model.")

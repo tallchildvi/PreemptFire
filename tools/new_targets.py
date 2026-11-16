@@ -1,7 +1,7 @@
 """Clips Iberian burned areas from global raw layers into a single GeoPackage.
 
 Usage:
-    python new_targets.py --src data/raw/globfire --out ba_iberia.gpkg
+    python tools/new_targets.py --src data/raw/globfire --out data/interim/ba_iberia.gpkg
 """
 import argparse
 from pathlib import Path
@@ -10,7 +10,7 @@ import pandas as pd
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--src", default="data/raw/globfire")
-ap.add_argument("--out", default="ba_iberia.gpkg")
+ap.add_argument("--out", default="data/interim/ba_iberia.gpkg")
 ap.add_argument("--bbox", type=float, nargs=4, default=[-10.8, 35.5, 4.6, 44.3], metavar=("W", "S", "E", "N"))
 a = ap.parse_args()
 
@@ -28,6 +28,8 @@ for f in files:
     if len(g):
         parts.append(g)
 out = pd.concat(parts, ignore_index=True)
-gpd.GeoDataFrame(out, crs="EPSG:4326").to_file(a.out, driver="GPKG")
-print(f"Saved {len(out)} polygons to {a.out}")
+out_path = Path(a.out)
+out_path.parent.mkdir(parents=True, exist_ok=True)
+gpd.GeoDataFrame(out, crs="EPSG:4326").to_file(out_path, driver="GPKG")
+print(f"Saved {len(out)} polygons to {out_path}")
 print("Attributes:", [c for c in out.columns if c != "geometry"])

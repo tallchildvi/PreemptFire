@@ -6,6 +6,7 @@ DATA_DIR = BASE_DIR / "data"
 RAW_DATA_DIR = DATA_DIR / "raw"
 INTERIM_DATA_DIR = DATA_DIR / "interim"
 PROCESSED_H5_DIR = DATA_DIR / "processed"
+MODELS_DIR = BASE_DIR / "models"
 
 # Spatial resolution & grid configuration: 12.80 km x 12.80 km at 100m/pixel (1 scene = 1 patch)
 GRID_SIZE_PX = 128
