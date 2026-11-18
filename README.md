@@ -329,6 +329,25 @@ export GEE_PROJECT="your_gee_project_id"
 
 ---
 
+## Future Directions: Stochastic Process Modeling
+
+Building on the existing climatological baseline, fire-history features, and Negative Binomial count distributions, planned mathematical extensions focus on formalizing wildfire occurrence as a continuous-time/space stochastic process:
+
+1. **Spatio-Temporal Hawkes Process (Self-Exciting Point Process):**
+   Decompose the conditional intensity of fire detections into a covariate-driven background ignition rate $\mu$ (weather, fuel moisture, terrain, climatology) and a self-exciting triggering kernel $g$ (temporal decay, spatial spread, wind vector, and radiative power $\text{FRP}_i$):
+   $$\lambda(t, s \mid \mathcal{H}_t) = \mu\bigl(s, t;\, X_{\text{weather}}, X_{\text{terrain}}\bigr) + \sum_{t_i < t} g\bigl(t - t_i,\, \|s - s_i\|;\, \text{wind}, \text{FRP}_i\bigr)$$
+   This explicitly separates **new independent ignitions** from **ongoing fire persistence/spread**, enables estimation via MLE/EM on historical FIRMS point events, and supports formal residual diagnostics via the time-rescaling theorem.
+
+2. **Log-Gaussian Cox Process (LGCP):**
+   Replace ad-hoc spatial neighborhood aggregations with a doubly stochastic Poisson formulation whose log-intensity incorporates a latent spatio-temporal Gaussian random field $Z(s, t)$:
+   $$\log \lambda(s, t) = X\beta + Z(s, t)$$
+   Modeling spatial autocorrelation directly through $Z(s, t)$ accounts for latent overdispersion and yields coherent posterior predictive intervals.
+
+3. **Extreme Value Theory (EVT) for Heavy Tails:**
+   Apply Peaks Over Threshold (POT) with a Generalized Pareto Distribution (GPD) to model the extreme tail of daily detection counts and Fire Radiative Power (FRP), addressing tail under-coverage of upper prediction bounds during rare large-scale fire outbreaks.
+
+---
+
 ## Citation
 
 If you use this benchmark dataset or codebase in your research, please cite it as follows:
